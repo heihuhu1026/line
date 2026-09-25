@@ -1,0 +1,3622 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>二次开发需求流水线 · 操作台</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a22; --panel2:#1c212b; --line:#262c38;
+    --fg:#e6e8ee; --dim:#98a0b3; --accent:#7c9cff; --ok:#4ec9a0; --warn:#e2b13c; --bad:#ef6b6b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Cascadia Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none !important}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.55 system-ui,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#171b24,#12151c);position:sticky;top:0;z-index:5}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  header .hint{color:var(--dim);font-size:12px}
+  header .spacer{flex:1}
+  main{display:grid;grid-template-columns:310px 1fr;gap:14px;padding:14px;align-items:start}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  aside{position:sticky;top:64px;max-height:calc(100vh - 80px);overflow:auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+  .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.4px}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;
+    padding:6px 11px;font-size:13px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent);color:#fff}
+  button.primary{background:#2a3c6e;border-color:#3d5490;color:#dfe7ff}
+  button.primary:hover{background:#33488a}
+  button.danger{border-color:#5b2b2b;color:#ffc9c9}
+  button.danger:hover{background:#3a1f1f;border-color:var(--bad)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  /* 禁用的勾选框必须仍能看出「勾没勾」：浏览器默认把 disabled 控件整体压暗，
+     深色底上几乎分不出选中与否。人工闸门在运行中/已结束时是锁定态（disabled 是对的），
+     但原始设置必须读得出来 —— 这里强制不降透明度，并给一个明确的强调色。 */
+  input[type=checkbox]:disabled{opacity:1;cursor:default;accent-color:#6ea8fe}
+  input[type=checkbox]:disabled:checked{opacity:1;accent-color:#6ea8fe;filter:none}
+  input,textarea,select{background:#0d1016;color:var(--fg);border:1px solid var(--line);border-radius:8px;
+    padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
+  textarea{resize:vertical;min-height:70px}
+  textarea.code{font-family:var(--mono);font-size:12.5px;line-height:1.5;min-height:220px;white-space:pre}
+  label{display:block;color:var(--dim);font-size:12px;margin:8px 0 4px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .b{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11.5px;border:1px solid var(--line);
+    color:var(--dim);white-space:nowrap}
+  .b.ok{color:var(--ok);border-color:#245343}
+  .b.bad{color:var(--bad);border-color:#5b2b2b}
+  .b.warn{color:var(--warn);border-color:#5b4a1c}
+  .b.acc{color:#c3d0ff;border-color:#3d5490;background:#1e2740}
+  .run{padding:9px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:8px;cursor:pointer;
+    background:var(--panel2)}
+  .run:hover{border-color:var(--accent)}
+  .run.active{border-color:var(--accent);background:#1e2740}
+  .run .id{font-family:var(--mono);font-size:12.5px}
+  .run .meta{color:var(--dim);font-size:11.5px;margin-top:3px;display:flex;gap:6px;flex-wrap:wrap}
+  .stage{border:1px solid var(--line);border-radius:9px;margin-bottom:9px;overflow:hidden;background:var(--panel2)}
+  .stage-head{display:flex;gap:8px;align-items:center;padding:9px 11px;flex-wrap:wrap}
+  .stage-head .seq{font-family:var(--mono);color:var(--dim);font-size:12px}
+  .stage-head b{font-size:13px}
+  .stage-head .grow{flex:1}
+  .stage-body{border-top:1px dashed var(--line);padding:11px;background:#12161e}
+  pre{background:#0b0e13;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;
+    max-height:340px;font-family:var(--mono);font-size:12px;margin:8px 0;white-space:pre-wrap;word-break:break-all}
+  /* 需求原文多为中文散文：break-all 会在任意字符处断开，换成 break-word 更易读 */
+  pre.req-text{max-height:220px;word-break:break-word;line-height:1.6}
+  details>summary{cursor:pointer;color:var(--dim);font-size:12.5px;margin:6px 0}
+  .note{color:var(--dim);font-size:12px}
+  .warnbox{border:1px solid #5b4a1c;background:#241f10;color:#f0d894;padding:8px 10px;border-radius:8px;
+    font-size:12.5px;margin:8px 0}
+  .errbox{border:1px solid #5b2b2b;background:#241414;color:#ffc9c9;padding:8px 10px;border-radius:8px;font-size:12.5px}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:4px 10px;font-size:12.5px}
+  .kv div:nth-child(odd){color:var(--dim)}
+  .gates{display:flex;gap:10px;flex-wrap:wrap;font-size:12.5px}
+  .gates label{display:inline-flex;gap:5px;align-items:center;margin:0;color:var(--fg);width:auto}
+  .gates input{width:auto}
+  #empty{color:var(--dim);padding:30px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+  .grow{flex:1}
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(640px,92vw);max-height:80vh;
+    display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .modal-head{display:flex;align-items:center;gap:8px;padding:11px 13px;border-bottom:1px solid var(--line)}
+  .modal-head b{font-size:13px}
+  .modal-head .path{font-family:var(--mono);font-size:12px;color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .modal-body{overflow:auto;padding:6px 8px;min-height:220px;max-height:52vh}
+  .dir-row{padding:6px 9px;border-radius:7px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:7px}
+  .dir-row:hover{background:var(--panel2)}
+  .dir-row.up{color:var(--accent)}
+  .dir-row:focus{background:var(--panel2);outline:1px solid var(--accent);outline-offset:-1px}
+  .dir-row .ic{width:18px;text-align:center}
+  .modal-foot{display:flex;gap:8px;align-items:center;padding:11px 13px;border-top:1px solid var(--line)}
+  .modal-foot .grow{flex:1}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px}
+  .flow .arrow{color:var(--dim);font-size:11px}
+  .chip{padding:3px 9px;border-radius:999px;border:1px solid var(--line);font-size:12px;color:var(--dim);white-space:nowrap}
+  .chip.done{color:var(--ok);border-color:#245343}
+  .chip.cur{color:#c3d0ff;border-color:#3d5490;background:#1e2740;font-weight:600;animation:pulse 1.4s ease-in-out infinite}
+  .chip.pending{opacity:.55}
+  /* 流程条即节点选择器：点节点 → 下方只显示该节点相关信息 */
+  button.chip{background:var(--panel2);cursor:pointer;font-family:inherit;line-height:1.5}
+  button.chip:hover{border-color:var(--accent);color:var(--fg)}
+  .chip.sel{box-shadow:0 0 0 2px var(--accent);border-color:var(--accent);font-weight:600}
+  .chip.all{color:var(--dim);border-style:dashed}
+  .node-mode{font-size:12px;color:var(--dim)}
+  .node-mode b{color:var(--accent)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .ctl-note{font-size:12px;color:var(--warn)}
+  .ctl-note.ok{color:var(--ok)}
+  .ctl-note.dim{color:var(--dim)}
+
+  /* 产物表单化：人工最常改的字段给可编辑表格，避免手改 JSON */
+  .af-wrap{border:1px solid var(--line);border-radius:9px;padding:9px 10px;margin:8px 0;background:#12161e}
+  .af-wrap h4{margin:0 0 6px;font-size:12.5px;color:var(--dim)}
+  .af-row{display:grid;grid-template-columns:1fr;gap:5px;padding:8px 0;border-top:1px dashed var(--line)}
+  .af-row:first-of-type{border-top:0;padding-top:0}
+  .af-q{font-size:12.5px;color:#c3d0ff;margin-bottom:2px}
+  .af-row label{margin:0}
+  .af-row input,.af-row textarea,.af-row select{font-size:12.5px}
+  .af-row textarea{min-height:44px}
+
+  /* 问题记录筛选 */
+  .flt{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 9px}
+  .flt select{width:auto;min-width:108px}
+  .flt label{display:inline-flex;gap:5px;align-items:center;margin:0;width:auto;color:var(--fg);font-size:12.5px}
+  .flt input[type=checkbox]{width:auto}
+
+  /* 运行日志：按行着色，便于扫读 */
+  pre .log-warn{color:var(--warn)}
+  pre .log-bad{color:var(--bad)}
+  pre .log-note{color:var(--accent)}
+  .log-bar{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+  .log-bar label{display:inline-flex;gap:5px;align-items:center;margin:0;width:auto;color:var(--fg);font-size:12.5px}
+  .log-bar input[type=checkbox]{width:auto}
+
+  /* markdown 渲染（handoff / PRD / 问题总览都是给人读的文档） */
+  .md h3,.md h4,.md h5,.md h6{margin:11px 0 6px;color:var(--fg)}
+  .md h3{font-size:14px}
+  .md h4{font-size:13.5px}
+  .md h5,.md h6{font-size:13px}
+  .md ul{margin:6px 0;padding-left:20px}
+  .md li{margin:2px 0}
+  .md li.md-ordered{list-style:decimal}
+  .md code{background:#0b0e13;border:1px solid var(--line);border-radius:4px;padding:0 4px;
+    font-family:var(--mono);font-size:12px}
+  .md blockquote{margin:6px 0;padding-left:10px;border-left:3px solid var(--line);color:var(--dim)}
+  .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+  .md p{margin:6px 0}
+  .md.md-box{background:#0b0e13;border:1px solid var(--line);border-radius:8px;padding:10px;
+    max-height:420px;overflow:auto;font-size:12.5px;line-height:1.65}
+
+  /* 轻量 toast 与确认框（替代原生 alert / confirm：原生弹窗阻塞渲染，且与深色主题不搭） */
+  #toast-box{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;
+    z-index:80;max-width:min(460px,92vw)}
+  .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:9px 12px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.45);
+    animation:toast-in .18s ease-out}
+  .toast.bad{border-left-color:var(--bad)}
+  .toast.ok{border-left-color:var(--ok)}
+  @keyframes toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  #confirm-modal .modal{width:min(460px,92vw)}
+  #confirm-text{font-size:13px;line-height:1.6;margin:4px 0 0;white-space:pre-wrap}
+
+  /* 窄屏：aside 的 sticky + 内部滚动会让运行列表缩成一个小框，必须一起取消 */
+  @media(max-width:900px){
+    aside{position:static;max-height:none;overflow:visible}
+  }
+  /* ---------------- 阶段流程图：节点 ↔ 该阶段产物/日志/状态 ---------------- */
+  .graph-wrap{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+  .graph-left{flex:0 0 auto;max-width:100%}
+  .graph-canvas{max-width:100%;overflow:auto}
+  .graph-side{flex:1 1 360px;min-width:300px;border-left:1px solid var(--line);padding-left:14px}
+  @media(max-width:1180px){
+    .graph-left{flex-basis:100%}
+    .graph-side{flex-basis:100%;border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:10px}
+  }
+  .graph-side h3{font-size:13px;margin:0 0 8px;color:var(--fg)}
+  .graph-side h4{font-size:12px;margin:12px 0 5px;color:var(--dim);font-weight:600}
+  svg.pipe{display:block}
+  .gnode{cursor:pointer}
+  .gnode rect{fill:var(--panel2);stroke:var(--line);stroke-width:1.3;transition:stroke .12s,fill .12s}
+  .gnode:hover rect{stroke:var(--accent)}
+  .gnode text{font-size:12px;fill:var(--fg);font-family:inherit;pointer-events:none;user-select:none}
+  .gnode .sub{font-size:10.5px;fill:var(--dim)}
+  .gnode.g-done rect{stroke:#2c6b56;fill:#152420}
+  .gnode.g-run rect{stroke:#3d5490;fill:#1e2740;animation:pulse 1.6s ease-in-out infinite}
+  .gnode.g-gate rect{stroke:#7a6320;fill:#251f10}
+  .gnode.g-attn rect{stroke:#5b2b2b;fill:#241414}
+  .gnode.g-skip rect{stroke:var(--line);fill:#14171d;opacity:.55}
+  .gnode.g-wait rect{opacity:.5}
+  .gnode.g-wait text{fill:var(--dim)}
+  .gnode.g-sel rect{stroke:var(--accent);stroke-width:2.4}
+  .gedge{fill:none;stroke:#39414f;stroke-width:1.2;marker-end:url(#garrow)}
+  .gedge.e-loop{stroke-dasharray:4 3}
+  .gedge.e-hot{stroke:var(--accent);stroke-width:1.9}
+  .gedge-lb{font-size:10px;fill:var(--dim);pointer-events:none;user-select:none}
+  .graph-legend{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px;font-size:11.5px;color:var(--dim)}
+  .graph-legend i{display:inline-block;width:11px;height:11px;border-radius:3px;border:1.4px solid var(--line);
+    margin-right:4px;vertical-align:-1px}
+  .graph-legend i.done{border-color:#2c6b56;background:#152420}
+  .graph-legend i.run{border-color:#3d5490;background:#1e2740}
+  .graph-legend i.gate{border-color:#7a6320;background:#251f10}
+  .graph-legend i.wait{opacity:.5}
+  .gp-file{display:flex;gap:8px;align-items:center;padding:5px 8px;border:1px solid var(--line);border-radius:7px;
+    margin-bottom:5px;background:var(--panel2);font-size:12.5px;flex-wrap:wrap}
+  .gp-file .fn{font-family:var(--mono);font-size:12px}
+  .stage.hl{border-color:var(--accent);box-shadow:0 0 0 1px rgba(124,156,255,.45)}
+</style>
+</head>
+<body>
+<header>
+  <h1>二次开发需求流水线 · 操作台</h1>
+  <span class="hint" id="svc"></span>
+  <span class="spacer"></span>
+  <span class="hint" id="busy"></span>
+  <button id="btn-report">问题总览</button>
+  <button id="btn-config">⚙ 配置</button>
+  <button id="btn-refresh">刷新</button>
+</header>
+
+<main>
+  <aside>
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <button id="btn-new" class="primary" style="flex:1">＋ 新建运行</button>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <button id="btn-manage" style="flex:1">管理</button>
+        <button id="btn-del-sel" class="danger" hidden>删除选中</button>
+      </div>
+      <div class="row" id="sel-all-row" hidden style="margin-bottom:6px">
+        <label><input type="checkbox" id="sel-all"> 全选（不含运行中）</label>
+      </div>
+      <h2>运行列表</h2>
+      <div id="run-list"></div>
+      <h2 style="margin-top:14px">作业（全局架构）</h2>
+      <div class="note" id="job-list-note">入口总闸判定为「大型」时，需求会被拆成模块，
+        每个模块各跑一条完整流水线，产物在 <code>runs/_jobs/</code> 下。</div>
+      <div id="job-list"></div>
+    </div>
+  </aside>
+
+  <section>
+    <div id="empty">从左侧选择一次运行，或点「＋ 新建运行」。</div>
+
+    <div id="new-form" class="card" hidden>
+      <h2>新建运行</h2>
+      <label>需求文本</label>
+      <textarea id="nf-req" placeholder="例：给客户列表页增加导出 Excel 按钮，导出当前筛选结果"></textarea>
+      <label>项目类型</label>
+      <div class="row" style="margin:4px 0 2px">
+        <label style="width:auto;margin:0"><input type="radio" name="nf-ptype" value="secondary" checked> 二次开发（基于存量仓库）</label>
+        <label style="width:auto;margin:0 0 0 14px"><input type="radio" name="nf-ptype" value="new"> 新建项目（从零生成）</label>
+      </div>
+      <label id="nf-repo-label" style="margin-top:10px">存量代码仓库路径（用于检索分片，可留空）</label>
+      <div class="row">
+        <input id="nf-repo" placeholder="D:/AI/project" style="flex:1">
+        <button type="button" id="nf-browse">浏览…</button>
+      </div>
+      <div class="note" id="nf-repo-note">二次开发：指向已有仓库，用于检索参考与套用补丁；留空则不做检索。</div>
+      <label style="margin-top:10px">入口总闸（全局架构岗：先判规模，再决定是否拆模块）</label>
+      <div class="row" style="margin:4px 0 2px">
+        <div style="width:190px"><label style="margin:0">模式</label>
+          <select id="nf-gw">
+            <option value="">沿用配置默认</option>
+            <option value="auto">auto（预判疑似大型才调）</option>
+            <option value="always">always（每次先调）</option>
+            <option value="off">off（完全旁路）</option>
+          </select></div>
+        <div style="width:190px"><label style="margin:0">强制规模</label>
+          <select id="nf-scale">
+            <option value="">不强制</option>
+            <option value="small">small（直通原有流水线）</option>
+            <option value="large">large（强制拆模块）</option>
+          </select></div>
+      </div>
+      <label style="margin-top:6px">全局禁区（逗号分隔，作为全局架构的输入；留空则用配置里的）</label>
+      <input id="nf-forbidden" placeholder="例：pipeline/flow.py,pipeline/config.py">
+      <div class="note" id="nf-gw-note">off 与原行为完全一致（连仓库都不扫）；auto 下判为 small 时零额外模型调用。</div>
+      <label>人工闸门（勾选的阶段结束后暂停，等人工确认）</label>
+      <div class="gates" id="nf-gates"></div>
+      <div class="note">交付前的「人工审核」闸门由流程在评审通过后自动触发，无需在此勾选。</div>
+      <div class="row" style="margin-top:10px">
+        <div style="width:150px"><label>评审频率 review_every</label><input id="nf-rev" type="number" min="1" value="2"></div>
+        <div style="width:150px"><label>回流上限 max_rework</label><input id="nf-max" type="number" min="0" value="2"></div>
+        <label class="gates" style="margin-top:22px"><input id="nf-mock" type="checkbox"> mock（不加载模型）</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="nf-submit">▶ 启动</button>
+        <button id="nf-cancel">取消</button>
+        <span class="note" id="nf-note"></span>
+      </div>
+    </div>
+
+    <div id="report-view" class="card" hidden>
+      <div class="row"><h2 style="margin:0">问题总览（跨运行）</h2><span class="grow"></span>
+        <button id="btn-report-close">关闭</button></div>
+      <div class="md md-box" id="report-text"></div>
+      <div class="note">同样内容可用 <code>python tools\report_issues.py</code> 落盘；交给模型做元优化用
+        <code>python tools\meta_optimize.py</code>（只产出建议书，不自动改代码）。</div>
+    </div>
+
+    <div id="config-view" class="card" hidden>
+      <div class="row"><h2 style="margin:0">配置（模型 / 提示词 / 运行参数）</h2><span class="grow"></span>
+        <button id="btn-config-close">关闭</button></div>
+
+      <h3>角色与模型</h3>
+      <div class="note" id="cfg-ollama">加载中…</div>
+      <label class="gates" style="width:auto"><input id="cfg-link" type="checkbox" checked>
+        联动同模型阶段（架构师/评审共用 14B，开发/测试共用 coder）</label>
+      <div id="cfg-models"></div>
+
+      <h3>系统提示词</h3>
+      <div class="note">提示词越长越挤占素材预算（14B 只有 8K 上下文），字符数实时显示。</div>
+      <div id="cfg-prompts"></div>
+
+      <h3>运行参数</h3>
+      <div id="cfg-runtime"></div>
+
+      <h3>Token 预算（按阶段）</h3>
+      <div class="note">调小会让该阶段看到的代码片段被裁剪，可能直接导致补丁偏浅，改动请注意。</div>
+      <div id="cfg-budgets"></div>
+
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="cfg-save">保存</button>
+        <button id="cfg-reset">全部还原默认</button>
+        <span class="note" id="cfg-save-note"></span>
+      </div>
+      <div class="note">覆盖写入 <code id="cfg-path"></code>，
+        <b>对之后启动的进程生效（含「继续执行」）</b>——配置在进程启动时加载，
+        所以当前正在跑的那一次不会被中途改写；已暂停的运行一续跑就会用上新配置。</div>
+    </div>
+
+    <div id="job-view" hidden>
+      <div class="card">
+        <div class="row"><h2 style="margin:0">作业 <span id="j-id" style="font-family:var(--mono)"></span></h2>
+          <span id="j-badges"></span><span class="grow"></span>
+          <button id="j-resume">续跑作业</button>
+          <button id="j-refresh">刷新</button>
+          <button id="j-close">关闭</button></div>
+        <div class="note" id="j-dir"></div>
+        <div class="note" id="j-msg"></div>
+      </div>
+      <div class="card"><h2>规模判定</h2><div class="kv" id="j-scale"></div></div>
+      <div class="card"><h2>项目摘要</h2><div class="md md-box" id="j-summary"></div></div>
+      <div class="card">
+        <div class="row"><h2 style="margin:0">模块与执行情况</h2><span class="grow"></span>
+          <span class="note" id="j-mod-note"></span></div>
+        <div id="j-modules" style="margin-top:10px"></div>
+      </div>
+      <div class="card" id="j-constraints-card">
+        <h2>全局约束</h2><div class="kv" id="j-constraints"></div>
+      </div>
+      <div class="card" id="j-ckpt-card">
+        <h2>集成校验点 <span class="note">（全量集成后人工核对；本流水线不新增评审节点）</span></h2>
+        <div id="j-checkpoints"></div>
+      </div>
+      <div class="card" id="j-req-card">
+        <details>
+          <summary style="cursor:pointer"><b>送进各模块子流水线的需求文本</b>
+            <span class="note">（人工要能一眼看到「到底送进去了什么」）</span></summary>
+          <div class="row" style="margin:8px 0"><select id="j-req-select"></select></div>
+          <pre class="req-text" id="j-req-text"></pre>
+        </details>
+      </div>
+      <div class="card" id="j-report-card">
+        <details>
+          <summary style="cursor:pointer"><b>人读报告 report.md</b></summary>
+          <div class="md md-box" id="j-report" style="margin-top:8px"></div>
+        </details>
+      </div>
+      <div class="card" id="j-notes-card" hidden>
+        <h2>备注 / 接地提示</h2><div id="j-notes"></div>
+      </div>
+    </div>
+
+    <div id="detail" hidden>
+      <div class="card">
+        <div class="row">
+          <b id="d-id" style="font-family:var(--mono)"></b>
+          <span id="d-badges"></span>
+          <span class="grow"></span>
+          <span class="ctl-note" id="d-ctl-note"></span>
+          <button class="primary" id="btn-resume">▶ 继续执行</button>
+          <button class="danger" id="btn-stop">■ 中断</button>
+          <button id="btn-open-log">日志</button>
+        </div>
+        <label>续跑 / 打回时的人工意见（会注入目标阶段的 prompt，优先级最高的约束）</label>
+        <textarea id="feedback" placeholder="例：方案里不要动 config.py；导出必须走流式，避免大结果集把内存吃满"></textarea>
+        <div class="row" style="margin-top:8px">
+          <div style="width:280px">
+            <label style="margin-top:0">人工干预的问题分类（记进 issues，供后续优化统计）</label>
+            <select id="issue-kind"><option value="">（不分类）</option></select>
+          </div>
+        </div>
+        <label>续跑时的人工闸门（留空表示跑到底）</label>
+        <div class="gates" id="d-gates"></div>
+        <div id="d-gates-ro" style="margin-top:6px"></div>
+        <div class="row" style="margin-top:8px;align-items:flex-end">
+          <div style="width:230px">
+            <label style="margin-top:0">回流上限 max_rework（留空 = 沿用当前）</label>
+            <input id="dg-max" type="number" min="0" step="1" placeholder="沿用">
+          </div>
+          <span class="note">触顶（needs_human）的运行靠「打回某个阶段重跑」救回；这里可手动放宽预算 ——
+            人工介入本身也会自动追加一轮（日志里的 <code>[预算]</code> 行）。</span>
+        </div>
+        <div id="d-msg"></div>
+      </div>
+
+      <div class="card" id="d-prog-card">
+        <div class="row">
+          <h2 style="margin:0">进度</h2>
+          <span class="grow"></span>
+          <span class="note" id="d-prog-summary"></span>
+          <span class="node-mode" id="d-node-mode"></span>
+        </div>
+        <div class="flow" id="d-flow"></div>
+        <div class="note" id="d-prog-detail" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card" id="d-graph-card">
+        <div class="row">
+          <h2 style="margin:0">阶段流程图 · 产物与日志</h2>
+          <span class="grow"></span>
+          <span class="note" id="d-graph-note"></span>
+        </div>
+        <div class="graph-wrap" style="margin-top:9px">
+          <div class="graph-left">
+            <div class="graph-canvas" id="d-graph"></div>
+            <div class="graph-legend">
+              <span><i class="done"></i>已完成</span>
+              <span><i class="run"></i>执行中</span>
+              <span><i class="gate"></i>等待人工</span>
+              <span><i class="wait"></i>未开始</span>
+              <span>虚线 = 回流 / 条件分支</span>
+              <span>×N = 该阶段产物条数（开发两遍 / 回流多轮都会累加）</span>
+            </div>
+          </div>
+          <div class="graph-side">
+            <div class="note" id="d-graph-hint">点击左侧任意<b>阶段节点</b>，查看该阶段的
+              <b>产物文件</b>、<b>执行日志</b>与<b>状态信息</b>；节点颜色即该阶段当前状态。</div>
+            <div id="d-graph-detail" hidden></div>
+          </div>
+        </div>
+        <details style="margin-top:9px">
+          <summary>流定义（Mermaid 源码 · 一致性校验）</summary>
+
+          <div class="note" id="d-flow-ok" style="margin-top:6px"></div>
+          <div class="row" style="margin:6px 0"><button id="btn-copy-flow">复制 Mermaid</button></div>
+          <pre class="req-text" id="d-flow-mermaid"></pre>
+          <div class="note">真源是 <code>pipeline/flow.py</code>：节点 / 边 / 回流 / 闸门都在那一份声明里，
+            <code>STAGE_MODELS</code> / <code>STAGE_SCHEMAS</code> / <code>STAGE_STATE_KEY</code> 与各阶段白名单都从它派生，
+            启动期做一致性校验（也可跑 <code>python -m pipeline.cli --show-flow</code>）。</div>
+        </details>
+      </div>
+
+      <div class="card" id="d-verify-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">最终输出 · 运行验证</h2>
+          <span class="grow"></span>
+          <span class="note" id="d-verify-note"></span>
+        </div>
+        <div class="note">把补丁物化到沙箱目录后<b>真实执行</b>得到的机械证据（不是让模型读文件判断能不能跑）。
+          验证失败时，即使评审给 pass 也会被机制改判为返工。</div>
+        <div id="d-verify-body" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card" id="d-demo-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">演示 / 运行</h2>
+          <span class="grow"></span>
+          <span class="note" id="d-demo-note"></span>
+        </div>
+        <div class="note">在<b>沙箱副本</b>里真实执行（不碰你的目标目录），安全约定与运行验证完全同一套：
+          只跑白名单程序、命中危险片段不执行、逐条超时、无显示环境（SDL 走 dummy，pygame 也能跑）。</div>
+        <div class="row" style="margin-top:8px">
+          <input id="d-demo-cmd" placeholder="要执行的命令（留空 = 自动挑入口）" style="flex:1">
+          <label class="note" style="width:auto;margin:0 8px 0 0">超时
+            <input id="d-demo-timeout" type="number" min="1" max="120" value="20" size="3">s</label>
+          <button class="primary" id="btn-demo-run">运行</button>
+        </div>
+        <div id="d-demo-meta" class="note" style="margin-top:6px"></div>
+        <pre id="d-demo-out" class="req-text" style="margin-top:6px;max-height:340px;overflow:auto"></pre>
+        <div class="row" style="margin-top:6px">
+          <button id="btn-demo-reject" hidden>把「补入口 / 补 import」填进打回意见</button>
+        </div>
+        <details style="margin-top:8px"><summary>沙箱文件</summary>
+          <div id="d-demo-files" class="note"></div>
+        </details>
+      </div>
+
+      <div class="card" id="d-summary-card"><h2>概要</h2><div class="kv" id="d-overview"></div></div>
+
+      <div class="card" id="d-req-card" hidden>
+        <div class="row"><h2 style="margin:0">需求原文</h2><span class="grow"></span>
+          <button id="btn-copy-req">复制</button></div>
+        <pre class="req-text" id="d-req"></pre>
+        <div class="note">这是本次运行的唯一输入来源；下游所有阶段的判断都以它为准。</div>
+      </div>
+      <div class="card" id="d-prd-card" hidden>
+        <div class="row"><h2 style="margin:0">产品需求文档 (prd.md)</h2><span class="grow"></span>
+          <button id="btn-prd-edit">编辑</button>
+          <button id="btn-copy-prd">复制</button></div>
+        <div class="md md-box" id="d-prd"></div>
+        <div id="d-prd-edit-box" hidden style="margin-top:10px">
+          <textarea id="d-prd-input" class="code" style="min-height:320px"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" id="btn-prd-save">保存 PRD</button>
+            <button id="btn-prd-regen">按产物重新生成</button>
+            <button id="btn-prd-cancel">取消</button>
+            <span class="note" id="d-prd-out"></span>
+          </div>
+        </div>
+        <div class="note">PM 阶段的产出：背景 / 目标 / 功能需求 / 验收标准，以及第 6 节的
+          <b>已裁决结论</b>与<b>待裁决的默认假设</b> —— 这是人工核对的重点：已裁决的下游直接
+          采纳，未裁决的下游暂按「本次默认取值」推进。裁决保存后会立刻同步到本节。
+          保存人工改写后，流水线不会再覆盖它；想回到产物驱动点「按产物重新生成」（会当场重渲染）。</div>
+      </div>
+      <div class="card" id="d-pmq-card" hidden>
+        <div class="row"><h2 style="margin:0">PM 未决问题与默认取值 · 裁决</h2>
+          <span class="note" id="d-pmq-mode"></span><span class="grow"></span>
+          <button class="primary" id="btn-pmq-save">保存裁决</button></div>
+        <div class="note" id="d-pmq-hint"></div>
+        <div id="d-pmq-body" style="margin-top:10px"></div>
+        <div id="d-pmq-advice"></div>
+        <div class="note" id="d-pmq-out"></div>
+      </div>
+      <div class="card" id="d-intake-card" hidden>
+        <div class="row"><h2 style="margin:0">需求补强 · 待确认问题裁决</h2>
+          <span class="note" id="d-intake-mode"></span><span class="grow"></span>
+          <button class="primary" id="btn-intake-save">保存裁决</button></div>
+        <div class="note" id="d-intake-hint"></div>
+        <div id="d-intake-body" style="margin-top:10px"></div>
+        <div id="d-intake-advice"></div>
+        <div class="note" id="d-intake-out"></div>
+      </div>
+      <div class="card" id="d-issues-card">
+        <h2>问题记录<span id="d-issues-scope"></span> <span class="note" id="d-issue-stats"></span></h2>
+        <div class="flt">
+          <select id="flt-sev">
+            <option value="">全部严重度</option>
+            <option value="blocker">仅阻断</option>
+            <option value="warn">仅警告</option>
+            <option value="info">仅提示</option>
+          </select>
+          <select id="flt-stage"><option value="">全部阶段</option></select>
+          <select id="flt-kind"><option value="">全部类型</option></select>
+          <label><input type="checkbox" id="flt-recurred"> 只看复发</label>
+        </div>
+        <div id="d-issues"></div>
+      </div>
+      <div class="card" id="d-patch-card" hidden>
+        <h2>补丁机械校验与落盘 <span class="note" id="d-patch-stats"></span></h2>
+        <div id="d-patch-audit"></div>
+        <div id="d-patch-files"></div>
+        <pre id="d-patch-view" hidden></pre>
+        <div class="note">套用（默认 dry-run，只写副本；<code>--in-place</code> 才会改仓库并留 <code>*.orig</code> 备份）：
+          <code>python tools\apply_patches.py --run <span id="d-patch-run"></span></code></div>
+      </div>
+      <div class="card" id="d-stages-card"><h2>阶段产物与操作<span id="d-stages-scope"></span></h2><div id="d-stages"></div></div>
+      <div class="card" id="d-ckpt-card">
+        <div class="row"><h2 style="margin:0">检查点时间线</h2><span class="grow"></span>
+          <span class="note" id="d-ckpt-note"></span></div>
+        <div class="note">每一份 <code>NN-&lt;阶段&gt;.json</code> 快照就是一个<b>可回放的状态点</b>（checkpoint）。
+          点「回放到此处」会作废该检查点之后的全部产物（归档到 <code>superseded/</code>）、把游标归位到该阶段并<b>立即续跑</b>。
+          同一阶段在多个轮次里各留一份，可分别定位 —— 这是它比「打回重跑本阶段」更精确的地方。</div>
+        <div id="d-ckpt-list" style="margin-top:10px"></div>
+        <div class="note" id="d-ckpt-out"></div>
+      </div>
+      <div class="card" id="d-handoff-card" hidden>
+        <h2>待人工确认清单 (handoff.md)</h2><div class="md md-box" id="d-handoff"></div>
+      </div>
+      <div class="card" id="d-hrev-card" hidden>
+        <h2>人工审核闸门（交付前最后一道关）</h2>
+        <div class="note">评审已通过后，请人工逐项核对以下 4 项，再决定放行交付或打回修复。</div>
+        <div id="d-hrev-list" style="margin:10px 0">
+          <label><input type="checkbox" id="hrev-core"> ① 核心业务路径走通，主流程通顺</label><br>
+          <label><input type="checkbox" id="hrev-err"> ② 无明显低级错误 / 逻辑硬伤</label><br>
+          <label><input type="checkbox" id="hrev-deliv"> ③ 交付物完整（代码 / 文档 / 说明齐全）</label><br>
+          <label><input type="checkbox" id="hrev-req"> ④ 对照最初需求，核心诉求已满足</label><br>
+        </div>
+        <div class="row">
+          <label><input type="radio" name="hrev-verdict" value="approve"> 通过（放行交付）</label>
+          <label style="margin-left:16px"><input type="radio" name="hrev-verdict" value="reject"> 打回（回流到开发修复）</label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label>审核人 <input type="text" id="hrev-reviewer" placeholder="可选" size="12"></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label>备注 / 打回问题点<br><textarea id="hrev-notes" rows="4" style="width:100%" placeholder="打回时必填：具体哪里不满足、期望如何修复"></textarea></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" id="btn-hrev-submit">提交审核</button>
+          <span class="note" id="d-hrev-out"></span>
+        </div>
+      </div>
+      <div class="card" id="d-log-card" hidden>
+        <div class="row"><h2 style="margin:0">运行日志</h2><span class="grow"></span>
+          <div class="log-bar">
+            <label><input type="checkbox" id="log-follow" checked> 自动跟随</label>
+            <label><input type="checkbox" id="log-only-issues"> 只看警告/错误</label>
+          </div>
+        </div>
+        <pre id="d-log"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="dir-modal" class="modal-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <b>选择目录</b>
+      <span class="path" id="dir-path">此电脑</span>
+      <button id="dir-up">↑ 上级</button>
+      <button id="dir-cancel">取消</button>
+    </div>
+    <div class="modal-body" id="dir-list"></div>
+    <div class="modal-foot">
+      <input id="dir-input" placeholder="或在此直接输入路径，例如 D:/AI/project" style="flex:1">
+      <span class="grow"></span>
+      <button class="primary" id="dir-pick">选择此目录</button>
+    </div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal-mask" hidden>
+  <div class="modal">
+    <div class="modal-head"><b id="confirm-title">请确认</b></div>
+    <div class="modal-body" style="padding:12px 13px;min-height:0;max-height:40vh">
+      <p id="confirm-text"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="grow"></span>
+      <button id="confirm-cancel">取消</button>
+      <button class="danger" id="confirm-ok">确定</button>
+    </div>
+  </div>
+</div>
+<div id="toast-box"></div>
+
+<script>
+const STAGES = ["intake","pm","architect_assess","architect_plan","dev","test","review","human_review"];
+// 可手动勾选的人工闸门：human_review 是评审通过后自动触发的交付闸门，不能作为 --pause-after 传入
+const GATE_STAGES = STAGES.filter(s => s !== "human_review");
+const STAGE_CN = {intake:"需求补强",pm:"产品经理",architect_assess:"架构师·评估",architect_plan:"架构师·方案",dev:"开发",test:"测试",verify:"运行验证",review:"评审",human_review:"人工审核",retrieve:"检索",done:"交付完成"};
+// 流程条上的节点：比 STAGES 多一个 verify（它是真实阶段，只是不参与人工闸门勾选）
+const NODES = ["intake","pm","architect_assess","architect_plan","dev","test","verify","review","human_review"];
+// 节点 → 该节点**专属**卡片。选中某节点时，下方只留这些 + 常驻卡 + 按该节点过滤过的
+// 「阶段产物 / 问题记录」。没列进来的属于全局卡，只在「全部」视图出现。
+const NODE_CARDS = {
+  intake: ["d-intake-card"],
+  pm: ["d-prd-card", "d-pmq-card"],
+  architect_assess: [],
+  architect_plan: [],
+  // 「能不能跑」是 dev 的直接产物问题，演示卡跟着它
+  dev: ["d-patch-card", "d-demo-card"],
+  test: [],
+  verify: ["d-verify-card", "d-demo-card"],
+  review: [],
+  // 人工审核闸门要看的是**整批交付物**（代码 / 补丁 / 运行验证证据），而它自己那一格
+  // 根本没有产物 —— 按节点过滤会把 dev/verify 的证据全藏起来，人工就没东西可核对了。
+  human_review: ["d-hrev-card", "d-patch-card", "d-verify-card", "d-demo-card"],
+};
+// 这些节点属于「复核全局」：选中它们时产物/问题/卡片一律不过滤（等同「全部」）
+const SCOPE_ALL_NODES = new Set(["human_review"]);
+// 只在「全部」视图出现的全局卡（与某个具体节点无关的概览性内容）
+const ALL_ONLY_CARDS = ["d-req-card", "d-ckpt-card", "d-handoff-card", "d-log-card"];
+// 受节点过滤管辖的卡片全集
+const MANAGED_CARDS = [...new Set([...Object.values(NODE_CARDS).flat(), ...ALL_ONLY_CARDS])];
+const S = {runs:[], current:null, detail:null, timer:null, tick:null, phase:null, editable:false,
+           manage:false, pick:new Set(), node:"", nodePin:false};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ----------------------------------------------------------- 通用小工具 */
+
+// 内容签名：轮询每 2.5s 触发一次 loadDetail，用它判断某块内容到底变了没 ——
+// 没变就不重渲，否则会冲掉用户的展开状态、未保存的编辑与选中文本。
+function sigOf(obj){
+  const s = JSON.stringify(obj);
+  let h = 0;
+  for(let i = 0; i < s.length; i++){ h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0; }
+  return `${s.length}:${h}`;
+}
+function skipIfSame(box, sig){
+  if(sig != null && box.dataset.sig === sig) return true;
+  box.dataset.sig = sig;
+  return false;
+}
+// 勾选框的「未提交改动」保护：容器整块重建后按 id 写回用户改过的勾选。
+// dataset.rendered 是上次渲染写入的值，与它不同即视为「用户改过」。
+function rememberChecks(root){
+  const mem = {};
+  root.querySelectorAll("input[type=checkbox]").forEach(el => {
+    if(el.dataset.rendered != null && String(el.checked) !== el.dataset.rendered) mem[el.id] = el.checked;
+  });
+  return mem;
+}
+function restoreChecks(root, mem){
+  root.querySelectorAll("input[type=checkbox]").forEach(el => {
+    if(mem[el.id] != null) el.checked = mem[el.id];
+    el.dataset.rendered = String(el.checked);
+  });
+}
+
+// 轻量 toast：替代原生 alert（原生弹窗阻塞渲染，且与深色主题不搭）
+function toast(msg, kind){
+  const el = document.createElement("div");
+  el.className = "toast" + (kind ? " " + kind : "");
+  el.textContent = msg;
+  $("toast-box").appendChild(el);
+  setTimeout(() => el.remove(), kind === "bad" ? 9000 : 4500);
+}
+// 轻量确认框：替代原生 confirm
+let _confirmResolve = null;
+function askConfirm(title, text, okLabel){
+  $("confirm-title").textContent = title || "请确认";
+  $("confirm-text").textContent = text || "";
+  $("confirm-ok").textContent = okLabel || "确定";
+  $("confirm-modal").hidden = false;
+  $("confirm-cancel").focus();
+  return new Promise(resolve => { _confirmResolve = resolve; });
+}
+function settleConfirm(v){
+  $("confirm-modal").hidden = true;
+  const r = _confirmResolve;
+  _confirmResolve = null;
+  if(r) r(v);
+}
+
+// 极简 markdown 渲染：handoff / PRD / 问题总览都是给人读的文档，塞进 <pre> 全是源码形态。
+// 先 esc 再替换，因此不存在注入风险；只支持文档里实际用到的语法（标题/列表/粗体/行内码/代码块/引用/分隔线）。
+function mdToHtml(src){
+  const inline = s => s
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  const lines = esc(src || "").split("\n");
+  const out = [];
+  let inFence = false, listOpen = false;
+  const closeList = () => { if(listOpen){ out.push("</ul>"); listOpen = false; } };
+  for(const line of lines){
+    if(/^\s*```/.test(line)){
+      closeList();
+      out.push(inFence ? "</pre>" : '<pre class="log-code">');
+      inFence = !inFence;
+      continue;
+    }
+    if(inFence){ out.push(line); continue; }
+    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    if(h){ closeList(); const lv = Math.min(h[1].length + 2, 6); out.push(`<h${lv}>${inline(h[2])}</h${lv}>`); continue; }
+    if(/^\s*---+\s*$/.test(line)){ closeList(); out.push("<hr>"); continue; }
+    if(/^&gt;\s?/.test(line)){ closeList(); out.push(`<blockquote>${inline(line.replace(/^&gt;\s?/, ""))}</blockquote>`); continue; }
+    const ul = /^\s*[-*]\s+(.*)$/.exec(line);
+    if(ul){ if(!listOpen){ out.push("<ul>"); listOpen = true; } out.push(`<li>${inline(ul[1])}</li>`); continue; }
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if(ol){ if(!listOpen){ out.push("<ul>"); listOpen = true; } out.push(`<li class="md-ordered">${inline(ol[1])}</li>`); continue; }
+    if(!line.trim()){ closeList(); continue; }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  if(inFence) out.push("</pre>");
+  return out.join("\n");
+}
+
+// 运行日志按行着色：警告/错误/机制判定以前全是一个颜色，扫读成本高
+function highlightLog(text, onlyIssues){
+  const rows = String(text || "").split("\n");
+  const picked = onlyIssues ? rows.filter(l => /警告|错误|Traceback|Error|\[机制\]|机制判定/.test(l)) : rows;
+  return picked.map(l => {
+    const cls = /\[机制\]|机制判定/.test(l) ? "log-note"
+      : /警告|Traceback|\[错误\]/.test(l) ? "log-warn"
+      : /\bError\b|failed|失败/.test(l) ? "log-bad" : "";
+    return cls ? `<span class="${cls}">${esc(l) || " "}</span>` : esc(l);
+  }).join("\n");
+}
+
+// 把 fetch 的底层报错（Failed to fetch 等）翻译成可操作的提示
+function netHint(e){
+  const msg = (e && e.message) || String(e);
+  if(location.protocol === "file:"){
+    return "页面是直接用文件打开的（file://），后端不可达。请先运行 python -m pipeline.server --port 8787，"
+      + "然后用 http://127.0.0.1:8787/ 打开本页面。";
+  }
+  if(/failed to fetch|networkerror|load failed|err_connection/i.test(msg)){
+    return "无法连接后端服务：请确认服务已启动（python -m pipeline.server --port 8787），"
+      + "并保持在本服务地址下操作；若服务已重启，请刷新页面。";
+  }
+  return msg;
+}
+
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch(e) { data = {error:text}; }
+  if(!res.ok){
+    // 后端返回的是 HTML 错误页（如 501 Unsupported method）而非 JSON：不要整页弹出来，
+    // 给一句人话 —— 这类情况多半是服务进程还是改动前的旧代码。
+    if(/^\s*(?:<!doctype|<html)/i.test(text || "")){
+      const hint = /unsupported method/i.test(text || "")
+        ? "后端不支持该操作：服务进程多半还是改动前的旧代码，请重启服务后重试"
+        : "后端返回了 HTML 错误页，请检查服务是否正常";
+      throw new Error(`HTTP ${res.status} —— ${hint}`);
+    }
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function badge(text, cls){ return text ? `<span class="b ${cls||""}">${esc(text)}</span>` : ""; }
+function statusBadge(run){
+  const st = run.status;
+  if(run.running) return badge("运行中","acc");
+  // 进程没了、state 却还写着 running：**可续跑**的中断态。必须在这里认出来，
+  // 否则会退化成原始英文 `running`，看着像还在跑（详情页早就这么判了，列表要对齐）。
+  if(run.orphaned) return badge("异常中断","bad");
+  if(st === "paused") return badge("已暂停","warn");
+  if(st === "done") return badge("已结束","ok");
+  // 启动即失败（没有 state.json，目录里只有 console.log）
+  if(st === "failed") return badge("启动失败","bad");
+  return badge(st || "未知");
+}
+function verdictBadge(v){
+  if(!v) return "";
+  const cls = v === "pass" ? "ok" : (v === "needs_human" ? "bad" : (v === "paused" ? "warn" : "acc"));
+  return badge(v, cls);
+}
+
+// 由详情推导 UI 相位：running（进行中）/ paused（已暂停可续跑）/ done（已结束）/ nostate（缺 state）/ idle
+function runPhase(d){
+  if(!d) return "idle";
+  if(d.running) return "running";
+  const st = d.state || {};
+  if(!d.has_state) return "nostate";
+  // 进程没了、state 却还写着 running ⇒ 上次是异常中断（后端重启把子进程带断 /
+  // 进程被外部杀掉）。它不是「正在跑」，而是**可以续跑**的中断态。
+  if(d.orphaned) return "aborted";
+  if(st.status === "done") return "done";
+  if(st.status === "paused") return "paused";
+  // 兜底：状态写着 running、进程却没了。正常情况上面那句 orphaned 已经拦住了，
+  // 这里防的是接口没给 orphaned（旧响应 / 缓存）时**误报成「运行中」**—— 那会把
+  // 「继续执行」置灰、页面显示「运行中：等待结束」，人工既不知道真相也续不了跑。
+  // 必须复用已存在的 aborted 相位（renderDetail / renderProgress 都认它），
+  // 不能新造一个没人处理的相位名。
+  if(st.status === "running") return "aborted";
+  return st.status || "idle";
+}
+function lastLogLine(log){
+  if(!log) return "";
+  const lines = log.split("\n").map(s => s.trim()).filter(Boolean);
+  return lines.length ? lines[lines.length-1].slice(0,160) : "";
+}
+function elapsedSec(d){
+  if(d && d.started_at) return Math.max(0, Math.round(Date.now()/1000 - d.started_at));
+  const sm = (d && d.summary) || {}, st = (d && d.state) || {};
+  return sm.wall_s ?? st.elapsed_s ?? null;
+}
+/* ------------------------------------------------------------------ 演示 */
+// 演示数据按 run 缓存：轮询每 2.5s 会调 renderDetail，不能每次都去拉沙箱清单
+const DEMO = {run:null, data:null, out:null};
+async function loadDemo(force){
+  if(!S.current) return;
+  if(!force && DEMO.run === S.current) return;
+  DEMO.run = S.current; DEMO.data = null; DEMO.out = null;
+  if($("d-demo-cmd")) $("d-demo-cmd").value = "";
+  try{
+    DEMO.data = await api(`/api/runs/${encodeURIComponent(S.current)}/demo`);
+  }catch(e){ DEMO.data = {error: netHint(e)}; }
+  renderDemo();
+}
+function renderDemo(){
+  const card = $("d-demo-card");
+  const d = DEMO.data;
+  if(!d){ card.hidden = true; return; }
+  card.hidden = !!d.error;
+  if(d.error){ return; }
+  $("d-demo-note").textContent = d.sandbox ? `沙箱 runs/${d.run_id}/verify/work` : "";
+  if(!$("d-demo-cmd").value) $("d-demo-cmd").value = d.command || "";
+  $("d-demo-files").innerHTML = (d.files || []).length
+    ? (d.files||[]).map(f => `<div>· <code>${esc(f)}</code></div>`).join("")
+    : `<div class="note">沙箱里还没有文件</div>`;
+  // 没有入口 → 无法演示，给一条能直接喂给开发的打回意见
+  const bad = !d.runnable;
+  $("btn-demo-reject").hidden = !bad;
+  $("d-demo-meta").innerHTML = bad
+    ? `<span style="color:var(--bad)">无法演示：${esc(d.note || "交付物没有可执行入口")}</span>`
+    : `自动挑中的入口命令：<code>${esc(d.command || "")}</code>`;
+  renderDemoOut();
+}
+function renderDemoOut(){
+  const box = $("d-demo-out"), r = DEMO.out;
+  if(!r){ box.textContent = ""; return; }
+  if(r.error){ box.textContent = "执行失败：" + r.error; return; }
+  const statusCn = {ok:"通过", fail:"失败", timeout:"超时", error:"无法执行", skipped:"未执行"};
+  const head = `命令：${r.command}\n状态：${statusCn[r.status] || r.status}`
+    + (r.exit_code != null ? `（退出码 ${r.exit_code}）` : "")
+    + `　耗时：${r.duration_s}s`
+    + (r.reason ? `\n说明：${r.reason}` : "");
+  const so = (r.stdout_tail || "").trim(), se = (r.stderr_tail || "").trim();
+  box.textContent = head
+    + "\n\n── stdout ──\n" + (so || "（空）")
+    + "\n\n── stderr ──\n" + (se || "（空）");
+}
+async function runDemo(){
+  if(!S.current) return;
+  $("btn-demo-run").disabled = true;
+  $("d-demo-out").textContent = "执行中…（沙箱内，超时会被强杀）";
+  try{
+    DEMO.out = await api(`/api/runs/${encodeURIComponent(S.current)}/demo`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        command: $("d-demo-cmd").value.trim(),
+        timeout: Number($("d-demo-timeout").value || 20),
+      })
+    });
+  }catch(e){ DEMO.out = {error: netHint(e)}; }
+  finally{ $("btn-demo-run").disabled = false; }
+  renderDemoOut();
+}
+function demoFillReject(){
+  const d = DEMO.data || {};
+  const text = "产物无法运行，请修复：1) 补齐模块之间的 import（当前产物里存在「用了别的文件里的名字却没 import」，"
+    + "运行时会直接 NameError）；2) 补一个可执行入口（main.py 或 __main__），让人能直接跑起来；"
+    + "3) 运行时要有实际输出（如打印状态/结果），否则无法验证。"
+    + (d.note ? `（机制提示：${d.note}）` : "");
+  const notes = $("hrev-notes");
+  if(notes){ notes.value = text; notes.scrollIntoView({behavior:"smooth", block:"center"}); }
+  const rej = document.querySelector('input[name="hrev-verdict"][value="reject"]');
+  if(rej) rej.checked = true;
+  $("d-hrev-card").hidden = false;
+}
+
+/* ------------------------------------------------- 节点驱动的信息联动 */
+// 「当前节点」：运行中跟随游标，暂停时跟随闸门所在阶段，已结束/缺 state 则回到「全部」
+function currentNode(d){
+  const phase = runPhase(d), st = (d && d.state) || {};
+  const c = phase === "running" ? st.cursor
+          : (phase === "paused" ? (st.paused_after || st.cursor) : "");
+  return NODES.includes(c) ? c : "";
+}
+// 当前选中节点的产物快照（未选节点 = 全部；复核型节点 = 全部）
+function nodeSnaps(d){
+  const all = (d && d.stages) || [];
+  return (S.node && !SCOPE_ALL_NODES.has(S.node)) ? all.filter(s => s.stage === S.node) : all;
+}
+// 渲染阶段会把「没有内容」的卡片置 hidden（如没有 prd 就不显示 PRD 卡）。
+// 这里把它记下来，之后节点过滤只在它之上做**减法** —— 绝不把空卡片强行显示出来。
+function markCardIntrinsic(){
+  MANAGED_CARDS.forEach(id => { const el = $(id); if(el) el.dataset.intr = el.hidden ? "0" : "1"; });
+}
+function applyNodeFilter(){
+  const node = S.node || "", all = !node;
+  const spec = new Set(NODE_CARDS[node] || []);
+  const scopeAll = SCOPE_ALL_NODES.has(node);   // 复核型节点：一律不过滤
+  MANAGED_CARDS.forEach(id => {
+    const el = $(id); if(!el) return;
+    const allowed = (all || scopeAll) ? true : spec.has(id);
+    el.hidden = !(allowed && el.dataset.intr !== "0");
+  });
+  const scope = !node ? ""
+    : (scopeAll ? " · 全部交付物（人工复核）" : ` · ${STAGE_CN[node] || node}`);
+  $("d-stages-scope").textContent = scope;
+  $("d-issues-scope").textContent = scope;
+  const mode = $("d-node-mode");
+  if(mode){
+    const label = esc(node ? (STAGE_CN[node] || node) : "全部");
+    mode.innerHTML = S.nodePin
+      ? `已固定：<b>${label}</b> · <a href="#" id="d-node-follow">跟随当前</a>`
+      : (node ? `跟随当前：<b>${label}</b>` : "全部信息");
+    const a = $("d-node-follow");
+    if(a) a.onclick = e => { e.preventDefault(); selectNode(currentNode(S.detail), false); };
+  }
+}
+async function selectNode(stage, pin){
+  S.node = stage || "";
+  // 手动选择默认固定住（**包括「全部」**）。否则运行中点「全部」会在下一次渲染
+  // 被自动跟随立刻拉回当前节点 —— 等于运行期间根本没法看全局信息。
+  // 回退到自动跟随走「跟随当前」链接，它传 pin=false。
+  S.nodePin = pin !== false;
+  S.graphSel = S.node || null;
+  if(!S.detail) return;
+  renderStages(nodeSnaps(S.detail));
+  renderIssues(S.detail);
+  applyNodeFilter();
+  renderProgress(S.detail);
+  if(S.node) await renderStagePanel(S.detail, S.node, true);
+}
+
+// 进度卡片：阶段流水线 + 当前阶段 + 已用时间 + 最近活动
+function renderProgress(d){
+  const st = d.state || {}, sm = d.summary || {};
+  const phase = runPhase(d);
+  const counts = {};
+  (d.stages||[]).forEach(s => { counts[s.stage] = (counts[s.stage]||0)+1; });
+  const cur = phase === "running" ? st.cursor : null;
+
+  // 自动跟随：没被人工固定时，选中节点随流水线推进而移动 —— 下方信息跟着换
+  if(!S.nodePin){
+    const follow = currentNode(d);
+    if(follow !== S.node){
+      S.node = follow;
+      S.graphSel = follow || null;
+      // 只有真正换了节点才重渲染受影响的块（换节点是低频事件，不会每 tick 都触发）
+      // 注意：这里**不能**调 markCardIntrinsic —— 此刻卡片还带着上一次过滤后的
+      // hidden 状态，会把「被节点过滤隐藏」误记成「没有内容」，之后再切回该节点
+      // 就永远显示不出来了。intrinsic 只在 renderDetail 末尾记录一次。
+      renderStages(nodeSnaps(d));
+      renderIssues(d);
+      applyNodeFilter();
+    }
+  }
+
+  const chip = s => {
+    const n = counts[s]||0;
+    let cls = n>0 ? "done" : "pending";
+    if(s === cur) cls = "cur";
+    const sel = S.node === s ? " sel" : "";
+    return `<button type="button" class="chip ${cls}${sel}" data-node="${esc(s)}"
+      title="只看「${esc(STAGE_CN[s]||s)}」的相关信息">${cls==="done"?"✓ ":""}${esc(STAGE_CN[s]||s)}${n>1?` ×${n}`:""}</button>`;
+  };
+  $("d-flow").innerHTML =
+    NODES.map(chip).join(`<span class="arrow">›</span>`)
+    + `<span class="arrow">›</span>`
+    + `<button type="button" class="chip all${S.node ? "" : " sel"}" data-node=""
+      title="显示全部信息">全部</button>`;
+  $("d-flow").querySelectorAll("button.chip").forEach(b => {
+    b.onclick = () => selectNode(b.dataset.node || "");
+  });
+  applyNodeFilter();   // 阶段名/模式提示随选中节点更新
+
+  const parts = [];
+  if(phase === "running"){
+    parts.push(`运行中 · 正在执行 <b>${esc(STAGE_CN[st.cursor]||st.cursor||"?")}</b>`);
+    // 外部进程：本服务重启之后，注册表里已经没有这个孩子了，靠它在运行目录里维持的
+    // pid + 心跳才判得出「还在跑」（见 pipeline/presence.py）。必须说明白，否则
+    // 「运行中」却像是没有可用的中断句柄，人会以为卡死。
+    if(d.presence) parts.push(
+      `<span style="color:var(--warn)">外部进程 pid=${esc(String(d.presence.pid||"?"))}`
+      + `（阶段 ${esc(STAGE_CN[d.presence.stage]||d.presence.stage||"?")}）· 「中断」会按 pid 结束它</span>`);
+  } else if(phase === "paused"){
+    parts.push(`已暂停在 <b>${esc(STAGE_CN[st.paused_after]||st.paused_after||"?")}</b> 之后`);
+  } else if(phase === "done"){
+    parts.push(`已结束 · 判定 <b>${esc(sm.verdict||st.verdict||"-")}</b>`);
+  } else if(phase === "aborted"){
+    parts.push(`异常中断：进程已不在，停在 <b>${esc(STAGE_CN[st.cursor]||st.cursor||"?")}</b>（可续跑）`);
+  } else {
+    parts.push("（无 state.json，无法探测进度）");
+  }
+  if(st.attempt) parts.push(`第 ${st.attempt} 轮`);
+  const el = elapsedSec(d);
+  if(el != null) parts.push(`已用 ${el}s`);
+  $("d-prog-summary").innerHTML = parts.join(" · ");
+
+  const snaps = (d.stages||[]).slice();
+  const last = snaps.length ? snaps[snaps.length-1] : null;
+  const detail = [];
+  if(last) detail.push(`最近完成：${STAGE_CN[last.stage]||last.stage}${last.meta && last.meta.wall_s!=null?`（${last.meta.wall_s}s）`:""}`);
+  if(phase === "running"){
+    const ll = lastLogLine(d.log);
+    if(ll) detail.push(`日志：${ll}`);
+  }
+  $("d-prog-detail").textContent = detail.join("　|　");
+}
+
+/* ------------------------------------------------------------------ 列表 */
+async function loadRuns(){
+  const data = await api("/api/runs");
+  S.runs = data.runs || [];
+  $("svc").textContent = "runs: " + data.runs_dir;
+  $("busy").textContent = data.busy_with ? ("▶ 正在跑 " + data.busy_with) : "空闲";
+  $("btn-new").disabled = !!data.busy_with;   // 单驻留：有运行进行中时禁用新建
+  $("btn-new").title = data.busy_with ? ("已有运行进行中（" + data.busy_with + "），显存单驻留") : "";
+  $("btn-manage").textContent = S.manage ? "退出管理" : "管理";
+  $("sel-all-row").hidden = !S.manage;
+  $("btn-del-sel").hidden = !S.manage;
+  pickedLabel();
+  loadJobs().catch(() => {});   // 作业列表（入口总闸产出）与运行列表同频刷新
+  $("run-list").innerHTML = S.runs.map(r => `
+    <div class="run ${S.current===r.run_id?"active":""}" data-run="${esc(r.run_id)}">
+      <div class="row">
+        ${S.manage?`<input type="checkbox" class="run-pick" data-run="${esc(r.run_id)}"${S.pick.has(r.run_id)?" checked":""}${r.running?" disabled":""}>`:""}
+        <span class="id">${esc(r.run_id)}</span><span class="grow"></span>${statusBadge(r)}
+        <button class="danger run-del" data-del="${esc(r.run_id)}"${r.running?" disabled":""}"
+          title="${r.running?"运行中：请先「中断」再删除":"删除该运行及其全部产物"}"
+          style="padding:0 6px;font-size:12px;line-height:1.5">×</button>
+      </div>
+      <div class="meta">
+        ${verdictBadge(r.verdict)}
+        ${r.running&&r.cursor?badge("执行中 "+(STAGE_CN[r.cursor]||r.cursor),"acc"):(r.cursor?badge("next "+(STAGE_CN[r.cursor]||r.cursor)):"")}
+        ${r.attempts?badge("迭代 "+r.attempts):""}
+        ${r.presence?badge("外部进程 pid="+esc(String(r.presence.pid||"?")),"warn"):""}
+        ${r.reviewed_rounds?badge("评审 "+r.reviewed_rounds):""}
+        ${r.wall_s?badge(r.wall_s+"s"):""}
+        ${r.issues && r.issues.total?badge("问题 " + r.issues.total, r.issues.blockers?"bad":""):""}
+      </div>
+      ${r.paused_after?`<div class="meta">${badge("停在 "+r.paused_after+" 之后","warn")}</div>`:""}
+    </div>`).join("") || `<div class="note">还没有运行记录。</div>`;
+  $("run-list").querySelectorAll(".run").forEach(el =>
+    el.onclick = () => openRun(el.dataset.run));
+  // 行内删除按钮：阻止冒泡，否则会连带触发「打开该运行」
+  $("run-list").querySelectorAll(".run-del").forEach(el => {
+    el.onclick = e => { e.stopPropagation(); deleteRun(el.dataset.del); };
+  });
+  $("run-list").querySelectorAll(".run-pick").forEach(el => {
+    el.onclick = e => e.stopPropagation();
+    el.onchange = () => {
+      if(el.checked) S.pick.add(el.dataset.run); else S.pick.delete(el.dataset.run);
+      pickedLabel();
+      syncSelAll();
+    };
+  });
+  syncSelAll();
+}
+
+/* --------------------------------------------------------- 运行列表维护（删除） */
+function pickedLabel(){
+  $("btn-del-sel").textContent = S.pick.size ? `删除选中 (${S.pick.size})` : "删除选中";
+  $("btn-del-sel").disabled = !S.pick.size;
+}
+function syncSelAll(){
+  const all = $("sel-all");
+  if(!all) return;
+  const pickable = (S.runs||[]).filter(r => !r.running);
+  all.disabled = !pickable.length;
+  all.checked = pickable.length > 0 && pickable.every(r => S.pick.has(r.run_id));
+}
+// 清空详情面板（删掉的运行正好是当前打开的那次时用）
+function clearDetailIfGone(goneIds){
+  if(S.current && goneIds.includes(S.current)){
+    S.current = null; S.detail = null;
+    $("detail").hidden = true; $("empty").hidden = false;
+  }
+}
+async function deleteRun(runId){
+  const row = (S.runs||[]).find(r => r.run_id === runId);
+  if(row && row.running){ toast("该运行正在进行中，请先「中断」再删除", "bad"); return; }
+  if(!await askConfirm("删除运行",
+    `删除运行 ${runId} 及其全部产物（阶段快照 / 日志 / 补丁 / 需求原文）？\n此操作不可撤销。`,
+    "删除")) return;
+  try{
+    await api("/api/runs/" + encodeURIComponent(runId), {method:"DELETE"});
+    toast("已删除 " + runId, "ok");
+    clearDetailIfGone([runId]);
+    await loadRuns();
+  }catch(e){ toast("删除失败：" + e.message, "bad"); }
+}
+async function deleteSelected(){
+  const ids = [...S.pick];
+  if(!ids.length){ toast("请先勾选要删除的运行", "warn"); return; }
+  const running = ids.filter(id => (S.runs||[]).find(r => r.run_id === id && r.running));
+  if(running.length){
+    toast("以下运行正在进行中，请先中断：" + running.join("、"), "bad"); return;
+  }
+  if(!await askConfirm("批量删除运行",
+    `删除选中的 ${ids.length} 次运行及其全部产物？\n此操作不可撤销。`, "删除")) return;
+  try{
+    const r = await api("/api/runs/delete", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({run_ids: ids})
+    });
+    toast(`已删除 ${r.removed.length} 次运行` + (r.failed.length ? `，${r.failed.length} 项失败` : ""),
+          r.failed.length ? "warn" : "ok");
+    if(r.failed.length) console.warn("删除失败明细", r.failed);
+    clearDetailIfGone(r.removed);
+    S.pick = new Set();
+    await loadRuns();
+  }catch(e){ toast("批量删除失败：" + e.message, "bad"); }
+}
+
+/* ------------------------------------------------------------------ 详情 */
+async function openRun(runId){
+  S.current = runId;
+  // 换运行就回到「跟随当前」：新运行的阶段进度与上一个无关，固定住会看到空面板
+  S.node = ""; S.nodePin = false; S.graphSel = null;
+  resetAdvice();   // 裁决参谋的问答线程按运行隔离，换运行必须整体作废
+  DEMO.run = null;   // 换运行 → 强制重拉沙箱演示数据
+  document.querySelectorAll(".run").forEach(el =>
+    el.classList.toggle("active", el.dataset.run === runId));
+  $("empty").hidden = true;
+  $("new-form").hidden = true;
+  $("report-view").hidden = true;
+  $("config-view").hidden = true;
+  $("job-view").hidden = true;
+  $("detail").hidden = false;
+  await loadDetail();
+  startPolling();
+}
+
+async function loadDetail(){
+  if(!S.current) return;
+  const d = await api("/api/runs/" + encodeURIComponent(S.current));
+  S.detail = d;
+  renderDetail();
+}
+
+function startPolling(){
+  if(S.timer) clearInterval(S.timer);
+  if(S.tick) clearInterval(S.tick);
+  S.timer = setInterval(async () => {
+    if(!S.detail) return;
+    if(S.detail.running){ try { await loadDetail(); await loadRuns(); } catch(e){} }
+  }, 2500);
+  // 运行中每秒刷新进度卡片（已用时间 / 当前阶段），不整页重渲
+  S.tick = setInterval(() => {
+    if(S.detail && S.detail.running){ try { renderProgress(S.detail); } catch(e){} }
+  }, 1000);
+}
+
+function renderDetail(){
+  const d = S.detail, st = d.state || {}, sm = d.summary || {};
+  const phase = runPhase(d);
+  const running = phase === "running";
+  // 可续跑 / 编辑产物 / 改闸门 的相位。
+  // needs_human（触顶后 status=done）**必须**也能操作：那正是「需要人工介入」的场景，
+  // 若把 done 一律当只读，人工就只能去命令行敲 --from，页面上无路可走。
+  // 异常中断态（aborted）同样可续跑：进程已经没了，不给人续跑的入口就永远卡住
+  const editable = phase === "paused" || phase === "aborted"
+    || (phase === "done" && !!st.needs_human);
+  S.phase = phase; S.editable = editable;
+  $("d-id").textContent = d.run_id;
+  $("d-badges").innerHTML = [
+    running ? badge("运行中","acc")
+      : (phase === "aborted" ? badge("异常中断","bad") : badge(st.status || "未知")),
+    verdictBadge(sm.verdict || (st.needs_human ? "needs_human" : "")),
+    (running && st.cursor) ? badge("执行中 " + (STAGE_CN[st.cursor]||st.cursor), "acc") : "",
+    // 外部进程：本服务不持有它的句柄，但「中断」会按 pid 结束它（见 /stop 实现）
+    d.presence ? badge("外部进程 pid=" + (d.presence.pid||"?"), "warn") : "",
+    (st.paused_after ? badge("停在 " + (STAGE_CN[st.paused_after]||st.paused_after) + " 之后", "warn") : "")
+  ].join(" ");
+
+  // 续跑按钮：运行中 / 已结束 / 缺 state → 一律置灰；仅暂停态可续跑
+  $("btn-resume").disabled = !editable;
+  $("btn-stop").disabled = !running;
+  $("btn-resume").title = editable
+    ? (phase === "aborted" ? "从中断处接着跑（进程已不在，续跑会重新拉起）" : "")
+    : (running ? "运行中，不可续跑（可点「中断」）"
+      : (d.has_state ? "该运行已结束，无法续跑" : "该运行没有 state.json，无法续跑"));
+
+  // 录入控件随状态控制
+  $("feedback").disabled = !editable;
+  $("issue-kind").disabled = !editable;
+  $("feedback").placeholder = editable
+    ? "例：方案里不要动 config.py；导出必须走流式，避免大结果集把内存吃满"
+    : (running ? "运行中不可编辑" : "该运行不可再续跑，人工意见不会生效");
+
+  const gates = st.pause_after || [];
+  renderGates("d-gates", "dg", gates);
+  $("d-gates").querySelectorAll("input").forEach(el => el.disabled = !editable);
+  // 锁定态（运行中 / 已结束）下勾选框是 disabled，浏览器默认把它压暗、深色底上难辨，
+  // 因此额外给一行只读读数：把本次运行实际设置的闸门直接列出来（勾选框照旧锁定不改）。
+  const ro = $("d-gates-ro");
+  const initial = st.initial_pause_after || [];
+  if(editable){
+    ro.hidden = true; ro.innerHTML = "";
+  } else {
+    ro.hidden = false;
+    // 优先展示「创建时的原始输入」：续跑时可能被改成跑到底（pause_after 清空），
+    // 但这次运行当初勾了什么必须仍然读得到。
+    const shown = initial.length ? initial : gates;
+    const changed = initial.length && gates.join(",") !== initial.join(",");
+    ro.innerHTML = shown.length
+      ? '<span class="note">创建时勾选的闸门（已锁定，不可修改）：</span> '
+        + shown.map(s => badge(STAGE_CN[s] || s, "warn")).join(" ")
+        + (changed ? '<span class="note">　当前已改为：' + (gates.length ? gates.map(s => esc(STAGE_CN[s] || s)).join("、") : "跑到底（无）") + '</span>' : "")
+      : '<span class="note">本次运行未设置人工闸门（跑到底）</span>';
+  }
+
+  // 顶部控制说明
+  $("d-ctl-note").className = "ctl-note " + (running ? "" : (editable ? "ok" : "dim"));
+  $("d-ctl-note").textContent = running ? "运行中：等待结束或点「中断」"
+    : (editable
+      ? (st.needs_human
+        ? "已触顶待人工裁决：可打回某个阶段重跑，并可在下方放宽回流上限"
+        : (phase === "aborted"
+          ? "异常中断（进程已不在）：可点「继续执行」从中断处接着跑"
+          : "已暂停：可续跑 / 编辑产物 / 打回"))
+      : (d.has_state ? "已结束：不可续跑，仅供查看" : "无 state.json：仅供查看"));
+  // 回流上限输入：仅可操作相位可改；只读时把当前值放进 placeholder 供对照
+  const maxInput = $("dg-max");
+  if(maxInput){
+    maxInput.disabled = !editable;
+    maxInput.placeholder = "当前 " + (st.max_rework ?? "-");
+  }
+
+  renderProgress(d);
+
+  const warn = (st.grounding_warnings || []).map(w => `${w.stage}: ${(w.paths||[]).join(", ")}`);
+  $("d-msg").innerHTML =
+    (!d.has_state ? `<div class="warnbox">该运行没有 state.json（可能是 --only 运行），只能查看，不能续跑。</div>` : "") +
+    (d.superseded ? `<div class="note">已作废旧快照 ${d.superseded} 个（superseded/）。</div>` : "") +
+    (warn.length ? `<div class="warnbox">未接地路径：${esc(warn.join("；"))}</div>` : "") +
+    (Object.keys(st.human_feedback||{}).length
+      ? `<div class="note">已注入人工意见：${esc(JSON.stringify(st.human_feedback))}</div>` : "");
+
+  // 顶部 d-badges 里这几个字段是彩色 badge，概要表里却是裸文本 —— 同一信息两种呈现，
+  // 人工得来回对照。这里统一成 badge（其余字段保持纯文本）。
+  const rows = [
+    ["状态", {html: running ? badge("运行中", "acc") : badge(st.status || "未知")}],
+    ["判定", {html: verdictBadge(sm.verdict || (st.needs_human ? "needs_human" : "")) || '<span class="note">-</span>'}],
+    ["进度游标", st.cursor || "-"],
+    ["迭代轮次", (st.attempt ?? "-") + " 轮 / 评审 " + ((st.rounds||[]).length) + " 次"],
+    ["评审频率", "review_every=" + (st.review_every ?? "-")],
+    ["人工闸门", (st.pause_after||[]).join(", ") || "（无）"],
+    ["回流上限", st.max_rework ?? "-"],
+    ["模型切换", (sm.model_switches ?? "-") + " 次"],
+    ["耗时", (sm.wall_s ?? st.elapsed_s ?? "-") + "s"],
+    ["tokens", "prompt " + (sm.total_prompt_tokens ?? "-") + " / output " + (sm.total_output_tokens ?? "-")],
+    ["问题记录", (d.issue_summary && d.issue_summary.total) + " 条（阻断 " + ((d.issue_summary||{}).blockers||0) + "）"],
+    ["流水线指纹", ((d.env||{}).fingerprint||{}).pipeline_hash || "-"],
+    ["提示词指纹", ((d.env||{}).fingerprint||{}).prompts_hash || "-"],
+    ["原始调用留存", (d.trace_calls || 0) + " 条 trace"],
+    ["仓库", sm.repo || st.repo || "未提供"],
+    ["项目类型", {html: d.project_type === "new" ? badge("新建项目", "acc")
+      : (d.project_type === "secondary" ? badge("二次开发") : '<span class="note">未记录</span>')}],
+  ];
+  const ovBox = $("d-overview");
+  if(!skipIfSame(ovBox, sigOf(rows))){
+    ovBox.innerHTML = rows.map(([k, v]) =>
+      `<div>${esc(k)}</div><div>${v && typeof v === "object" ? v.html : esc(v)}</div>`).join("");
+  }
+
+  // 需求原文：唯一输入来源，缺了就只能去翻 runs/<id>/requirement.txt
+  const reqText = d.requirement || st.requirement || "";
+  $("d-req-card").hidden = !reqText;
+  $("d-req").textContent = reqText;
+
+  // PRD：PM 阶段的完整产出（未决问题与默认假设在第 6 节），人工核对的主要入口。
+  // 渲染成 HTML 而不是塞进 <pre> —— 这是给人读的文档，不是源码。
+  $("d-prd-card").hidden = !d.prd;
+  if(!skipIfSame($("d-prd"), sigOf(d.prd || ""))) $("d-prd").innerHTML = mdToHtml(d.prd || "");
+
+  renderStages(nodeSnaps(d));   // 节点联动：只渲染当前选中节点的产物
+  renderCheckpoints(d);
+  renderGatewayLink(d);   // 被入口总闸拆成作业时，这里指向作业目录
+  renderVerify(d);   // 最终输出的运行验证结果（沙箱里真跑出来的机械证据）
+  refreshGraph(d);   // 阶段流程图 + 节点驱动的阶段详情（异步，内部自 await）
+
+  renderIssues(d);
+  renderPatchAudit(d);
+
+  $("d-handoff-card").hidden = !d.handoff;
+  if(!skipIfSame($("d-handoff"), sigOf(d.handoff || ""))) $("d-handoff").innerHTML = mdToHtml(d.handoff || "");
+  renderLog(d.log || "");
+
+  // 启动即失败的运行（没有 state.json）：自动展开日志 —— 否则人工只看到「无 state.json，
+  // 只能查看」，却不知道为什么失败，而原因就写在 console.log 的头几行。
+  if(!d.has_state && d.log) $("d-log-card").hidden = false;
+
+  renderIntakeCard();
+  renderPmQuestions();
+  renderDemo();   // 不拉数据，只按缓存渲染（拉取由 loadDemo 按 run 变化触发）
+  loadDemo();
+
+  const atGate = st.paused_after === "human_review";
+  $("d-hrev-card").hidden = !atGate;
+  // 只在「刚进入这道闸门」时清一次空。
+  // 以前是**无条件**清：renderDetail 会被轮询反复调用（运行中每 2.5s 一次），
+  // 用户正在填还没提交的裁决内容会被无声吞掉。
+  const gateSig = atGate
+    ? sigOf({run: d.run_id, attempt: st.attempt, stages: (d.stages || []).length})
+    : "";
+  if (!atGate) {
+    S.hrevSig = "";
+  } else if (gateSig !== S.hrevSig) {
+    S.hrevSig = gateSig;
+    $("d-hrev-out").textContent = "";
+    ["hrev-core","hrev-err","hrev-deliv","hrev-req"].forEach(id => $(id).checked = false);
+    document.querySelectorAll('input[name="hrev-verdict"]').forEach(r => r.checked = false);
+    $("hrev-reviewer").value = "";
+    $("hrev-notes").value = "";
+  }
+
+  // 节点联动收尾：先把「有没有内容」的固有可见性记下来，再按选中节点做过滤。
+  // 必须放在最后 —— 上面各渲染函数才刚把卡片的 hidden 设好。
+  markCardIntrinsic();
+  applyNodeFilter();
+}
+
+async function submitHumanReview(){
+  const verdict = (document.querySelector('input[name="hrev-verdict"]:checked') || {}).value;
+  if (!verdict){ $("d-hrev-out").textContent = "请先选择 通过 / 打回"; return; }
+  const notes = $("hrev-notes").value.trim();
+  if (verdict === "reject" && !notes){ $("d-hrev-out").textContent = "打回时必须填写具体问题"; return; }
+  const artifact = {
+    verdict,
+    core_path_ok: $("hrev-core").checked,
+    no_obvious_errors: $("hrev-err").checked,
+    deliverables_complete: $("hrev-deliv").checked,
+    requirement_met: $("hrev-req").checked,
+    notes,
+    reviewer: $("hrev-reviewer").value.trim()
+  };
+  $("btn-hrev-submit").disabled = true;
+  try {
+    await api(`/api/runs/${encodeURIComponent(S.current)}/artifact`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({stage:"human_review", artifact})
+    });
+    await resume(null, null);
+  } catch(e){ $("d-hrev-out").textContent = "提交失败: " + e.message; }
+  finally { $("btn-hrev-submit").disabled = false; }
+}
+
+const KIND_LABEL = {
+  contract_violation: "输出不合契约", prompt_truncated: "prompt 被裁剪",
+  prompt_over_budget: "prompt 逼近上限", slow_call: "调用过慢",
+  ungrounded_path: "路径未接地", review_rework_architect: "评审要求返工方案",
+  review_required_fix: "评审必改项", review_blocker: "评审阻断项",
+  review_residual_risk: "评审残留风险", test_gap: "测试未覆盖",
+  pm_unknown: "需求未决", arch_uncertainty: "架构不确定",
+  human_gate: "人工闸门", human_edit: "人工改产物", human_rework: "人工打回",
+  human_directive: "人工意见", needs_human: "触顶需人工裁决"
+};
+
+// 运行日志：按行着色 + 可选「只看警告/错误」；已在底部时自动跟随，
+// 否则保持用户当前位置。用签名判断内容是否变化，避免每 2.5s 重渲冲掉选中文本。
+function renderLog(text){
+  const box = $("d-log");
+  const sig = sigOf([text, $("log-only-issues").checked]);
+  if(box.dataset.sig === sig) return;
+  const first = box.dataset.sig == null;
+  const stick = $("log-follow").checked
+    && (first || box.scrollTop + box.clientHeight >= box.scrollHeight - 24);
+  box.dataset.sig = sig;
+  if(!text){
+    // CLI 直接跑出来的 run 不会写 console.log（日志只输出到终端），
+    // 空白一片会让人以为页面坏了 —— 说清楚。
+    box.innerHTML = `<span class="note">该运行没有 console.log。日志文件由操作页面启动的进程才写盘；`
+      + `命令行直接运行的日志只在终端里。</span>`;
+    return;
+  }
+  box.innerHTML = highlightLog(text, $("log-only-issues").checked);
+  if(stick) box.scrollTop = box.scrollHeight;
+}
+
+const SEV_ORDER = {blocker: 0, warn: 1, info: 2};
+
+function issueFilter(){
+  return {
+    sev: $("flt-sev").value,
+    stage: $("flt-stage").value,
+    kind: $("flt-kind").value,
+    recurred: $("flt-recurred").checked
+  };
+}
+function passesIssueFilter(it, f){
+  if(f.sev && it.severity !== f.sev) return false;
+  if(f.stage && (it.stage || "") !== f.stage) return false;
+  if(f.kind && it.kind !== f.kind) return false;
+  if(f.recurred && !it.recurred) return false;
+  return true;
+}
+function refreshIssueFilterOptions(list){
+  const stageSel = $("flt-stage"), kindSel = $("flt-kind");
+  const keepStage = stageSel.value, keepKind = kindSel.value;
+  const stages = [...new Set(list.map(i => i.stage).filter(Boolean))].sort();
+  stageSel.innerHTML = `<option value="">全部阶段</option>` +
+    stages.map(s => `<option value="${esc(s)}">${esc(STAGE_CN[s] || s)}</option>`).join("");
+  stageSel.value = stages.includes(keepStage) ? keepStage : "";
+  const kinds = [...new Set(list.map(i => i.kind).filter(Boolean))].sort();
+  kindSel.innerHTML = `<option value="">全部类型</option>` +
+    kinds.map(k => `<option value="${esc(k)}">${esc(KIND_LABEL[k] || k)}</option>`).join("");
+  kindSel.value = kinds.includes(keepKind) ? keepKind : "";
+}
+// 人工意见分类下拉是「未提交的输入」，只在选项集合变化时才重建，避免冲掉用户的选择
+function renderIssueKindOptions(d){
+  const select = $("issue-kind");
+  const current = select.value;
+  const kinds = d.issue_kinds || [];
+  const sig = sigOf(kinds);
+  if(select.dataset.sig !== sig){
+    select.dataset.sig = sig;
+    select.innerHTML = `<option value="">（不分类）</option>` +
+      kinds.map(k => `<option value="${esc(k.kind)}">${esc(k.label)}</option>`).join("");
+  }
+  select.value = current || "";
+}
+
+function renderIssues(d){
+  const all = d.issues || [];
+  // 节点联动：选中节点时只留该节点的问题（复核型节点看全部）。
+  // 下拉**选项**仍按全集生成 —— 否则换节点时选项集跟着跳，手感很差。
+  const list = (S.node && !SCOPE_ALL_NODES.has(S.node))
+    ? all.filter(i => (i.stage || "") === S.node) : all;
+  const stats = d.issue_summary || {};
+  const degraded = d.record_source === "summary" ? "（本轮改造前的运行，仅有 summary 记录）" : "";
+  refreshIssueFilterOptions(all);
+  renderIssueKindOptions(d);
+
+  const box = $("d-issues");
+  if(!list.length){
+    box.dataset.sig = "";
+    $("d-issue-stats").textContent = "（暂无记录）" + degraded;
+    box.innerHTML = `<div class="note">本次运行还没有记录到问题。</div>`;
+    return;
+  }
+
+  // 阻断项优先：人工来这里是找「有没有拦住交付的东西」，不该靠自己逐条扫
+  const f = issueFilter();
+  const shown = list
+    .filter(it => passesIssueFilter(it, f))
+    .sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
+
+  const head = list.length === shown.length
+    ? `共 ${stats.total} 条（阻断 ${stats.blockers || 0} / 复发 ${stats.recurred || 0}）`
+    : `筛出 ${shown.length} / ${stats.total} 条（阻断 ${stats.blockers || 0} / 复发 ${stats.recurred || 0}）`;
+  $("d-issue-stats").textContent = head + degraded;
+
+  if(!shown.length){ box.innerHTML = `<div class="note">当前筛选条件下没有问题。</div>`; return; }
+  if(skipIfSame(box, sigOf({shown, f}))) return;
+
+  const groups = {};
+  for(const it of shown){ (groups[it.kind] = groups[it.kind] || []).push(it); }
+  box.innerHTML = Object.entries(groups).map(([kind, items]) => `
+    <div style="margin-bottom:10px">
+      <div class="row" style="margin-bottom:5px">
+        <b>${esc(KIND_LABEL[kind] || kind)}</b>
+        <span class="note">${esc(kind)} × ${items.length}</span>
+      </div>
+      ${items.map(it => `
+        <div style="border-left:2px solid ${it.severity==='blocker'?'var(--bad)':(it.severity==='warn'?'var(--warn)':'var(--line)')};padding:3px 9px;margin:3px 0">
+          <div class="row">
+            ${badge(it.stage || "", "acc")}
+            ${badge(it.severity, it.severity==='blocker'?'bad':(it.severity==='warn'?'warn':''))}
+            ${badge(it.source_cn || it.source)}
+            ${it.recurred ? badge("复发 x" + it.occurrence,"bad") : ""}
+            ${it.attempt ? badge("第 " + it.attempt + " 轮") : ""}
+            <span>${esc(it.title)}</span>
+          </div>
+          ${it.detail ? `<div class="note">${esc(it.detail)}</div>` : ""}
+        </div>`).join("")}
+    </div>`).join("");
+}
+
+function renderPatchAudit(d){
+  const state = d.state || {};
+  const audit = state.patch_audit || {};
+  const rows = audit.edits || [];
+  const files = d.patches || [];
+  const card = $("d-patch-card");
+  if(!rows.length && !files.length){ card.hidden = true; return; }
+  card.hidden = false;
+  $("d-patch-run").textContent = d.run_id;
+  $("d-patch-stats").textContent = audit.source_available === false
+    ? "（未提供仓库，无法核对）"
+    : `可套用 ${audit.ok || 0} 条 / 有问题 ${audit.problems || 0} 条`;
+  // 与问题记录、日志同理：轮询每 2.5s 会重渲，无谓重建会冲掉选中文本
+  if(skipIfSame($("d-patch-audit"), sigOf({rows, files}))) return;
+
+  $("d-patch-audit").innerHTML = rows.map(r => {
+    const ok = r.status === "ok";
+    const span = r.anchor_span || r.symbol_span;
+    return `<div style="border-left:2px solid ${ok?'var(--ok)':'var(--bad)'};padding:3px 9px;margin:3px 0">
+      <div class="row">
+        ${badge(r.symbol || r.path, "acc")}
+        ${badge(r.status, ok ? "ok" : "bad")}
+        ${r.patch_mode_used||r.patch_mode ? badge((r.patch_mode_used||r.patch_mode)) : ""}
+        ${span ? badge("第 "+span[0]+"-"+span[1]+" 行") : ""}
+        ${badge((r.patch_lines||0)+" 行补丁")}
+        ${r.patch_file ? badge(r.patch_file) : ""}
+      </div>
+      ${(r.notes||[]).map(n => `<div class="note">${esc(n)}</div>`).join("")}
+    </div>`;
+  }).join("");
+
+  $("d-patch-files").innerHTML = files.length
+    ? `<div class="row" style="margin-top:8px">` + files.map(f =>
+        `<button data-patch="${esc(f.file)}">${esc(f.file.split("/").pop())} (${f.size}B)</button>`).join("") + `</div>`
+    : `<div class="note">没有生成补丁文件（补丁不可套用或未提供仓库）。</div>`;
+  $("d-patch-files").querySelectorAll("[data-patch]").forEach(btn => btn.onclick = async () => {
+    const res = await fetch(`/api/runs/${encodeURIComponent(S.current)}/patch?file=${encodeURIComponent(btn.dataset.patch)}`);
+    const box = $("d-patch-view");
+    box.hidden = false;
+    box.textContent = await res.text();
+  });
+}
+
+async function loadReport(){
+  const box = $("report-view");
+  box.hidden = false;
+  $("report-text").innerHTML = `<span class="note">加载中…</span>`;
+  $("detail").hidden = true; $("empty").hidden = true; $("new-form").hidden = true;
+  try{
+    const r = await api("/api/report");
+    $("report-text").innerHTML = mdToHtml(r.markdown || "（无）");
+  } catch(e){ $("report-text").innerHTML = `<div class="errbox">加载失败: ${esc(e.message)}</div>`; }
+}
+
+/* ------------------------------------------------------------------ 配置 */
+let CFG = null;
+
+const sameVal = (a, b) => {
+  const norm = v => (v === null || v === undefined || v === "" ? null : v);
+  return String(norm(a)) === String(norm(b));
+};
+const fmtGB = b => (b ? (b / 1073741824).toFixed(1) + " GB" : "-");
+
+async function loadConfig(){
+  const box = $("config-view");
+  box.hidden = false;
+  $("report-view").hidden = true; $("detail").hidden = true;
+  $("empty").hidden = true; $("new-form").hidden = true;
+  $("cfg-models").innerHTML = '<div class="note">加载中…</div>';
+  try{
+    CFG = await api("/api/config");
+    renderConfig();
+  } catch(e){
+    $("cfg-models").textContent = "加载失败: " + netHint(e);
+  }
+}
+
+function renderConfig(){
+  $("cfg-path").textContent = CFG.path || "";
+  const o = CFG.ollama || {};
+  if(o.reachable){
+    $("cfg-ollama").textContent = `Ollama 可达（${o.host}），共 ${(o.models || []).length} 个模型可选。`;
+  } else {
+    $("cfg-ollama").innerHTML =
+      `<b>Ollama 不可达</b>（${esc(o.host || "")}）：${esc(o.error || "")}<br>${esc(o.hint || "")}`;
+  }
+  renderCfgModels();
+  renderCfgPrompts();
+  renderCfgRuntime();
+  renderCfgBudgets();
+}
+
+// Ollama 返回的 name 常带 ":latest" 后缀，而配置里写的是裸 tag —— 二者等价。
+// 若不归一，用户打开页面什么都不改直接保存，就会把所有 tag 判成「已改动」，凭空写出覆盖。
+const normTag = n => String(n ?? "").replace(/:latest$/, "");
+
+function tagOptions(){
+  const raw = (CFG.ollama && CFG.ollama.models) || [];
+  const seen = [], out = [];
+  for(const m of raw){
+    const n = normTag(m.name);
+    if(!n || seen.includes(n)) continue;
+    seen.push(n);
+    out.push({name: n, meta: m});
+  }
+  return out;
+}
+
+function tagOptionHtml(current){
+  const names = tagOptions().map(o => o.name);
+  const cur = normTag(current);
+  if(cur && !names.includes(cur)) names.unshift(cur);  // Ollama 不可达时也要能显示当前值
+  return names.map(n =>
+    `<option value="${esc(n)}"${n === cur ? " selected" : ""}>${esc(n)}</option>`).join("");
+}
+
+function renderCfgModels(){
+  const stages = CFG.stages || Object.keys(CFG.models || {});
+  let html = '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+    "<tr><th>阶段</th><th>角色</th><th>模型 tag</th><th>num_ctx</th><th>预算</th>" +
+    "<th>think</th><th>temp</th><th>num_predict</th><th></th></tr>";
+  for(const stage of stages){
+    const m = (CFG.models || {})[stage] || {};
+    const d = m.default || {};
+    const meta = (tagOptions().find(o => o.name === normTag(m.tag)) || {}).meta;
+    const thinkVal = m.think === null || m.think === undefined ? "none" : String(m.think);
+    const warn = [];
+    if(meta && meta.context_length && m.num_ctx > meta.context_length){
+      warn.push(`num_ctx ${m.num_ctx} 超过该 tag 自报的 context_length ${meta.context_length}`);
+    }
+    if(m.think === true && meta && !(meta.capabilities || []).includes("thinking")){
+      warn.push("已开启 think，但该 tag 未声明 thinking 能力");
+    }
+    html += `<tr data-stage="${esc(stage)}" title="${meta ? esc(`${meta.parameter_size || "?"} · ${meta.quantization_level || "?"} · ${fmtGB(meta.size)}`) : ""}">
+      <td><code>${esc(stage)}</code>${m.source === "override" ? ' <span class="badge">已改</span>' : ""}</td>
+      <td><input data-field="role" value="${esc(m.role || "")}" style="width:90px"></td>
+      <td><select data-field="tag">${tagOptionHtml(m.tag)}</select>
+          ${meta ? `<div class="note">ctx ${meta.context_length || "?"} · ${esc(meta.parameter_size || "?")} · ${fmtGB(meta.size)}</div>` : ""}
+          ${warn.length ? `<div class="note"><b>注意：</b>${esc(warn.join("；"))}</div>` : ""}</td>
+      <td><input data-field="num_ctx" type="number" value="${m.num_ctx}" style="width:78px"></td>
+      <td><input data-field="prompt_token_budget" type="number" value="${m.prompt_token_budget}" style="width:78px"></td>
+      <td><select data-field="think">
+            <option value="none"${thinkVal === "none" ? " selected" : ""}>不指定</option>
+            <option value="true"${thinkVal === "true" ? " selected" : ""}>开</option>
+            <option value="false"${thinkVal === "false" ? " selected" : ""}>关</option>
+          </select></td>
+      <td><input data-field="temperature" type="number" step="0.05" value="${m.temperature}" style="width:70px"></td>
+      <td><input data-field="num_predict" type="number" value="${m.num_predict}" style="width:80px"></td>
+      <td><button data-revert="${esc(stage)}" title="还原该阶段默认值">还原</button></td>
+    </tr>`;
+  }
+  $("cfg-models").innerHTML = html + "</table>";
+
+  $("cfg-models").querySelectorAll("[data-revert]").forEach(btn => {
+    btn.onclick = () => {
+      const d = (CFG.models[btn.dataset.revert] || {}).default || {};
+      const tr = btn.closest("tr");
+      const set = (f, v) => { const el = tr.querySelector(`[data-field="${f}"]`); if(el) el.value = v; };
+      set("role", d.role ?? ""); set("tag", d.tag ?? "");
+      set("num_ctx", d.num_ctx ?? 0); set("prompt_token_budget", d.prompt_token_budget ?? 0);
+      set("temperature", d.temperature ?? 0); set("num_predict", d.num_predict ?? 0);
+      const th = tr.querySelector('[data-field="think"]');
+      if(th) th.value = (d.think === null || d.think === undefined) ? "none" : String(d.think);
+    };
+  });
+
+  // 联动：改 tag 时把「原本同 tag」的阶段一起改掉（架构师/评审、开发/测试通常共用同一个模型）
+  $("cfg-models").querySelectorAll('select[data-field="tag"]').forEach(sel => {
+    sel.onchange = () => {
+      if(!$("cfg-link").checked) return;
+      const stage = sel.closest("tr").dataset.stage;
+      const from = (CFG.models[stage] || {}).tag;
+      if(!from || from === sel.value) return;
+      $("cfg-models").querySelectorAll("tr[data-stage]").forEach(tr => {
+        const other = tr.dataset.stage;
+        if(other !== stage && (CFG.models[other] || {}).tag === from){
+          tr.querySelector('[data-field="tag"]').value = sel.value;
+        }
+      });
+    };
+  });
+}
+
+function renderCfgPrompts(){
+  const stages = Object.keys(CFG.prompts || {});
+  let html = "";
+  for(const stage of stages){
+    const p = CFG.prompts[stage];
+    html += `<details${p.source === "override" ? " open" : ""} style="margin:6px 0">
+      <summary><code>${esc(stage)}</code> — ${p.chars} 字符
+        ${p.source === "override" ? '<span class="badge">已改</span>' : ""}</summary>
+      <textarea data-stage="${esc(stage)}" rows="8" style="width:100%">${esc(p.text || "")}</textarea>
+      <div class="row"><span class="note" data-count="${esc(stage)}"></span><span class="grow"></span>
+        <button data-prompt-revert="${esc(stage)}">还原默认</button></div>
+    </details>`;
+  }
+  $("cfg-prompts").innerHTML = html;
+
+  $("cfg-prompts").querySelectorAll("textarea[data-stage]").forEach(ta => {
+    const stage = ta.dataset.stage;
+    const counter = $("cfg-prompts").querySelector(`[data-count="${stage}"]`);
+    const upd = () => { counter.textContent = `${ta.value.length} 字符（默认 ${(CFG.prompts[stage].default || "").length}）`; };
+    ta.oninput = upd; upd();
+  });
+  $("cfg-prompts").querySelectorAll("[data-prompt-revert]").forEach(btn => {
+    btn.onclick = () => {
+      const ta = $("cfg-prompts").querySelector(`textarea[data-stage="${btn.dataset.promptRevert}"]`);
+      ta.value = CFG.prompts[btn.dataset.promptRevert].default || "";
+      ta.dispatchEvent(new Event("input"));
+    };
+  });
+}
+
+const RUNTIME_LABEL = {
+  review_every: "评审频率 review_every（每 N 轮评审一次）",
+  max_rework: "回流上限 max_rework",
+  request_timeout: "单次调用超时（秒）",
+  pm_num_ctx: "PM 上下文 num_ctx",
+  dev_two_pass: "开发两遍模式（先脚手架后回填）",
+  human_review_gate: "交付前人工审核闸门",
+  chars_per_token: "字符/token 估算系数",
+  prompt_hard_ratio: "prompt 占 ctx 的告警阈值",
+  per_file_tokens: "单文件切片上限",
+  pool_per_file_tokens: "检索池单文件上限",
+  // 以下此前没有中文标签，页面上显示的是原始键名 —— 想找「哪个开关会让运行停下等人」
+  // 时根本认不出来。三个闸门开关（human_review_gate / pause_on_open_questions /
+  // intake_pause_on_gaps）尤其必须能一眼看到。
+  pause_on_open_questions: "PM 未决项闸门（PM 提出问题就停下等人）",
+  intake_pause_on_gaps: "需求补强闸门（high 待确认项停下等人）",
+  verify: "运行验证（沙箱里真跑一遍命令）",
+  verify_timeout: "验证单条命令超时（秒）",
+  verify_max_commands: "验证最多执行命令数",
+  deliver: "交付落盘（结果写入目标目录）",
+  rework_stagnation: "停滞护栏（最近 N 轮无改善就停，0=不判）",
+  max_wall_s: "总时长上限（秒，0=不限）",
+  max_total_tokens: "总 token 上限（0=不限）",
+  advice: "裁决参谋（闸门内问答）",
+  advice_max_history: "参谋保留轮数",
+  advice_context_chars: "参谋上下文注入长度",
+};
+
+function renderCfgRuntime(){
+  let html = "";
+  for(const [key, meta] of Object.entries(CFG.runtime || {})){
+    const ctl = meta.type === "bool"
+      ? `<input type="checkbox" data-key="${esc(key)}"${meta.value ? " checked" : ""}>`
+      : `<input type="number" step="any" data-key="${esc(key)}" value="${meta.value}" style="width:120px">`;
+    html += `<div class="row" style="margin:4px 0">
+      <label style="width:auto;margin:0">${ctl} ${esc(RUNTIME_LABEL[key] || key)}</label>
+      <span class="grow"></span>
+      <span class="note">默认 ${String(meta.default)}${meta.source === "override" ? ' <span class="badge">已改</span>' : ""}</span>
+    </div>`;
+  }
+  $("cfg-runtime").innerHTML = html;
+}
+
+function renderCfgBudgets(){
+  let html = "";
+  for(const [name, meta] of Object.entries(CFG.budgets || {})){
+    html += `<div style="margin:8px 0"><b>${esc(name)}</b>${
+      meta.source === "override" ? ' <span class="badge">已改</span>' : ""}</div><div class="row">`;
+    for(const [stage, val] of Object.entries(meta.value || {})){
+      const def = (meta.default || {})[stage];
+      html += `<div style="width:170px"><label>${esc(stage)}（默认 ${def}）</label>
+        <input type="number" data-dict="${esc(name)}" data-stage="${esc(stage)}" value="${val}" style="width:100%"></div>`;
+    }
+    html += "</div>";
+  }
+  $("cfg-budgets").innerHTML = html;
+}
+
+function collectPatch(){
+  const patch = {models: {}, prompts: {}, runtime: {}};
+
+  $("cfg-models").querySelectorAll("tr[data-stage]").forEach(tr => {
+    const stage = tr.dataset.stage;
+    const d = (CFG.models[stage] || {}).default || {};
+    const get = f => tr.querySelector(`[data-field="${f}"]`);
+    const obj = {};
+    const put = (f, v) => { obj[f] = sameVal(v, d[f]) ? null : v; };
+    put("role", get("role").value);
+    put("tag", get("tag").value);
+    put("num_ctx", Number(get("num_ctx").value));
+    put("prompt_token_budget", Number(get("prompt_token_budget").value));
+    put("temperature", Number(get("temperature").value));
+    put("num_predict", Number(get("num_predict").value));
+    const tv = get("think").value;
+    put("think", tv === "none" ? null : tv === "true");
+    patch.models[stage] = Object.values(obj).some(v => v !== null) ? obj : null;
+  });
+
+  $("cfg-prompts").querySelectorAll("textarea[data-stage]").forEach(ta => {
+    const stage = ta.dataset.stage;
+    patch.prompts[stage] = ta.value === (CFG.prompts[stage].default || "") ? null : ta.value;
+  });
+
+  $("cfg-runtime").querySelectorAll("[data-key]").forEach(inp => {
+    const key = inp.dataset.key;
+    const val = inp.type === "checkbox" ? inp.checked : Number(inp.value);
+    patch.runtime[key] = sameVal(val, CFG.runtime[key].default) ? null : val;
+  });
+
+  $("cfg-budgets").querySelectorAll("[data-dict]").forEach(inp => {
+    const dict = inp.dataset.dict, stage = inp.dataset.stage;
+    if(!patch.runtime[dict]) patch.runtime[dict] = {};
+    const def = (CFG.budgets[dict].default || {})[stage];
+    const val = Number(inp.value);
+    patch.runtime[dict][stage] = val === Number(def) ? null : val;
+  });
+
+  return patch;
+}
+
+async function saveConfig(){
+  const note = $("cfg-save-note");
+  note.textContent = "保存中…";
+  try{
+    const r = await api("/api/config", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(collectPatch()),
+    });
+    CFG = r.view; renderConfig();
+    note.textContent = "已保存，对之后启动的进程生效（含续跑）";
+  } catch(e){ note.textContent = "保存失败: " + netHint(e); }
+}
+
+async function resetConfig(){
+  if(!await askConfirm("还原默认配置", "清除全部本地配置覆盖，恢复代码默认值？", "还原")) return;
+  const note = $("cfg-save-note");
+  try{
+    const r = await api("/api/config/reset", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}",
+    });
+    CFG = r.view; renderConfig();
+    note.textContent = "已还原默认";
+  } catch(e){ note.textContent = "还原失败: " + netHint(e); }
+}
+
+function renderGates(containerId, prefix, checked){
+  const box = $(containerId);
+  // 勾选是「未提交的输入」：轮询 / 手动刷新都会重渲，必须把用户改过的勾选写回 ——
+  // 否则「改勾选 → 点刷新 → 点续跑」提交的其实还是旧值，属于静默丢失。
+  const mem = rememberChecks(box);
+  box.innerHTML = GATE_STAGES.map(s =>
+    `<label><input type="checkbox" id="${prefix}-${s}" ${checked.includes(s)?"checked":""}>${esc(STAGE_CN[s])}</label>`
+  ).join("");
+  restoreChecks(box, mem);
+}
+
+function readGates(prefix){
+  return GATE_STAGES.filter(s => { const el = $(prefix+"-"+s); return el && el.checked; });
+}
+
+/* ------------------------------------------- 需求补强 · 待确认问题裁决 */
+// 补强给出「缺失要素 + 默认假设」「待澄清问题 + 建议答案」，但这些只是猜测。
+// 这里把它们渲染成可读的一问一答列表，人工逐条填入裁决；裁决保存后注入 PM 与所有下游阶段。
+// 点「用默认 / 用建议」＝人工**采纳**该默认值。带入时要去掉「默认 / 建议」前缀：
+// 否则落下去的是「默认假设使用方向键控制」这种猜测口吻，下游等于没拿到裁决。
+function cleanDecision(s){
+  return String(s || "").replace(/^\s*(?:默认假设|默认建议|默认|建议答案|建议)\s*[:：]?\s*/, "").trim();
+}
+
+// 与后端 prompts._intake_restating 同一判据：带「需明确 / 待确认 …」这类词、又拿不出
+// 任何具体取值，就是「把问题原样退回来」。前端也判一次，是为了让**旧产物**（后端整理
+// 逻辑上线前生成的运行，例如 20260925-140707）同样显示正确，不必等重新生成。
+const VAGUE_MARKS = ["建议补充","需明确","需要明确","待明确","需要澄清","需澄清","待确认",
+  "需要确认","待定","未明确","未提供","未指定","视情况","由用户决定","由用户确认","需要进一步"];
+const CONCRETE_RE = /\d|×|使用|采用|默认|即|例如|如：|=/;
+function isVagueValue(s){
+  return VAGUE_MARKS.some(m => s.includes(m)) && !CONCRETE_RE.test(s);
+}
+
+// 补强产物的「待确认项」—— **一条列表**，不再分「缺失要素 / 澄清问题」两类。
+// 旧产物是 missing_elements + clarifying_questions 两个字段，这里就地合并：那两个字段
+// 本就是同一主题的重复生成源（真机 20260925-140707 里「游戏分辨率」与「游戏窗口尺寸
+// 要求」各出一条，人工得在两个框里各填一遍）。合并后结构上不可能重复。
+// 2-gram 集合，用来估两条主题的相似度。只用于**提示**，不用于合并。
+function bigrams(s){
+  const t = String(s || "").replace(/[\s，。？！、：；（）()「」【】\-—_/\\|.]/g, "");
+  const out = new Set();
+  for(let i = 0; i + 2 <= t.length; i++) out.add(t.slice(i, i + 2));
+  return out;
+}
+function topicOverlap(a, b){
+  const A = bigrams(a), B = bigrams(b);
+  if(!A.size || !B.size) return 0;
+  let hit = 0;
+  A.forEach(g => { if(B.has(g)) hit += 1; });
+  return hit / Math.min(A.size, B.size);
+}
+
+function intakeItems(art){
+  const rows = [];
+  const push = o => {
+    if(!o || typeof o !== "object") return;
+    const value = String(o.default_assumption || o.suggested_answer || "").trim();
+    const element = String(o.element || o.question || "").trim();
+    if(!element) return;
+    rows.push({
+      element,
+      why: String(o.why || o.impact || "").trim(),
+      value,
+      importance: String(o.importance || "medium"),
+      final_decision: String(o.final_decision || ""),
+      // 没给值、或给的是把问题退回的话 → 标记出来：界面要说清「这不是可用的建议」，
+      // 并且不给「用默认」按钮（那按钮会把一句疑问句当成裁决落盘）。
+      needsValue: !!o.needs_value || !value || isVagueValue(value),
+    });
+  };
+  const fresh = (art.pending_items || []).filter(x => x && typeof x === "object");
+  if(fresh.length){ fresh.forEach(push); }
+  else {
+    (art.missing_elements || []).forEach(push);
+    (art.clarifying_questions || []).forEach(push);
+  }
+  markSameTopic(rows);
+  return rows;
+}
+
+// 提示「这两条可能是一件事」（真机：「游戏分辨率」与「游戏窗口尺寸要求？」）。
+// **只提示、不合并**：换了说法但主题相同的判断文本做不可靠，「键盘控制」与「触屏控制」的
+// 字符重叠度同样很高 —— 误并两个真的不同的问题比重复更坏。宁可让人自己判断。
+// 前提是**两条都没给出具体取值**：只要有一侧给了可用的建议取值，就说明它们不是同一件事。
+function markSameTopic(rows){
+  const vague = rows.map((r, i) => (r.needsValue ? i : -1)).filter(i => i >= 0);
+  const text = r => [r.element, r.why, r.value].join(" ");
+  for(let a = 0; a < vague.length; a++){
+    for(let b = a + 1; b < vague.length; b++){
+      const i = vague[a], j = vague[b];
+      if(rows[j].sameAs) continue;
+      if(topicOverlap(text(rows[i]), text(rows[j])) >= 0.7) rows[j].sameAs = rows[i].element;
+    }
+  }
+}
+
+function intakeRow(kind, ref, head, preset, value, noFill, lock, ask){
+  // 「问模型」＝把这一条设为裁决参谋的焦点（风险 / 收益 / 可逆性），可反复问。
+  // 已走过阶段的只读记录也保留它 —— 「当时为什么这么定」同样值得问。
+  const askBtn = ask
+    ? `<button type="button" data-ask="${esc(ref)}"
+        title="就这一条问裁决参谋（风险 / 收益 / 可逆性）">问模型</button>`
+    : "";
+  // 历史记录（该阶段已走过）：**只渲染内容，不给输入框**。
+  // 禁用状态的输入框看起来仍像「可以改」，让人白填一遍才发现不生效。
+  if(lock){
+    return `<div style="margin:10px 0;padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+      <div>${head}</div>
+      ${askBtn ? `<div class="row" style="margin-top:6px"><span class="grow"></span>${askBtn}</div>` : ""}
+    </div>`;
+  }
+  const label = kind === "clarifying_question" ? "用建议" : "用默认";
+  // 补强没给出具体取值时（needs_value）**不给「用默认 / 用建议」按钮**：
+  // 那按钮会把「需明确窗口尺寸或画布大小」这种把问题退回的话当成裁决填进去，
+  // 一点就落盘，下游等于拿到一条没有内容的结论 —— 比让人工自己写还糟。
+  const fill = noFill ? "" :
+    `<button type="button" data-fill="${esc(preset)}">${label}</button>`;
+  return `<div style="margin:10px 0;padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+    <div>${head}</div>
+    <div class="row" style="margin-top:6px">
+      <input type="text" data-ikind="${kind}" data-ref="${esc(ref)}" style="flex:1"
+        placeholder="${noFill ? "补强没给具体取值，请直接写裁决…（留空则不落盘）" : "填写裁决…（留空则不落盘）"}"
+        value="${esc(value)}">
+      ${fill}${askBtn}
+    </div></div>`;
+}
+
+/* ------------------------------------------- 裁决参谋（就待确认项问风险/收益，可反复问） */
+// 它**不是流程阶段**：不产出产物、不进流程注册表，问答落在 runs/<id>/advice/<stage>.jsonl。
+// 页面上挂在每个裁决卡片底部，可以就任意一条反复提问 —— 裁决是「判断」，不该让人靠猜。
+const ADV = {};   // stage -> 面板状态
+
+function advState(stage){
+  if(!ADV[stage]) ADV[stage] = {
+    stage, focus:"", turns:[], model:"", enabled:true, busy:false,
+    loading:false, asking:false, loaded:false, err:"", rendered:null,
+  };
+  return ADV[stage];
+}
+
+// 换运行就把面板整体作废：上一个运行的问答与当前这条没关系
+function resetAdvice(){
+  Object.keys(ADV).forEach(k => delete ADV[k]);
+}
+
+function renderAdvicePanel(stage, boxId){
+  const A = advState(stage);
+  const box = $(boxId);
+  if(!box) return;
+  if(!A.enabled){
+    box.innerHTML = `<div class="note" style="margin-top:14px">裁决参谋已关闭（PIPELINE_ADVICE=0）。</div>`;
+    return;
+  }
+  // busy 必须跟着**实时**值走，不能只在 loadAdvice 时取一次。
+  // 真机 20260925-161212：运行跑到 PM 阶段时页面渲染过 PM 卡片（面板于是取到
+  // busy=true → 输入框 disabled），PM 结束后运行暂停、子进程已退出，可 A.busy
+  // 仍是那份旧值，输入框就**一直锁着** —— 而服务端此刻 /advice 明明返回 busy=false，
+  // 直接 POST 也能成功。取 detail 里的 busy_with（服务端用 _any_running() 算的，
+  // 与 /advice 的 busy、与 POST 那道 409 闸同一来源），每次渲染都同步一次。
+  if(S.detail) A.busy = !!S.detail.busy_with;
+  // 状态没变就别重建：轮询每 2.5s 会调到这里，重建会把用户正在输入的提问冲掉
+  // （与裁决输入框同一类坑）。
+  const sig = sigOf({n:A.turns.length, f:A.focus, b:A.busy, k:A.asking, e:A.err, m:A.model});
+  if(A.rendered === sig) return;
+  A.rendered = sig;
+
+  const two = (title, arr, cls) => (arr && arr.length)
+    ? `<div class="note">${title}：${arr.map(x => badge(esc(x), cls)).join(" ")}</div>` : "";
+  const turns = (A.turns || []).map(t => {
+    const a = t.answer || {};
+    const rev = a.reversibility || "-";
+    return `<div style="margin:8px 0;padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+      <div class="note">第 ${esc(String(t.n))} 问${t.focus ? `（${esc(t.focus)}）` : ""}
+        · ${esc(String(t.wall_s ?? "-"))}s · ${esc(t.model || "")}</div>
+      <div>问：${esc(t.question || "")}</div>
+      <div style="margin-top:4px"><b>建议：${esc(a.recommendation || "-")}</b>
+        ${badge("可逆性 " + rev, rev === "hard" ? "bad" : (rev === "easy" ? "ok" : "warn"))}
+        ${badge("置信度 " + (a.confidence || "-"),
+                a.confidence === "high" ? "ok" : (a.confidence === "low" ? "warn" : ""))}</div>
+      ${a.answer ? `<div class="note">${esc(a.answer)}</div>` : ""}
+      ${two("收益", a.benefits, "ok")}
+      ${two("风险", a.risks, "bad")}
+      ${two("备选", a.alternatives, "")}
+      ${a.evidence ? `<div class="note">依据：${esc(a.evidence)}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  box.innerHTML = `<div style="margin-top:14px;padding-top:10px;border-top:1px dashed var(--line)">
+    <div class="row"><b>裁决参谋</b>
+      <span class="note">就某一条问风险 / 收益 / 可逆性，可反复问；回答只作参考，不写进产物</span>
+      <span class="grow"></span><span class="note">${esc(A.model || "")}</span></div>
+    ${A.busy ? `<div class="note" style="color:var(--warn)">有运行正在进行中：单驻留，等它结束或先「中断」再问（否则会抢显存）</div>` : ""}
+    <div class="note">正在问：${A.focus ? `<b>${esc(A.focus)}</b>` : "（未指定，将作为补充提问）"}
+      ${A.focus ? ` · <a href="#" data-adv-clear="1">清除</a>` : ""}</div>
+    ${turns || `<div class="note">还没有问过。</div>`}
+    <div class="row" style="margin-top:8px">
+      <input id="${boxId}-q" type="text" style="flex:1" ${A.asking || A.busy ? "disabled" : ""}
+        placeholder="例：定成 800×600 的收益与风险是什么？选错了以后改起来贵吗？">
+      <button class="primary" data-adv-send="1" ${A.asking || A.busy ? "disabled" : ""}>${
+        A.asking ? "问模型中…（约 30s）" : "问模型"}</button>
+    </div>
+    <div class="note" id="${boxId}-out">${esc(A.err || "")}</div>
+  </div>`;
+  box.querySelectorAll("[data-adv-send]").forEach(b => { b.onclick = () => askAdvice(stage, boxId); });
+  box.querySelectorAll("[data-adv-clear]").forEach(a => {
+    a.onclick = e => { e.preventDefault(); advState(stage).focus = ""; renderAdvicePanel(stage, boxId); };
+  });
+}
+
+async function loadAdvice(stage, boxId){
+  const A = advState(stage);
+  if(A.loading) return;
+  A.loading = true;
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/advice?stage=${encodeURIComponent(stage)}`);
+    A.enabled = r.enabled !== false;
+    A.busy = !!r.busy;
+    A.model = r.model || "";
+    A.turns = r.turns || [];
+    A.err = "";
+  }catch(e){
+    A.err = "读取裁决参谋失败：" + (e.message || e);
+  }finally{
+    A.loading = false;
+    // 失败也标 loaded：否则轮询每 2.5s 重试一次，服务端会被空转打满
+    A.loaded = true;
+    renderAdvicePanel(stage, boxId);
+  }
+}
+
+async function askAdvice(stage, boxId){
+  const A = advState(stage);
+  const inp = $(boxId + "-q");
+  const q = inp ? inp.value.trim() : "";
+  if(!q){ A.err = "先写一句你想问的（例如某一条的风险 / 收益）"; renderAdvicePanel(stage, boxId); return; }
+  A.asking = true; A.err = "";
+  renderAdvicePanel(stage, boxId);
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/advice`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({stage, question:q, focus:A.focus}),
+    });
+    A.turns = [...(A.turns || []), r.turn];
+  }catch(e){
+    A.err = "裁决参谋调用失败：" + (e.message || e);
+  }finally{
+    A.asking = false;
+    renderAdvicePanel(stage, boxId);   // focus 保留：追问通常还在同一条上
+  }
+}
+
+// 卡片底部的面板：进闸门时拉一次线程；已有数据就不重复拉（GET 很轻，但没必要每 2.5s 一次）
+function syncAdvicePanel(stage, boxId){
+  const A = advState(stage);
+  if(!A.loaded && !A.loading){
+    loadAdvice(stage, boxId);
+  } else {
+    renderAdvicePanel(stage, boxId);
+  }
+}
+
+// 每行的「问模型」：把该条设为焦点，并把光标送进提问框 —— 少一次点击
+function wireAskButtons(bodyId, stage, boxId){
+  const body = $(bodyId);
+  if(!body) return;
+  body.querySelectorAll("[data-ask]").forEach(b => {
+    b.onclick = () => {
+      advState(stage).focus = b.dataset.ask || "";
+      renderAdvicePanel(stage, boxId);
+      const i = $(boxId + "-q");
+      if(i) i.focus();
+    };
+  });
+}
+
+function renderIntakeCard(){
+  const d = S.detail || {};
+  const snap = ((d.stages) || []).find(s => s.stage === "intake");
+  const art = snap && snap.artifact;
+  const card = $("d-intake-card");
+  const st = d.state || {};
+  // 补强的闸门**此刻**是否在等人工裁决：只有停在这个闸门上才允许编辑。
+  // 已经走过这一阶段（例如现在停在 pm）时，点进来应当看到**历史裁决记录（只读）**——
+  // 否则改完既不知道有没有生效，也会和下游已经用过的结论对不上。
+  const active = !!(S.editable && st.paused_after === "intake");
+  const decidedList = (st.intake_decisions || []).filter(x => x && x.ref);
+  // 数据没变就整块跳过重建：轮询每 2.5s 会调 renderDetail，而重建 innerHTML 会
+  // 把用户正在填、还没点「保存」的裁决内容直接冲掉（表现就是「输入框自己清空」）。
+  const sig = sigOf({ run: d.run_id, art: art || null, saved: decidedList, active });
+  if(skipIfSame($("d-intake-body"), sig)){
+    syncAdvicePanel("intake", "d-intake-advice");   // 正文不必重建，但参谋面板要跟着刷新
+    return;
+  }
+  card.hidden = !art;
+  $("d-intake-out").textContent = "";
+  if(!art){
+    $("d-intake-body").innerHTML = "";
+    $("d-intake-mode").textContent = "";
+    $("d-intake-hint").textContent = "";
+    syncAdvicePanel("intake", "d-intake-advice");
+    return;
+  }
+
+  // 已保存的裁决按「主题」回显（ref = 要素名 / 问题原文）。
+  // **两处都要看**：产物里的 final_decision（已并回）+ state.intake_decisions。
+  // 只看产物会漏记录 —— 曾出现「前端提交 kind=pending_item、旧服务端按 question 匹配不上」，
+  // 4 条裁决只并回 1 条，人工明明填过却在页面上看不到，PM 于是又问了一遍。
+  const saved = {};
+  decidedList.forEach(x => { saved[x.ref] = x.decision; });
+
+  const items = intakeItems(art);
+  const decidedOf = it => String(it.final_decision || "").trim() || String(saved[it.element] || "").trim();
+  const req = art.refined_requirement || {};
+  const parts = [];
+
+  // 已确认结论：产物里的 confirmed_facts + 从裁决记录补出来的（去重）——
+  // 免得因上面那个合并缺陷让「已确认结论」少数几条，人工以为自己的裁决没生效。
+  const facts = [];
+  const seenFact = new Set();
+  const addFact = t => {
+    const s = String(t || "").trim();
+    if(s && !seenFact.has(s)){ seenFact.add(s); facts.push(s); }
+  };
+  (art.confirmed_facts || []).forEach(addFact);
+  items.forEach(it => { const v = decidedOf(it); if(v) addFact(`${it.element}：${v}`); });
+  if(facts.length){
+    parts.push(`<h3 style="margin:4px 0 2px">已确认结论（${facts.length}，将作为确定结论给到下游）</h3>
+      <div>${facts.map(f => badge(esc(f), "ok")).join(" ")}</div>`);
+  }
+  parts.push(`<div class="kv">
+    <div>核心目标</div><div>${esc(req.core_goal || "-")}</div>
+    <div>背景动机</div><div>${esc(req.background || "-")}</div>
+    <div>核心功能</div><div>${(req.core_features || []).map(esc).join("；") || "-"}</div>
+    <div>目标用户</div><div>${(req.target_users || []).map(esc).join("、") || "-"}</div>
+    <div>使用场景</div><div>${(req.main_scenarios || []).map(esc).join("；") || "-"}</div>
+    <div>约束条件</div><div>${(req.constraints || []).map(esc).join("；") || "-"}</div>
+  </div>`);
+
+  // 关键行为与期望值：模型推导出的「做对了应该是什么样」。
+  // 为什么要单独展示：越是「大家都知道」的默认行为（例如「吃到食物蛇变长」），
+  // 越不会被当成待确认项列出来，但它恰恰决定了「做出来的是哪一种东西」。
+  // 把它摆在明处，人工才能发现并纠正 —— 而不是等到跑完才发现做出来的不是自己要的。
+  const kbs = (art.key_behaviors || []).filter(x => x && typeof x === "object");
+  if(kbs.length){
+    parts.push(`<h3 style="margin:14px 0 2px">关键行为与期望值（${kbs.length}）</h3>
+      <div class="note">模型推导的「做对了应该是什么样」——<b>它替你定的行为都写在这里</b>。
+        发现不对的（例如「吃到食物蛇变长」你并不想要），就写进下面的裁决。</div>
+      <div class="kv">${kbs.map(k =>
+        `<div>${esc(k.behavior || "")}</div><div>${esc(k.expectation || "")}</div>`).join("")}</div>`);
+  }
+
+  const decidedCount = items.filter(it => decidedOf(it)).length;
+  $("d-intake-mode").textContent = active ? "待你裁决" : "已完成 · 历史记录（只读）";
+  $("d-intake-hint").innerHTML = active
+    ? `补强给出的是<b>建议取值</b>（AI 猜的）。逐条裁决后，裁决值会<b>并回补强产物本身</b>
+       （<code>NN-intake.json</code> 由「初稿」变为「已裁决终稿」），下游只读这一份即可。留空的条目不会落盘。`
+    : `该阶段已走过，下面是<b>当时的裁决记录（只读）</b>：共 ${items.length} 项、${decidedCount} 项有人工裁决。
+       需要改动请用左侧「打回重跑本阶段」从补强重来 —— 直接改这里会让下游已用过的结论与页面对不上。`;
+
+  if(items.length){
+    const vague = items.filter(x => x.needsValue).length;
+    parts.push(`<h3 style="margin:14px 0 2px">待确认项（${items.length}${
+      vague ? `，其中 <span style="color:var(--warn)">${vague} 条补强未给出具体取值</span>` : ""}）</h3>`);
+    items.forEach(it => {
+      const ref = it.element;
+      const decided = decidedOf(it);
+      const head = `<b>${esc(ref)}</b> ${badge(it.importance || "", it.importance === "high" ? "bad" : "")}
+        ${it.needsValue ? badge("未给具体取值", "warn") : ""}
+        ${decided ? badge("已裁决", "ok") : (active ? "" : badge("未裁决", "warn"))}
+        ${it.sameAs && active ? `<div class="note" style="color:var(--warn)">⚠ 可能与「${esc(it.sameAs)}」是同一主题，答一次即可。</div>` : ""}
+        ${it.why ? `<div class="note">为什么要定：${esc(it.why)}</div>` : ""}
+        ${it.value ? `<div class="note">建议取值：${esc(it.value)}</div>`
+                   : `<div class="note">补强没给出具体取值。</div>`}
+        ${decided ? `<div class="note">裁决：<b>${esc(decided)}</b></div>`
+                  : (active ? "" : `<div class="note">当时没有给出裁决。</div>`)}`;
+      parts.push(intakeRow("pending_item", ref, head, it.value, decided, it.needsValue, !active, ref));
+    });
+  } else {
+    parts.push(`<div class="note" style="margin-top:10px">补强阶段没有识别出待确认项（需求相对完整）。</div>`);
+  }
+  // 不在闸门上就锁死：输入框不渲染、一键用默认不给、保存按钮藏起来。
+  // 留着可编辑反而误导 —— 改完既不知道有没有生效，也与下游已用过的结论不一致。
+  $("btn-intake-save").hidden = !active;
+  $("d-intake-body").innerHTML = parts.join("");
+  wireAskButtons("d-intake-body", "intake", "d-intake-advice");
+  syncAdvicePanel("intake", "d-intake-advice");
+  // 「用默认 / 用建议」：一键把补强给的值填进裁决框
+  $("d-intake-body").querySelectorAll("[data-fill]").forEach(b => {
+    b.onclick = () => { const inp = b.parentNode.querySelector("input"); if(inp) inp.value = cleanDecision(b.dataset.fill); };
+  });
+}
+
+/* ------------------------------------- PM 未决问题与默认取值 · 裁决 */
+// 与需求补强裁决同一套交互：问题 + 建议/默认取值 + 严重度（仅展示）+ 裁决输入框。
+// 刻意**不展示** impact_if_wrong（猜错的代价）—— 裁决阶段不需要它，只会占版面。
+function renderPmQuestions(){
+  const d = S.detail || {};
+  const snap = ((d.stages) || []).find(s => s.stage === "pm");
+  const art = snap && snap.artifact;
+  const card = $("d-pmq-card");
+  const qs = (art && art.open_questions) || [];
+  const st = d.state || {};
+  // 同补强卡片：只有运行停在 PM 闸门上时才可裁决；已走过就展示历史记录（只读）。
+  const active = !!(S.editable && st.paused_after === "pm");
+  const decidedList = (st.pm_decisions || []).filter(x => x && x.ref);
+  // 同上：数据未变就别重建，否则用户填一半的裁决会被轮询冲掉。
+  const sig = sigOf({ run: d.run_id, art: art || null, saved: decidedList, active });
+  if(skipIfSame($("d-pmq-body"), sig)){
+    syncAdvicePanel("pm", "d-pmq-advice");
+    return;
+  }
+  card.hidden = !qs.length;
+  $("d-pmq-out").textContent = "";
+  if(!qs.length){
+    $("d-pmq-body").innerHTML = "";
+    $("d-pmq-mode").textContent = "";
+    $("d-pmq-hint").textContent = "";
+    syncAdvicePanel("pm", "d-pmq-advice");
+    return;
+  }
+
+  const saved = {};
+  decidedList.forEach(x => { saved[x.ref] = x.decision; });
+  const decidedOf = q => String(q.final_decision || "").trim()
+    || String(saved[String(q.question || "")] || "").trim();
+  const parts = [];
+
+  // 已确认结论同样两处取（产物 + 裁决记录），去重
+  const facts = [];
+  const seenFact = new Set();
+  const addFact = t => {
+    const s = String(t || "").trim();
+    if(s && !seenFact.has(s)){ seenFact.add(s); facts.push(s); }
+  };
+  (art.confirmed_facts || []).forEach(addFact);
+  qs.forEach(q => { const v = decidedOf(q); if(v) addFact(`${q.question}：${v}`); });
+  if(facts.length){
+    parts.push(`<h3 style="margin:4px 0 2px">已确认结论（${facts.length}，将作为确定结论给到下游）</h3>
+      <div>${facts.map(f => badge(esc(f), "ok")).join(" ")}</div>`);
+  }
+
+  const decidedCount = qs.filter(q => decidedOf(q)).length;
+  $("d-pmq-mode").textContent = active ? "待你裁决" : "已完成 · 历史记录（只读）";
+  $("d-pmq-hint").innerHTML = active
+    ? `PM 给出的是<b>建议 / 默认取值</b>。逐条裁决后，裁决值会并回 PM 产物（<code>NN-pm.json</code>），
+       下游拿到的就是<b>确定结论</b>，不会再把这些问一遍。留空不落盘。`
+    : `该阶段已走过，下面是<b>当时的裁决记录（只读）</b>：共 ${qs.length} 项、${decidedCount} 项有人工裁决。
+       需要改动请用左侧「打回重跑本阶段」从 PM 重来。`;
+
+  qs.forEach(q => {
+    const ref = String(q.question || "");
+    const decided = decidedOf(q);
+    const sev = q.severity === "high" ? "bad" : "";
+    const head = `<b>${esc(ref)}</b> ${badge("严重度 " + (q.severity || "-"), sev)}
+      ${decided ? badge("已裁决", "ok") : (active ? "" : badge("未裁决", "warn"))}
+      ${q.why_it_matters ? `<div class="note">为何重要：${esc(q.why_it_matters)}</div>` : ""}
+      ${q.recommendation ? `<div class="note">建议：${esc(q.recommendation)}</div>` : ""}
+      <div class="note">默认取值：${esc(q.assumed_answer || "")}</div>
+      ${decided ? `<div class="note">裁决：<b>${esc(decided)}</b></div>`
+                : (active ? "" : `<div class="note">当时没有给出裁决。</div>`)}`;
+    parts.push(intakeRow("pm_question", ref, head,
+      String(q.assumed_answer || ""), decided, false, !active, ref));
+  });
+  $("btn-pmq-save").hidden = !active;
+  $("d-pmq-body").innerHTML = parts.join("");
+  wireAskButtons("d-pmq-body", "pm", "d-pmq-advice");
+  syncAdvicePanel("pm", "d-pmq-advice");
+  $("d-pmq-body").querySelectorAll("[data-fill]").forEach(b => {
+    b.onclick = () => { const inp = b.parentNode.querySelector("input"); if(inp) inp.value = cleanDecision(b.dataset.fill); };
+  });
+}
+
+async function savePmDecisions(){
+  const items = [];
+  document.querySelectorAll("#d-pmq-body input[data-ikind]").forEach(el => {
+    if(el.disabled) return;   // 只读的历史记录不参与提交
+    const v = cleanDecision(el.value);
+    if(v) items.push({kind: el.dataset.ikind, ref: el.dataset.ref, decision: v});
+  });
+  if(!items.length){ $("d-pmq-out").textContent = "还没有填写任何裁决（至少填一条）"; return; }
+  $("btn-pmq-save").disabled = true;
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/pm-decisions`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({decisions: items}),
+    });
+    toast(`已保存 ${r.decisions.length} 条 PM 裁决`
+      + (r.prd_refreshed ? "，PRD 第 6 节已同步" : "（PRD 是人工改写版，未覆盖）"), "ok");
+    // 同上：提示写在 loadDetail 之后，否则会被重渲清空。
+    await loadDetail();
+    $("d-pmq-out").textContent = `已保存 ${r.decisions.length} 条裁决，其中 ${r.merged} 条并回 PM 产物。`;
+  }catch(e){ $("d-pmq-out").textContent = "保存失败：" + e.message; }
+  finally{ $("btn-pmq-save").disabled = false; }
+}
+
+/* ------------------------------------------------ PRD 查看 / 编辑 */
+function togglePrdEdit(on){
+  const d = S.detail || {};
+  $("d-prd-edit-box").hidden = !on;
+  $("d-prd").hidden = on;
+  if(on) $("d-prd-input").value = d.prd || "";
+  $("d-prd-out").textContent = "";
+}
+async function savePrd(){
+  const text = $("d-prd-input").value;
+  if(!text.trim()){ $("d-prd-out").textContent = "内容不能为空"; return; }
+  $("btn-prd-save").disabled = true;
+  try{
+    await api(`/api/runs/${encodeURIComponent(S.current)}/prd`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({content: text}),
+    });
+    $("d-prd-out").textContent = "已保存（流水线不会再覆盖它）";
+    toast("PRD 已保存", "ok");
+    togglePrdEdit(false);
+    await loadDetail();
+  }catch(e){ $("d-prd-out").textContent = "保存失败：" + e.message; }
+  finally{ $("btn-prd-save").disabled = false; }
+}
+async function regenPrd(){
+  // 旧行为只删「人工改写标记」，重渲染留给下次持久化 —— 运行暂停/结束后不会再持久化，
+  // 于是点了没反应。现在服务端当场按产物重渲染（纯渲染、不调模型）。
+  if(!await askConfirm("按产物重新生成 PRD",
+    "用当前 PM 产物重新渲染 prd.md：第 6 节的「已裁决」结论会以陈述形式写进去。\n\n"
+    + "你手工改写过 PRD 的部分会被覆盖。", "重新生成")) return;
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/prd`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({regenerate: true}),
+    });
+    $("d-prd-out").textContent =
+      `已按产物重新生成：已裁决 ${r.decided} 条 / 待裁决 ${r.pending} 条`;
+    toast(`PRD 已重新生成（已裁决 ${r.decided} 条写入第 6 节）`, "ok");
+    togglePrdEdit(false);
+    await loadDetail();
+  }catch(e){ $("d-prd-out").textContent = "操作失败：" + e.message; }
+}
+
+async function saveIntakeDecisions(){
+  const items = [];
+  document.querySelectorAll("#d-intake-body input[data-ikind]").forEach(el => {
+    if(el.disabled) return;   // 只读的历史记录不参与提交
+    const v = cleanDecision(el.value);
+    if(v) items.push({kind: el.dataset.ikind, ref: el.dataset.ref, decision: v});
+  });
+  if(!items.length){ $("d-intake-out").textContent = "还没有填写任何裁决（至少填一条）"; return; }
+  $("btn-intake-save").disabled = true;
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/intake-decisions`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({decisions: items}),
+    });
+    toast(`已保存 ${r.decisions.length} 条裁决`, "ok");
+    // 提示必须写在 loadDetail **之后**：loadDetail 会重渲卡片并清空提示区，
+    // 写早了这条「已保存」会瞬间消失，看起来像没保存成功。
+    await loadDetail();
+    $("d-intake-out").textContent =
+      `已保存 ${r.decisions.length} 条裁决，其中 ${r.merged} 条并回补强产物（终稿供下游直接读取）。`;
+  }catch(e){ $("d-intake-out").textContent = "保存失败：" + e.message; }
+  finally{ $("btn-intake-save").disabled = false; }
+}
+
+/* ------------------------------------------------ 产物表单化（高频字段） */
+// 每次过闸门，人工的核心动作就是核对/修正这些字段，但原先只能在 textarea 里手写 JSON。
+// 这里给它们一个可编辑表格：改完实时同步回 JSON textarea，用户照常点「保存产物」——
+// 不引入第二条保存路径，也就不会出现「表单改了但忘了保存」这类不一致。
+// 注意键是**阶段名**（pm / review），不是产物里的字段名（scope）——查表时用的是 sn.stage
+const ARTIFACT_FORMS = {
+  pm: [{
+    key: "open_questions",
+    title: "未决问题与默认取值（人工核对重点）",
+    labelKey: "question",
+    fields: [
+      {key: "recommendation", label: "PM 建议"},
+      {key: "assumed_answer", label: "下游默认取值（下游已按此执行）"},
+      {key: "impact_if_wrong", label: "猜错的代价"},
+      {key: "severity", label: "严重度", options: ["high", "low"]},
+    ],
+  }],
+  review: [{
+    key: "required_fixes_detail",
+    title: "返工项（architect 会把下一轮回退到方案阶段；needs_external 只记入残留风险）",
+    labelKey: "fix",
+    fields: [
+      {key: "scope", label: "作用域", options: ["in_material", "architect", "needs_external"]},
+      {key: "why", label: "为什么"},
+    ],
+  }],
+};
+
+function artifactFormHtml(stage, artifact){
+  const specs = ARTIFACT_FORMS[stage];
+  if(!specs || !artifact || typeof artifact !== "object") return "";
+  let html = "";
+  for(const spec of specs){
+    const rows = artifact[spec.key];
+    if(!Array.isArray(rows) || !rows.length) continue;
+    html += `<div class="af-wrap" data-af-key="${esc(spec.key)}"><h4>${esc(spec.title)}</h4>`;
+    rows.forEach((row, i) => {
+      if(!row || typeof row !== "object") return;
+      html += `<div class="af-row" data-af-i="${i}">
+        <div class="af-q">${i + 1}. ${esc(row[spec.labelKey] || "（空）")}</div>`;
+      for(const f of spec.fields){
+        const val = row[f.key] == null ? "" : String(row[f.key]);
+        if(f.options){
+          html += `<div><label>${esc(f.label)}</label><select data-af-field="${esc(f.key)}">` +
+            f.options.map(o => `<option value="${esc(o)}"${o === val ? " selected" : ""}>${esc(o)}</option>`).join("") +
+            `</select></div>`;
+        } else if(val.length > 48){
+          html += `<div><label>${esc(f.label)}</label><textarea data-af-field="${esc(f.key)}">${esc(val)}</textarea></div>`;
+        } else {
+          html += `<div><label>${esc(f.label)}</label><input data-af-field="${esc(f.key)}" value="${esc(val)}"></div>`;
+        }
+      }
+      html += `</div>`;
+    });
+    html += `<div class="note">以上改动已实时同步到下方 JSON，确认无误后点「保存产物」提交。</div></div>`;
+  }
+  return html;
+}
+
+// 表单 → JSON：按表单当前值重建该字段，再写回 textarea（不碰 dataset.rendered，
+// 于是重渲时它会被当作「未保存编辑」原样保留）
+function bindArtifactForm(el){
+  const ta = el.querySelector(".artifact");
+  el.querySelectorAll(".af-wrap").forEach(wrap => {
+    const key = wrap.dataset.afKey;
+    wrap.querySelectorAll("[data-af-field]").forEach(input => {
+      const sync = () => {
+        let obj;
+        try { obj = JSON.parse(ta.value); }
+        catch(e){ el.querySelector(".out").textContent = "当前 JSON 无法解析，表单改动暂未同步"; return; }
+        if(!obj || !Array.isArray(obj[key])) return;
+        wrap.querySelectorAll(".af-row").forEach(rowEl => {
+          const i = Number(rowEl.dataset.afI);
+          if(!obj[key][i]) return;
+          rowEl.querySelectorAll("[data-af-field]").forEach(f => { obj[key][i][f.dataset.afField] = f.value; });
+        });
+        ta.value = JSON.stringify(obj, null, 2);
+        el.querySelector(".out").textContent = "表单改动已同步到下方 JSON，点「保存产物」提交";
+      };
+      input.oninput = sync;
+      input.onchange = sync;
+    });
+  });
+}
+
+function renderStages(stages){
+  const box = $("d-stages");
+  if(!stages.length){
+    box.dataset.sig = "";
+    box.innerHTML = S.node
+      ? `<div class="note">「${esc(STAGE_CN[S.node] || S.node)}」还没有产物落盘。</div>`
+      : `<div class="note">还没有阶段产物落盘。</div>`;
+    return;
+  }
+  // 产物列表没变化就别重渲：轮询每 2.5s 触发一次 loadDetail，整块 innerHTML 重建会把
+  // 用户刚点开的产物折叠回去、把内层 <details> 收起来，还会跳滚动位置。
+  // 手动「刷新」会清掉 sig 强制重渲（那样能从文件读到别人改过的产物）。
+  const sig = stages.map(s => `${s.seq}:${s.stage}:${s.file}`).join("|");
+  if(box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+
+  // 真要重渲（有新产物落盘）时，先把展开状态与未保存的编辑记下来，重建后恢复
+  const keep = new Map();
+  box.querySelectorAll(".stage").forEach(el => {
+    const body = el.querySelector(".stage-body");
+    const dirty = {};
+    el.querySelectorAll("textarea").forEach((ta, i) => {
+      // dataset.rendered 是上次渲染写入的值；与它不同 = 用户改过且没保存
+      if(ta.dataset.rendered != null && ta.value !== ta.dataset.rendered){
+        dirty[`${ta.className}#${i}`] = ta.value;
+      }
+    });
+    keep.set(el.dataset.seq, {
+      open: !!body && !body.hidden,
+      details: [...el.querySelectorAll("details")].map(d => d.open),
+      dirty,
+    });
+  });
+
+  box.innerHTML = `<div class="note" style="margin-bottom:6px">最新的产物在最上面（#序号越大越新）。</div>` +
+    stages.slice().reverse().map(sn => {
+    const m = sn.meta || {};
+    const flags = [
+      m.switched ? badge("切换") : "",
+      (m.attempt||1) > 1 ? badge("契约重试x"+m.attempt,"warn") : "",
+      m.truncated ? badge("已裁剪","warn") : "",
+      m.prompt_over_budget ? badge("预算告警","warn") : "",
+      m.human_edited ? badge("人工已编辑","acc") : "",
+      m.human_feedback_used ? badge("含人工意见","acc") : "",
+      m.note ? badge(m.note) : ""
+    ].join(" ");
+    return `
+    <div class="stage" data-seq="${sn.seq}" data-stage="${esc(sn.stage)}">
+      <div class="stage-head">
+        <span class="seq">#${String(sn.seq).padStart(2,"0")}</span>
+        <b>${esc(sn.stage)}</b><span class="note">${esc(STAGE_CN[sn.stage]||"")}</span>
+        <span class="grow"></span>
+        ${badge(m.tag || "")}
+        ${m.wall_s!=null?badge(m.wall_s+"s"):""}
+        ${m.prompt_tokens!=null?badge("prompt "+m.prompt_tokens):""}
+        ${m.output_tokens!=null?badge("out "+m.output_tokens):""}
+        ${m.prefill_tps?badge("prefill "+m.prefill_tps+" t/s"):""}
+        ${m.gen_tps?badge("gen "+m.gen_tps+" t/s"):""}
+        ${(m.vram_ratio!=null && m.vram_ratio<0.99)?badge("显存仅 "+Math.round(m.vram_ratio*100)+"%","bad"):""}
+        ${flags}
+        <button data-act="toggle">查看/编辑</button>
+        <button data-act="rerun" ${S.editable?"":"disabled"}>打回重跑本阶段</button>
+      </div>
+      <div class="stage-body" hidden>
+        <div class="row"><span class="note">编辑后点保存即可（续跑时以文件为准，编辑立即生效）</span></div>
+        <div class="af-holder"></div>
+        <textarea class="code artifact" ${S.editable?"":"disabled"}></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" data-act="save" ${S.editable?"":"disabled"}>保存产物</button>
+          <button data-act="format">格式化</button>
+          <span class="note out"></span>
+        </div>
+        <details><summary>该次调用的输入预览（截断）</summary><pre class="preview"></pre></details>
+        <details><summary>调用元数据</summary><pre class="meta"></pre></details>
+        <div style="margin-top:10px">
+          <label>打回原因 / 修改要求（作为人工意见注入该阶段）</label>
+          <textarea class="rerun-note" ${S.editable?"":"disabled"} placeholder="例：第 3 个任务的验收标准不可测，改成能直接跑的命令"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" data-act="rerun-submit" ${S.editable?"":"disabled"}>打回重跑本阶段</button>
+            <span class="note">${S.editable?"会作废该阶段及其下游产物（归档到 superseded/），并从该阶段重新执行。":"运行 / 已结束态为只读，不可打回重跑。"}</span>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+
+  box.querySelectorAll(".stage").forEach(el => {
+    const sn = stages.find(s => s.seq == el.dataset.seq && s.stage === el.dataset.stage);
+    el.querySelector(".artifact").value = JSON.stringify(sn.artifact ?? null, null, 2);
+    el.querySelector(".preview").textContent = sn.request_preview || "（无）";
+    el.querySelector(".meta").textContent = JSON.stringify(sn.meta || {}, null, 2);
+    el.querySelectorAll("[data-act]").forEach(btn =>
+      btn.onclick = () => onStageAction(el, sn, btn.dataset.act));
+
+    // 恢复重渲前的展开状态与未保存编辑
+    const prev = keep.get(el.dataset.seq);
+    if(prev){
+      const body = el.querySelector(".stage-body");
+      if(prev.open) body.hidden = false;
+      el.querySelectorAll("details").forEach((d, i) => { if(prev.details[i]) d.open = true; });
+      el.querySelectorAll("textarea").forEach((ta, i) => {
+        const saved = prev.dirty[`${ta.className}#${i}`];
+        if(saved != null) ta.value = saved;
+      });
+    }
+    // 表单视图必须与 textarea 里的**最终**内容一致（可能是刚恢复的未保存编辑）
+    const holder = el.querySelector(".af-holder");
+    if(holder){
+      let parsed = null;
+      try { parsed = JSON.parse(el.querySelector(".artifact").value); } catch(e){ parsed = null; }
+      holder.innerHTML = parsed ? artifactFormHtml(sn.stage, parsed) : "";
+      if(parsed) bindArtifactForm(el);
+    }
+    // 记录本次渲染值，供下一轮判断用户是否改过
+    el.querySelectorAll("textarea").forEach(ta => { ta.dataset.rendered = ta.value; });
+  });
+}
+
+async function onStageAction(el, sn, act){
+  const body = el.querySelector(".stage-body");
+  if(act === "toggle"){ body.hidden = !body.hidden; return; }
+  if((act === "save" || act === "rerun-submit") && !S.editable) return;   // 运行/已结束态只读
+  if(act === "format"){
+    try { el.querySelector(".artifact").value = JSON.stringify(JSON.parse(el.querySelector(".artifact").value), null, 2); }
+    catch(e){ el.querySelector(".out").textContent = "JSON 解析失败: " + e.message; }
+    return;
+  }
+  if(act === "save"){
+    let artifact;
+    try { artifact = JSON.parse(el.querySelector(".artifact").value); }
+    catch(e){ el.querySelector(".out").innerHTML = `<span style="color:var(--bad)">JSON 解析失败: ${esc(e.message)}</span>`; return; }
+    try {
+      const r = await api(`/api/runs/${encodeURIComponent(S.current)}/artifact`,
+        {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({stage: sn.stage, artifact})});
+      el.querySelector(".out").innerHTML = r.warnings && r.warnings.length
+        ? `<span style="color:var(--warn)">已保存，但不符合契约：${esc(r.warnings.join("；"))}</span>`
+        : `<span style="color:var(--ok)">已保存</span>`;
+      await loadRuns();
+    } catch(e){ el.querySelector(".out").innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; }
+    return;
+  }
+  if(act === "rerun" || act === "rerun-submit"){
+    if(act === "rerun"){ body.hidden = false; el.querySelector(".rerun-note").focus(); return; }
+    const feedback = el.querySelector(".rerun-note").value.trim();
+    if(!await askConfirm(
+      "打回重跑本阶段",
+      `确认打回重跑 ${sn.stage}？\n该阶段及其下游产物会被作废（归档到 superseded/）。`,
+      "打回重跑"
+    )) return;
+    await resume(sn.stage, feedback);
+  }
+}
+
+/* ------------------------------------------------- 检查点（checkpoint）时间线 */
+function renderCheckpoints(d){
+  const box = $("d-ckpt-list");
+  const list = d.checkpoints || [];
+  $("d-ckpt-out").textContent = "";
+  if(!list.length){
+    box.dataset.sig = "";
+    box.innerHTML = `<div class="note">还没有检查点落盘。</div>`;
+    $("d-ckpt-note").textContent = "";
+    return;
+  }
+  // 与阶段产物卡片同理：列表没变就不重渲，免得 2.5s 轮询把展开状态/滚动位置冲掉。
+  // sig 里带上 S.editable，是因为「回放」按钮的可用性随运行相位变化。
+  const sig = list.map(c => `${c.seq}:${c.stage}:${c.superseded?1:0}`).join("|") + `#${S.editable?1:0}`;
+  if(box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+
+  const live = list.filter(c => !c.superseded);
+  const current = live.length ? live[live.length - 1] : null;
+  $("d-ckpt-note").textContent = `${live.length} 个在存 / 共 ${list.length} 个`;
+
+  box.innerHTML = list.map(c => {
+    const flags = [
+      c.superseded ? badge("已作废") : "",
+      c.human_edited ? badge("人工改过","acc") : "",
+      (current && !c.superseded && c.seq === current.seq) ? badge("当前状态点","ok") : ""
+    ].filter(Boolean).join(" ");
+    const disabled = (!S.editable || c.superseded) ? "disabled" : "";
+    const hint = c.superseded ? "已作废的检查点只可查看，不能回放"
+      : (!S.editable ? "运行中 / 已结束态为只读，不可回放" : "");
+    return `<div style="border-left:2px solid var(--line,#333);padding:4px 9px;margin:4px 0">
+      <div class="row" style="align-items:center;gap:8px">
+        <code>#${c.seq}</code>
+        <b>${esc(STAGE_CN[c.stage] || c.stage)}</b>
+        ${flags}
+        <span class="grow"></span>
+        <span class="note">${esc(c.tag || "")}</span>
+        <button data-ckpt="${c.seq}" ${disabled}>回放到此处</button>
+      </div>
+      <div class="note">${esc(c.file)}${c.note ? " · " + esc(c.note) : ""}${hint ? " · " + hint : ""}</div>
+    </div>`;
+  }).join("");
+
+  box.querySelectorAll("button[data-ckpt]").forEach(btn => {
+    btn.onclick = () => replayCheckpoint(parseInt(btn.dataset.ckpt, 10));
+  });
+}
+
+async function replayCheckpoint(seq){
+  if(!S.current || !S.editable || isNaN(seq)) return;
+  if(!await askConfirm(
+    "回放到检查点",
+    `确认回放到检查点 #${seq}？\n该检查点之后的全部产物会被作废（归档到 superseded/），并从该阶段重新执行。`,
+    "回放"
+  )) return;
+  $("d-ckpt-out").textContent = "正在启动…";
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(S.current)}/replay`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({seq})
+    });
+    $("d-ckpt-out").innerHTML = `<span style="color:var(--ok)">已从检查点 #${r.seq} 续跑</span>`;
+    setTimeout(loadDetail, 700);
+    await loadRuns();
+  } catch(e){
+    $("d-ckpt-out").innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  }
+}
+
+/* ------------------------------------------------- 流定义（Mermaid · 一致性校验） */
+let flowCache = null, flowPending = null;
+async function ensureFlow(){
+  if(flowCache) return flowCache;
+  if(!flowPending){
+    flowPending = api("/api/flow")
+      .then(f => { flowCache = (f && Array.isArray(f.nodes) && f.nodes.length) ? f : null; flowPending = null; return flowCache; })
+      .catch(() => { flowPending = null; return null; });
+  }
+  return flowPending;
+}
+async function renderFlow(){
+  const f = await ensureFlow();
+  if(!f){ $("d-flow-ok").innerHTML = `<span style="color:var(--bad)">流定义接口不可用（/api/flow）</span>`; return; }
+  const gw = f.gateway || {};
+  const pre = (f.pre_nodes || []).map(n => {
+    const br = (f.pre_edges || {})[n] || {};
+    return `${n}（入口总闸：` + Object.entries(br).map(([k,v]) => `${k}→${v}`).join(" / ") + "）";
+  }).join("；");
+  $("d-flow-ok").innerHTML = (f.ok
+    ? `<span style="color:var(--ok)">一致性校验通过</span>：STAGE_MODELS / STAGE_SCHEMAS / STAGE_STATE_KEY / 闸门声明均与流定义一致。`
+    : `<span style="color:var(--bad)">一致性校验不通过</span>：${esc((f.problems || []).join("；"))}`)
+    + (pre ? `<br>前置节点：${esc(pre)}` : "")
+    + (gw.modes ? `<br>入口总闸模式：${esc(gw.mode || "-")}（可选 ${esc((gw.modes||[]).join("/"))}）；`
+        + `全局禁区 ${(gw.forbidden||[]).length} 条` : "");
+  $("d-flow-mermaid").textContent = f.mermaid || "";
+}
+
+/* ------------------------------------------------- 阶段流程图：节点 ↔ 产物/日志/状态 */
+// 节点坐标按真实拓扑手工定位（3 行），保证边不交叉、视觉稳定、渲染不依赖任何布局库。
+// 表里没有的阶段（未来在 flow.py 新增）会落到兜底网格，不会从图上消失。
+const GRAPH_POS = {
+  intake:           {x:   6, y:  34},
+  pm:               {x: 132, y:  34},
+  retrieve:         {x: 258, y:  34},
+  architect_assess: {x: 384, y:  34},
+  architect_plan:   {x: 510, y:  34},
+  dev:              {x: 510, y: 142},
+  test:             {x: 636, y: 142},
+  verify:           {x: 762, y: 142},
+  review:           {x: 888, y: 142},
+  human_review:     {x: 888, y: 250},
+  done:             {x: 636, y: 250}
+};
+const G_W = 108, G_H = 44;
+const G_VIEW_W = 1004, G_VIEW_H = 336;
+// /api/flow 不可用时的兜底拓扑（与 flow.py 当前内容一致，保证图始终能画出来）
+const GRAPH_FALLBACK = [
+  ["intake","pm",""], ["pm","retrieve",""],
+  ["retrieve","architect_assess","secondary"], ["retrieve","architect_plan","new"],
+  ["architect_assess","architect_plan",""], ["architect_plan","dev",""],
+  ["dev","test",""], ["test","review",""],
+  ["review","human_review","pass"], ["review","dev","rework_dev"],
+  ["review","architect_plan","rework_architect"],
+  ["human_review","done","approve"], ["human_review","dev","reject"]
+];
+// 边上的英文条件名换成中文短标签（键统一是「源阶段|条件」；节点间空间有限，只放关键词）
+const EDGE_CN = {
+  "retrieve|new":"新建项目", "retrieve|secondary":"二次开发",
+  "review|pass":"通过", "review|rework_dev":"回流开发", "review|rework_architect":"回流方案",
+  "review|needs_human":"需人工介入", "review|escalated_ambiguous":"转人工",
+  "human_review|approve":"放行", "human_review|reject":"打回"
+};
+// 节点状态 -> [中文, badge 样式]
+const NODE_STATUS = {
+  done:["已完成","ok"], run:["执行中","acc"], gate:["等待人工","warn"],
+  attn:["需人工介入","bad"], wait:["未开始",""], skip:["未执行",""]
+};
+let GRAPH_STATUS = {};
+const LOG_CACHE = {};
+const GP = { stage:null, sig:"" };
+
+function graphCounts(d){
+  const out = {};
+  (d.stages||[]).forEach(s => { out[s.stage] = (out[s.stage]||0)+1; });
+  return out;
+}
+
+// 每个阶段的状态：completed / running / waiting-gate / needs-human / not-started
+function graphStatus(d, order){
+  const st = d.state || {}, phase = runPhase(d);
+  const counts = graphCounts(d);
+  const reached = new Set(Object.keys(counts));
+  const markUpTo = (target) => {
+    const i = order.indexOf(target);
+    if(i >= 0) order.slice(0, i+1).forEach(s => reached.add(s));
+  };
+  const cands = new Set(Object.keys(counts));
+  if(phase === "running" && st.cursor) cands.add(st.cursor);
+  if(phase === "paused" && (st.paused_after || st.cursor)) cands.add(st.paused_after || st.cursor);
+  cands.forEach(markUpTo);
+  // 正常跑完（非 needs_human）说明整条链都过了；needs_human 时后面确实没跑到，别一律标绿
+  if(phase === "done" && !st.needs_human) order.forEach(s => reached.add(s));
+
+  const out = {};
+  order.forEach(s => {
+    const n = counts[s] || 0;
+    if(phase === "paused" && st.paused_after === s) out[s] = "gate";
+    else if(phase === "running" && st.cursor === s) out[s] = "run";
+    else if(s === "review" && st.needs_human) out[s] = "attn";
+    else if(n > 0) out[s] = "done";
+    else if(reached.has(s)) out[s] = (s === "retrieve" || s === "done") ? "done" : "skip";
+    else out[s] = "wait";
+  });
+  return out;
+}
+
+// 边的走线：同排向前直连；同排反向（回流）从下方绕；跨排走三次贝塞尔。
+// 带标签的同排边若「中间隔着别的节点」或「两节点间距塞不下标签」，改从上方拱过去，
+// 避免标签被节点框压住（retrieve→architect_assess 这种相邻节点只隔 18px，直连必压）。
+function edgeGeometry(a, b, hasLabel, crowded){
+  const ax = a.x + G_W/2, ay = a.y + G_H/2;
+  const bx = b.x + G_W/2, by = b.y + G_H/2;
+  const sameRow = Math.abs(ay - by) < 1;
+  if(sameRow && bx > ax){
+    if(hasLabel && crowded){
+      const hump = a.y - 16;
+      return { d:`M ${ax} ${a.y} C ${ax} ${hump} ${bx} ${hump} ${bx} ${b.y}`,
+               mid:{x:(ax+bx)/2, y:hump - 5}, loop:true };
+    }
+    return { d:`M ${a.x + G_W} ${ay} H ${b.x}`, mid:{x:(a.x+G_W+b.x)/2, y:ay - 6}, loop:false };
+  }
+  if(sameRow){
+    const dip = a.y + G_H + 26;
+    return { d:`M ${ax} ${a.y + G_H} C ${ax} ${dip} ${bx} ${dip} ${bx} ${b.y + G_H}`,
+             mid:{x:(ax+bx)/2, y:dip + 12}, loop:true };
+  }
+  if(by > ay){
+    return { d:`M ${ax} ${a.y + G_H} C ${ax} ${ay + 38} ${bx} ${b.y - 38} ${bx} ${b.y}`,
+             mid:{x:(ax+bx)/2 + 30, y:(a.y + G_H + b.y)/2}, loop:false };
+  }
+  // 向上回流：标签往左挪一点，避开同区域的下行/绕行标签
+  return { d:`M ${ax} ${a.y} C ${ax} ${ay - 44} ${bx} ${b.y + G_H + 44} ${bx} ${b.y + G_H}`,
+           mid:{x:(ax+bx)/2 - 46, y:ay - 24}, loop:true };
+}
+
+async function renderGraph(d){
+  const host = $("d-graph");
+  if(!host || !d) return;
+  const f = await ensureFlow();
+  const order = (f && Array.isArray(f.nodes) && f.nodes.length) ? f.nodes.slice() : Object.keys(GRAPH_POS);
+  const posOf = (s, i) => GRAPH_POS[s] || { x: 6 + (i % 5) * 126, y: 34 + Math.floor(i / 5) * 108 };
+
+  let rawEdges = [];
+  if(f && f.linear){
+    Object.entries(f.linear).forEach(([a, b]) => rawEdges.push([a, b, ""]));
+    Object.entries(f.conditional || {}).forEach(([a, tbl]) =>
+      Object.entries(tbl || {}).forEach(([cond, b]) => rawEdges.push([a, b, cond])));
+  } else {
+    rawEdges = GRAPH_FALLBACK.slice();
+  }
+  // 同一对节点可能挂着多条条件边（review→done 的 needs_human / escalated_ambiguous），
+  // 合并成一条并把中文标签拼起来 —— 否则会画两条完全重叠的线、叠两段字。
+  const merged = new Map();
+  rawEdges
+    .filter(([a, b]) => order.includes(a) && order.includes(b))
+    .forEach(([a, b, cond]) => {
+      const key = `${a}|${b}`;
+      const item = merged.get(key) || { a, b, conds: [] };
+      if(cond) item.conds.push(cond);
+      merged.set(key, item);
+    });
+  const edges = [...merged.values()].map((it) => [
+    it.a,
+    it.b,
+    it.conds.map((c) => EDGE_CN[`${it.a}|${c}`] || c).join(" / "),
+  ]);
+
+  const status = graphStatus(d, order);
+  GRAPH_STATUS = status;
+  const counts = graphCounts(d);
+  const lastMeta = {};
+  (d.stages||[]).forEach(s => { lastMeta[s.stage] = s.meta || {}; });
+  const st = d.state || {}, phase = runPhase(d);
+
+  $("d-graph-note").innerHTML =
+    phase === "running" ? `执行中：<b>${esc(STAGE_CN[st.cursor] || st.cursor || "-")}</b>`
+    : phase === "paused" ? `等待人工：<b>${esc(STAGE_CN[st.paused_after] || st.paused_after || "-")}</b>`
+    : phase === "done" ? `已结束 · 判定 <b>${esc((d.summary||{}).verdict || st.verdict || "-")}</b>`
+    : "（无 state.json，无法探测进度）";
+
+  const sig = JSON.stringify([status, counts, S.graphSel || "", phase, st.cursor || "", st.paused_after || ""]);
+  if(host.dataset.sig === sig) return;
+  host.dataset.sig = sig;
+
+  // 当前阶段发出的边点亮，直观看出「走到哪了」
+  const hotFrom = phase === "running" ? st.cursor : (phase === "paused" ? (st.paused_after || st.cursor) : null);
+  const parts = [
+    `<defs><marker id="garrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+       <path d="M0,0 L8,4 L0,8 z" fill="#5a6377"/></marker></defs>`
+  ];
+  edges.forEach(([a, b, label]) => {
+    const pa = posOf(a, order.indexOf(a)), pb = posOf(b, order.indexOf(b));
+    if(order.indexOf(a) < 0 || order.indexOf(b) < 0) return;
+    const sameRow = Math.abs((pa.y + G_H/2) - (pb.y + G_H/2)) < 1;
+    const lo = Math.min(pa.x, pb.x) + G_W, hi = Math.max(pa.x, pb.x);
+    const nodeBetween = order.some(s => {
+      const p = GRAPH_POS[s];
+      return p && p.y === pa.y && p.x >= lo && p.x < hi;
+    });
+    // 直连是否「拥挤」：中间隔着别的节点，或两节点间距塞不下标签，都改走上方拱线
+    const crowded = sameRow && (nodeBetween || (pb.x - (pa.x + G_W)) < 96);
+    const g = edgeGeometry(pa, pb, !!label, crowded);
+    const hot = hotFrom && a === hotFrom;
+    parts.push(`<path class="gedge${g.loop ? " e-loop" : ""}${hot ? " e-hot" : ""}" d="${g.d}"/>`);
+    if(label) parts.push(`<text class="gedge-lb" x="${g.mid.x}" y="${g.mid.y}" text-anchor="middle">${esc(label)}</text>`);
+  });
+
+  order.forEach((s, i) => {
+    const p = posOf(s, i);
+    const n = counts[s] || 0;
+    const m = lastMeta[s] || {};
+    const cls = `gnode g-${status[s] || "wait"}${S.graphSel === s ? " g-sel" : ""}`;
+    // 无产物 ≠ 没跑过：检索/交付完成这类阶段本来就不落文件，别自相矛盾地写「未执行」。
+    // 数量口径是「产物条数 = 模型调用次数」：开发有两遍（DEV_TWO_PASS），回流还会多轮，
+    // 所以不能写成「执行轮次」——那会让人以为 dev 跑了两轮。
+    const sub = n ? `${n} 条产物${m.wall_s != null ? ` · ${m.wall_s}s` : ""}`
+      : (status[s] === "done" ? "已执行 · 无产物" : (status[s] === "skip" ? "已跳过" : "未执行"));
+    parts.push(`<g class="${cls}" data-stage="${esc(s)}">
+      <title>${esc(`${STAGE_CN[s] || s}（${s}）　${(NODE_STATUS[status[s]] || ["",""])[0]}`)}</title>
+      <rect x="${p.x}" y="${p.y}" width="${G_W}" height="${G_H}" rx="9"/>
+      <text x="${p.x + 11}" y="${p.y + 19}">${esc(STAGE_CN[s] || s)}</text>
+      <text class="sub" x="${p.x + 11}" y="${p.y + 34}">${esc(sub)}</text>
+      ${n > 1 ? `<text class="sub" x="${p.x + G_W - 8}" y="${p.y + 15}" text-anchor="end">×${n}</text>` : ""}
+    </g>`);
+  });
+
+  host.innerHTML = `<svg class="pipe" viewBox="0 0 ${G_VIEW_W} ${G_VIEW_H}" width="${G_VIEW_W}" height="${G_VIEW_H}"
+      style="max-width:100%;height:auto" role="img" aria-label="流水线阶段流程图">${parts.join("")}</svg>`;
+  host.querySelectorAll(".gnode").forEach(el => {
+    el.onclick = () => selectStage(el.dataset.stage);
+  });
+}
+
+async function selectStage(stage){
+  if(!stage || !S.detail) return;
+  // 双向联动：点流程图节点 = 选中该节点，下方信息随之切换（与点流程条等价）
+  S.node = stage;
+  S.nodePin = true;
+  S.graphSel = stage;
+  GP.stage = null;                     // 强制重建详情面板
+  renderGraph(S.detail);               // 重渲以更新选中高亮（异步，不阻塞面板）
+  $("d-graph-hint").hidden = true;
+  $("d-graph-detail").hidden = false;
+  renderStages(nodeSnaps(S.detail));
+  renderIssues(S.detail);
+  applyNodeFilter();
+  renderProgress(S.detail);
+  await renderStagePanel(S.detail, stage, true);
+}
+
+/* 该阶段详情：状态信息 + 产物文件列表 + 执行日志（日志按阶段切片，异步填进去，点击不卡） */
+async function renderStagePanel(d, stage, force){
+  const box = $("d-graph-detail");
+  if(!box) return;
+  const st = d.state || {};
+  const snaps = (d.stages||[]).filter(s => s.stage === stage);
+  const cks = (d.checkpoints || []).filter(c => c.stage === stage);
+  const status = GRAPH_STATUS[stage] || "wait";
+  const last = snaps.length ? snaps[snaps.length-1] : null;
+  const m = (last && last.meta) || {};
+
+  const sig = JSON.stringify([stage, status, snaps.map(s => s.seq), cks.map(c => `${c.seq}:${c.superseded?1:0}`),
+                              S.editable, !!d.running]);
+  if(!force && GP.stage === stage && GP.sig === sig){
+    await refreshPanelLog(d, stage, box);   // 结构没变就只滚动日志
+    return;
+  }
+  GP.stage = stage; GP.sig = sig;
+
+  const [sCn, sCls] = NODE_STATUS[status] || ["未知", ""];
+  const rows = [
+    ["阶段", `<b>${esc(STAGE_CN[stage] || stage)}</b> <span class="note">${esc(stage)}</span>`],
+    ["状态", badge(sCn, sCls)],
+    // 口径说明：产物条数 = 该阶段的模型调用次数（开发是两遍、回流有多轮，都会各留一份快照）
+    ["模型调用", snaps.length ? `${snaps.length} 次` : "未执行"]
+  ];
+  if(m.tag) rows.push(["模型", `<code>${esc(m.tag)}</code>${m.num_ctx ? ` · ctx ${m.num_ctx}` : ""}${m.think === false ? " · 关思考" : ""}`]);
+  if(m.wall_s != null) rows.push(["最近耗时", `${m.wall_s}s${m.load_s != null ? `（含加载 ${m.load_s}s）` : ""}`]);
+  if(m.prompt_tokens != null) rows.push(["token", `prompt ${m.prompt_tokens} / out ${m.output_tokens || 0}`]);
+  if(m.prefill_tps || m.gen_tps)
+    rows.push(["吞吐", [m.prefill_tps ? `prefill ${m.prefill_tps} t/s` : "",
+                        m.gen_tps ? `gen ${m.gen_tps} t/s` : ""].filter(Boolean).join(" · ")]);
+  const flags = [
+    m.switched ? "模型切换" : "", (m.attempt || 1) > 1 ? `契约重试×${m.attempt}` : "",
+    m.truncated ? "输入已裁剪" : "", m.prompt_over_budget ? "预算告警" : "",
+    m.human_edited ? "人工已编辑" : "", m.human_feedback_used ? "含人工意见" : ""
+  ].filter(Boolean);
+  if(flags.length) rows.push(["标记", flags.map(f => badge(f, "warn")).join(" ")]);
+  if(d.running && st.cursor === stage) rows.push(["说明", `<span class="note">正在执行，日志会自动跟随刷新</span>`]);
+  if(st.paused_after === stage) rows.push(["说明", `<span class="note">运行停在本阶段之后，等待人工确认</span>`]);
+  if(st.needs_human && stage === "review") rows.push(["说明", `<span class="warnbox" style="margin:3px 0">评审未通过且已达回流上限，需人工介入</span>`]);
+
+  const files = cks.length
+    ? cks.map(c => `<div class="gp-file">
+        <code>#${c.seq}</code><span class="fn">${esc(c.file)}</span>
+        ${c.superseded ? badge("已作废") : ""}${c.human_edited ? badge("人工改过","acc") : ""}
+        ${c.tag ? badge(c.tag) : ""}
+        <span class="grow"></span>
+        <button data-locate="1">在阶段产物中定位</button>
+      </div>`).join("")
+    : `<div class="note">${stage === "retrieve"
+        ? "该阶段不产出文件：检索步骤按符号构建代码池，结果存进 state.pool。"
+        : "该阶段还没有产物落盘。"}</div>`;
+
+  box.innerHTML = `
+    <h3>${esc(STAGE_CN[stage] || stage)} <span class="note">${esc(stage)}</span></h3>
+    <div class="kv" style="grid-template-columns:74px 1fr">
+      ${rows.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join("")}
+    </div>
+    <h4>产物文件（${cks.filter(c => !c.superseded).length} 个在存 / 共 ${cks.length} 个）</h4>
+    ${files}
+    <h4>执行日志 <span class="note" id="gp-log-note"></span></h4>
+    <div class="row" style="margin-bottom:4px">
+      <button data-log-refresh="1">刷新日志</button>
+      <span class="note">仅本阶段切片（按 <code>== STAGE ${esc(stage)} ==</code> 边界切分）</span>
+    </div>
+    <pre id="gp-log" style="max-height:260px">加载中…</pre>`;
+
+  box.querySelectorAll("[data-locate]").forEach(btn => { btn.onclick = () => locateStage(stage); });
+  const rb = box.querySelector("[data-log-refresh]");
+  if(rb) rb.onclick = () => refreshPanelLog(d, stage, box, true);
+
+  await refreshPanelLog(d, stage, box, true);
+}
+
+async function fetchStageLog(runId, stage, force){
+  const key = `${runId}:${stage}`;
+  if(!force && LOG_CACHE[key]) return LOG_CACHE[key];
+  try{
+    const r = await api(`/api/runs/${encodeURIComponent(runId)}/log?stage=${encodeURIComponent(stage)}&lines=300`);
+    LOG_CACHE[key] = (r && typeof r.text === "string")
+      ? r : { text:"", lines:0, occurrences:0, has_markers:false };
+  } catch(e){
+    LOG_CACHE[key] = { text:"", error:e.message, lines:0, occurrences:0, has_markers:false };
+  }
+  return LOG_CACHE[key];
+}
+
+async function refreshPanelLog(d, stage, box, force){
+  const pre = box.querySelector("#gp-log");
+  if(!pre) return;
+  if(!force && !d.running) return;              // 未在跑就别反复读盘
+  const r = await fetchStageLog(S.current, stage, force || !!d.running);
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 14;
+  pre.textContent = r.text || (r.error ? `日志读取失败：${r.error}` : "（该阶段暂无日志）");
+  const note = box.querySelector("#gp-log-note");
+  if(note){
+    if(r.error || !r.text) note.textContent = "";
+    else if(!r.has_markers) note.textContent = "该运行没有阶段标记（旧运行），显示的是日志尾部";
+    else note.textContent = `${r.lines} 行`
+      + (r.occurrences > 1 ? ` · ${r.occurrences} 次执行` : "")
+      + (r.truncated ? " · 已截断（仅尾部）" : "");
+  }
+  if(atBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+/* ------------------------------------------------- 最终输出 · 运行验证 */
+const VERIFY_ST_CN = {ok:"通过", fail:"失败", timeout:"超时", error:"无法执行", skipped:"未执行"};
+
+function renderVerify(d){
+  const card = $("d-verify-card");
+  const art = (d.artifacts || {}).verify;
+  if(!art){ card.hidden = true; return; }
+  card.hidden = false;
+  const v = String(art.verdict || "skipped");
+  $("d-verify-note").innerHTML = [
+    badge(v === "pass" ? "验证通过" : (v === "fail" ? "验证失败（阻断）" : "未执行"),
+          v === "pass" ? "ok" : (v === "fail" ? "bad" : "warn")),
+    art.mode === "mock" ? badge("mock：只计划未真跑", "warn") : "",
+    art.elapsed_s != null ? badge(art.elapsed_s + "s") : ""
+  ].filter(Boolean).join(" ");
+
+  const box = $("d-verify-body");
+  const commands = art.commands || [];
+  const sig = JSON.stringify([art.verdict, art.summary, commands.map(c => `${c.command}:${c.status}`), art.mode]);
+  if(box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+
+  const parts = [];
+  if(art.summary) parts.push(`<div class="note" style="margin-bottom:6px">${esc(art.summary)}</div>`);
+  if(v === "fail" && (art.problems || []).length)
+    parts.push(`<div class="errbox" style="margin-bottom:8px">${art.problems.map(p => esc(p)).join("<br>")}</div>`);
+  if(art.sandbox)
+    parts.push(`<div class="note" style="margin-bottom:6px">沙箱目录：<code>${esc(art.sandbox)}</code>
+      —— 补丁已物化在这里，可自行进去复跑</div>`);
+  if(!commands.length) parts.push(`<div class="note">没有计划出可执行的命令。</div>`);
+  commands.forEach(c => {
+    const st = String(c.status || "");
+    const color = st === "ok" ? "var(--ok)" : (st === "skipped" ? "var(--line)" : "var(--bad)");
+    const bits = [
+      badge(VERIFY_ST_CN[st] || st, st === "ok" ? "ok" : (st === "skipped" ? "" : "bad")),
+      badge(c.source || ""),
+      c.exit_code != null ? badge("exit " + c.exit_code) : "",
+      c.duration_s ? badge(c.duration_s + "s") : ""
+    ].filter(Boolean).join(" ");
+    const out = [c.stdout_tail, c.stderr_tail].filter(Boolean).join("\n").trim();
+    parts.push(`<div style="border-left:2px solid ${color};padding:4px 9px;margin:5px 0">
+      <div class="row" style="gap:6px;align-items:center">${bits}</div>
+      <div style="margin-top:3px"><code style="word-break:break-all">${esc(c.command || "")}</code></div>
+      ${c.reason ? `<div class="note">${esc(c.reason)}</div>` : ""}
+      ${out ? `<pre style="max-height:180px;margin:6px 0 0">${esc(out)}</pre>` : ""}
+    </div>`);
+  });
+  if((art.notes || []).length)
+    parts.push(`<div class="note" style="margin-top:6px">${art.notes.map(n => esc(n)).join("<br>")}</div>`);
+  box.innerHTML = parts.join("");
+}
+
+/* 把流程图节点与下方「阶段产物与操作」的产物块绑定：定位 + 展开 + 高亮 */
+function locateStage(stage){
+  const blocks = [...document.querySelectorAll("#d-stages .stage")]
+    .filter(el => el.dataset.stage === stage);
+  if(!blocks.length){
+    toast(`下方「阶段产物与操作」里还没有 ${STAGE_CN[stage] || stage} 的产物块`, "bad");
+    return;
+  }
+  document.querySelectorAll("#d-stages .stage.hl").forEach(el => el.classList.remove("hl"));
+  blocks.forEach(el => {
+    el.classList.add("hl");
+    const body = el.querySelector(".stage-body");
+    if(body) body.hidden = false;
+  });
+  blocks[0].scrollIntoView({ behavior:"smooth", block:"center" });
+  toast(`已定位到 ${blocks.length} 个 ${STAGE_CN[stage] || stage} 产物块`, "ok");
+}
+
+async function refreshGraph(d){
+  if(!d) return;
+  if(S.graphRun !== d.run_id){    // 切换运行：清干净上一轮的选中态与日志缓存
+    S.graphRun = d.run_id;
+    S.graphSel = null;
+    GP.stage = null; GP.sig = "";
+    Object.keys(LOG_CACHE).forEach(k => { if(k.startsWith(d.run_id + ":")) delete LOG_CACHE[k]; });
+    $("d-graph-hint").hidden = false;
+    $("d-graph-detail").hidden = true;
+  }
+  await renderGraph(d);
+  await renderFlow();
+  if(S.graphSel) await renderStagePanel(d, S.graphSel, false);
+}
+
+/* ------------------------------------------------- 项目类型 / 目录选择器 */
+function pType(){
+  const el = document.querySelector('input[name="nf-ptype"]:checked');
+  return el ? el.value : "secondary";
+}
+function applyPType(){
+  const t = pType();
+  if(t === "new"){
+    $("nf-repo-label").textContent = "项目目录（新生成代码写入此目录，必填）";
+    $("nf-repo").placeholder = "D:/AI/new-project";
+    $("nf-repo-note").textContent =
+      "新建项目：目录可以尚不存在，流水线会在此生成新文件；本机目录请点「浏览…」选择，无需手动录入。";
+  } else {
+    $("nf-repo-label").textContent = "存量代码仓库路径（用于检索分片，可留空）";
+    $("nf-repo").placeholder = "D:/AI/project";
+    $("nf-repo-note").textContent =
+      "二次开发：指向已有仓库，用于检索参考与套用补丁；留空则不做检索。";
+  }
+}
+
+const DIR_COMPUTER = "__computer__";
+let dirState = {path: DIR_COMPUTER};
+function openDirModal(seed){
+  $("dir-modal").hidden = false;
+  dirModalNavigate((seed || "").trim() || DIR_COMPUTER);
+  // 打开即聚焦输入框：键盘可以直接输路径回车跳转，不必先摸鼠标
+  setTimeout(() => $("dir-input").focus(), 30);
+}
+async function dirModalNavigate(path){
+  path = path || DIR_COMPUTER;
+  try{
+    const data = await api("/api/fs/browse?path=" + encodeURIComponent(path));
+    dirState = data;
+    $("dir-path").textContent = data.computer ? "此电脑" : data.path;
+    $("dir-up").disabled = !data.parent;
+    const base = data.computer ? "" : data.path;
+    let html = "";
+    if(data.parent){
+      html += `<div class="dir-row up" data-path="${esc(data.parent)}"><span class="ic">↑</span> 上级目录</div>`;
+    }
+    html += (data.entries || []).map(e => {
+      const full = e.is_dir ? (base ? base.replace(/\/+$/, "") + "/" + e.name : e.name) : e.name;
+      return `<div class="dir-row" data-path="${esc(full)}" data-dir="${e.is_dir}"><span class="ic">${e.is_dir ? "📁" : "📄"}</span> ${esc(e.name)}</div>`;
+    }).join("");
+    $("dir-list").innerHTML = html || `<div class="note">（空目录）</div>`;
+    $("dir-input").value = data.computer ? "" : data.path;
+    $("dir-list").querySelectorAll(".dir-row").forEach(el => {
+      // 键盘可达：目录行原先只是不可聚焦的 div，只能鼠标点
+      el.tabIndex = 0;
+      el.setAttribute("role", "button");
+      const activate = () => {
+        if(el.classList.contains("up")){ dirModalNavigate(el.dataset.path); return; }
+        if(el.dataset.dir === "true"){ dirModalNavigate(el.dataset.path); }
+      };
+      el.onclick = activate;
+      el.onkeydown = e => {
+        if(e.key === "Enter" || e.key === " "){ e.preventDefault(); activate(); }
+      };
+    });
+  } catch(e){ $("dir-list").innerHTML = `<div class="errbox">${esc(netHint(e))}</div>`; }
+}
+function dirPick(){
+  const chosen = dirState.computer
+    ? ($("dir-input").value.trim() || "")
+    : (dirState.path || $("dir-input").value.trim());
+  $("nf-repo").value = chosen;
+  closeDirModal();
+}
+function closeDirModal(){ $("dir-modal").hidden = true; }
+
+/* ------------------------------------------------------------------ 动作 */
+async function resume(from, feedback){
+  const gates = readGates("dg");
+  const note = feedback || $("feedback").value.trim();
+  const issueKind = $("issue-kind").value || "";
+  const maxRework = (($("dg-max") || {}).value || "").trim();
+  $("btn-resume").disabled = true;
+  try{
+    await api(`/api/runs/${encodeURIComponent(S.current)}/resume`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        from: from || null, feedback: note || null, pause_after: gates, issue_kind: issueKind,
+        // 留空 = 不覆盖（沿用该 run 原本的上限）；填了才覆盖
+        max_rework: maxRework === "" ? null : Number(maxRework)
+      })
+    });
+    $("feedback").value = "";
+    setTimeout(loadDetail, 700);
+    await loadRuns();
+  } catch(e){
+    toast("启动失败: " + e.message, "bad");
+  } finally {
+    $("btn-resume").disabled = false;
+  }
+}
+
+async function createRun(){
+  const req = $("nf-req").value.trim();
+  if(!req){ $("nf-note").textContent = "需求文本不能为空"; return; }
+  const ptype = pType();
+  const repo = $("nf-repo").value.trim();
+  if(ptype === "new" && !repo){ $("nf-note").textContent = "新建项目必须指定项目目录"; return; }
+  const payload = {
+    requirement: req,
+    project_type: ptype,
+    repo: repo,
+    pause_after: readGates("nf"),
+    review_every: Number($("nf-rev").value || 2),
+    max_rework: Number($("nf-max").value || 0),
+    mock: $("nf-mock").checked,
+    // 入口总闸：留空 = 沿用 config.local.json 的 guard.mode（不覆盖配置）
+    gateway: $("nf-gw").value || null,
+    scale: $("nf-scale").value || null,
+    forbidden: $("nf-forbidden").value.split(",").map(s => s.trim()).filter(Boolean)
+  };
+  $("nf-note").textContent = "启动中…";
+  try{
+    const r = await api("/api/runs", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+    $("nf-note").textContent = "已启动 " + r.run_id;
+    $("new-form").hidden = true;
+    await loadRuns();
+    await openRun(r.run_id);
+  } catch(e){ $("nf-note").textContent = "启动失败: " + netHint(e); }
+}
+
+/* ------------------------------------------------- 作业（全局架构 / 入口总闸） */
+// 作业不是「运行」：它是入口总闸把一个大需求拆成多个模块后的**编排单元**，
+// 每个模块各自是一条完整流水线（runs/<job>-M-01/…）。产物在 runs/_jobs/ 下。
+const JS = {jobs:[], cur:null, detail:null};
+
+function jobStatusBadge(st){
+  const map = {done:["已完成","ok"], running:["进行中","acc"], paused:["已暂停","warn"],
+               blocked:["有阻断","bad"], partial:["部分完成","warn"], pending:["待执行",""],
+               empty:["无模块",""], failed:["失败","bad"]};
+  const item = map[st] || [st || "未知", ""];
+  return badge(item[0], item[1]);
+}
+
+async function loadJobs(){
+  let data;
+  try { data = await api("/api/jobs"); } catch(e){ return; }
+  JS.jobs = data.jobs || [];
+  if(!JS.modeShown){
+    JS.modeShown = true;   // 只写一次：否则轮询会把用户正在编辑的说明文字冲掉
+    $("nf-gw-note").textContent =
+      `当前配置默认 guard.mode=${data.mode}，禁区 ${(data.forbidden||[]).length} 条。` +
+      "off 与原行为完全一致（连仓库都不扫）；auto 下判为 small 时零额外模型调用。";
+  }
+  renderJobList();
+}
+
+function renderJobList(){
+  const box = $("job-list");
+  if(!JS.jobs.length){ box.innerHTML = `<div class="note">（暂无作业）</div>`; return; }
+  box.innerHTML = JS.jobs.map(j => `
+    <div class="run ${JS.cur===j.job_id?"active":""}" data-job="${esc(j.job_id)}">
+      <div class="row">
+        <span class="id">${esc(j.job_id)}</span><span class="grow"></span>${jobStatusBadge(j.status)}
+      </div>
+      <div class="meta">
+        ${badge(j.modules + " 模块")}${j.mode?badge("gw:"+j.mode):""}
+        ${j.pending && j.pending.length?badge("待跑 " + j.pending.length):""}
+      </div>
+    </div>`).join("");
+  box.querySelectorAll("[data-job]").forEach(el => el.onclick = () => openJob(el.dataset.job));
+}
+
+async function openJob(jobId){
+  try{
+    const d = await api("/api/jobs/" + encodeURIComponent(jobId));
+    JS.cur = jobId; JS.detail = d;
+    $("empty").hidden = true; $("new-form").hidden = true;
+    $("detail").hidden = true; $("report-view").hidden = true; $("config-view").hidden = true;
+    $("job-view").hidden = false;
+    renderJob(d);
+    renderJobList();
+  } catch(e){ toast("打开作业失败: " + netHint(e), "bad"); }
+}
+
+function renderJob(d){
+  $("j-id").textContent = d.job_id || "";
+  $("j-badges").innerHTML = jobStatusBadge(d.status) +
+    badge((d.modules||[]).length + " 模块") + (d.mode ? badge("gw:" + d.mode) : "");
+  $("j-dir").textContent = "作业目录：" + (d.dir || "");
+  $("j-msg").textContent = "";
+  $("j-resume").disabled = d.status === "running" || d.status === "done";
+
+  $("j-scale").innerHTML = [
+    ["规模判定", "large"],
+    ["判定理由", (d.reasons||[]).join("；") || "（人工强制）"],
+    ["存量仓库", d.repo || "（无 / 全新项目）"],
+    ["归属解析", (d.unclaimed_dirs||[]).length ? ("无主目录：" + d.unclaimed_dirs.join("、")) : "（全部目录均有归属）"],
+    ["边界重叠", Object.keys(d.ambiguous_dirs||{}).length
+      ? Object.entries(d.ambiguous_dirs).map(([k,v]) => k + "(" + v.join("/") + ")").join("、") : "（无）"]
+  ].map(([k,v]) => `<div class="kv-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join("");
+
+  $("j-summary").innerHTML = mdToHtml((d.ga && d.ga.project_summary) || "");
+
+  // 模块表：状态 / 子运行 / 审计结论（踩禁区或越界会被标 blocked）
+  const mods = d.modules || [];
+  $("j-mod-note").textContent = `按依赖顺序串行执行（单驻留：同一时刻只有一个模型在显存）`;
+  $("j-modules").innerHTML = mods.map((m, i) => {
+    const a = m.audit || {};
+    const flags = [
+      a.forbidden_touched && a.forbidden_touched.length ? badge("踩禁区 " + a.forbidden_touched.length, "bad") : "",
+      a.cross_module && a.cross_module.length ? badge("越界 " + a.cross_module.length, "bad") : "",
+      a.outside_scope && a.outside_scope.length ? badge("无主目录 " + a.outside_scope.length) : ""
+    ].filter(Boolean).join(" ");
+    const issues = (m.issues||[]).map(x => `<div class="note" style="color:var(--bad)">! ${esc(x)}</div>`).join("");
+    const risk = m.risk_level === "high" ? badge("高风险","bad") : badge(m.risk_level || "");
+    return `<div style="border-left:2px solid var(--line,#333);padding:5px 10px;margin:6px 0">
+      <div class="row" style="align-items:center;gap:8px">
+        <code>${i+1}</code><b>${esc(m.module_id)}</b> ${esc(m.module_name||"")}
+        ${risk}${jobStatusBadge(m.status)}${flags}
+        <span class="grow"></span>
+        ${m.run_id?`<button data-open-run="${esc(m.run_id)}">打开子运行</button>`:""}
+      </div>
+      <div class="note">${esc(m.responsibility||"")}</div>
+      <div class="note">候选落点：${(m.owned_dirs||[]).length?esc(m.owned_dirs.join("、")):"（未匹配到专属目录）"}
+        ${(m.depends_on||[]).length?" · 依赖：" + esc(m.depends_on.join("、")):""}</div>
+      ${issues}
+    </div>`;
+  }).join("") || `<div class="note">（GA 未产出模块）</div>`;
+  $("j-modules").querySelectorAll("[data-open-run]").forEach(b => b.onclick = () => openRun(b.dataset.openRun));
+
+  const c = (d.ga && d.ga.global_constraints) || {};
+  $("j-constraints").innerHTML = [
+    ["禁区", (c.forbidden_paths||[]).join("；") || "（无）"],
+    ["命名规范", c.naming_rules || "（无）"],
+    ["兼容性约束", c.compatibility_rules || "（无）"],
+    ["依赖版本", c.dependency_versions || "（无）"]
+  ].map(([k,v]) => `<div class="kv-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join("");
+
+  const cks = (d.ga && d.ga.integration_checkpoints) || [];
+  $("j-checkpoints").innerHTML = cks.length
+    ? cks.map(x => `<div style="margin:5px 0"><b>${esc(x.checkpoint)}</b>
+        <div class="note">${esc(x.verification_method)}</div></div>`).join("")
+    : `<div class="note">（无）</div>`;
+
+  const reqs = d.module_requirements || [];
+  $("j-req-select").innerHTML = reqs.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join("");
+  $("j-req-text").textContent = reqs.length ? reqs[0].text : "（无）";
+  $("j-req-select").onchange = () => {
+    const hit = reqs.find(f => f.name === $("j-req-select").value);
+    $("j-req-text").textContent = hit ? hit.text : "";
+  };
+  $("j-req-card").hidden = !reqs.length;
+
+  $("j-report").innerHTML = mdToHtml(d.report || "（无）");
+  $("j-report-card").hidden = !d.report;
+
+  const notes = [].concat(
+    (d.notes||[]).map(x => ["备注", x, ""]),
+    (d.grounding_warnings||[]).map(x => ["接地提示", x, ""])
+  );
+  $("j-notes").innerHTML = notes.map(([k,v]) =>
+    `<div class="note"><b>${esc(k)}</b>：${esc(v)}</div>`).join("");
+  $("j-notes-card").hidden = !notes.length;
+}
+
+async function resumeJob(){
+  if(!JS.cur) return;
+  if(!await askConfirm("续跑作业",
+    `确认续跑作业 ${JS.cur}？\n会先把已暂停的模块各自续跑完，再推进后续未开始的模块。`, "续跑")) return;
+  $("j-msg").textContent = "启动中…";
+  try{
+    await api(`/api/jobs/${encodeURIComponent(JS.cur)}/resume`, {
+      method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({})
+    });
+    $("j-msg").textContent = "已启动续跑";
+    setTimeout(() => openJob(JS.cur), 900);
+    await loadRuns();
+  } catch(e){ $("j-msg").innerHTML = `<span style="color:var(--bad)">${esc(netHint(e))}</span>`; }
+}
+
+// 运行详情顶部的「已拆分为作业」提示：页面发起的那次运行只剩日志，
+// 不提示的话人工只会看到一条空运行记录，不知道产物去了作业目录。
+function renderGatewayLink(d){
+  const box = $("d-msg");
+  const g = d && d.gateway;
+  if(!g){ if(box.dataset.gw) { box.textContent = ""; box.dataset.gw = ""; } return; }
+  box.dataset.gw = g.job_id;
+  box.innerHTML = `<div class="note" style="margin:6px 0">本次需求被<b>入口总闸</b>判定为 large
+    （${esc((g.reasons||[]).join("；") || "人工强制")}），已拆分为作业
+    <code>${esc(g.job_id)}</code>（${g.modules ?? "?"} 个模块，状态 ${esc(g.status || "-")}）
+    <button id="d-gw-jump" style="margin-left:6px">查看作业</button></div>`;
+  const btn = $("d-gw-jump");
+  if(btn) btn.onclick = () => openJob(g.job_id);
+}
+
+/* ------------------------------------------------------------------ 绑定 */
+// 轻量确认框的按钮（原生 confirm 会阻塞渲染，且与深色主题不搭）
+$("confirm-ok").onclick = () => settleConfirm(true);
+$("confirm-cancel").onclick = () => settleConfirm(false);
+$("confirm-modal").onclick = e => { if(e.target === $("confirm-modal")) settleConfirm(false); };
+// Esc 关闭弹层（原生 confirm 支持 Esc，自定义的也必须支持）
+document.addEventListener("keydown", e => {
+  if(e.key !== "Escape") return;
+  if(!$("confirm-modal").hidden){ settleConfirm(false); return; }
+  if(!$("dir-modal").hidden){ closeDirModal(); }
+});
+
+// 问题记录筛选
+["flt-sev", "flt-stage", "flt-kind", "flt-recurred"].forEach(id => {
+  $(id).addEventListener("change", () => { if(S.detail) renderIssues(S.detail); });
+});
+// 日志工具栏：改选项后强制重渲一次
+["log-follow", "log-only-issues"].forEach(id => {
+  $(id).addEventListener("change", () => {
+    $("d-log").dataset.sig = "";
+    renderLog((S.detail || {}).log || "");
+  });
+});
+
+$("btn-hrev-submit").onclick = submitHumanReview;
+$("btn-demo-run").onclick = runDemo;
+$("btn-demo-reject").onclick = demoFillReject;
+$("btn-intake-save").onclick = saveIntakeDecisions;
+$("btn-pmq-save").onclick = savePmDecisions;
+$("btn-prd-edit").onclick = () => togglePrdEdit(true);
+$("btn-prd-cancel").onclick = () => togglePrdEdit(false);
+$("btn-prd-save").onclick = savePrd;
+$("btn-prd-regen").onclick = regenPrd;
+// 运行列表维护：管理模式切换 / 删除选中 / 全选
+$("btn-manage").onclick = () => {
+  S.manage = !S.manage;
+  if(!S.manage) S.pick = new Set();
+  loadRuns().catch(e => toast(netHint(e), "bad"));
+};
+$("btn-del-sel").onclick = deleteSelected;
+$("sel-all").onchange = () => {
+  const on = $("sel-all").checked;
+  (S.runs||[]).forEach(r => {
+    if(r.running) return;          // 运行中不可删，不参与全选
+    if(on) S.pick.add(r.run_id); else S.pick.delete(r.run_id);
+  });
+  loadRuns().catch(e => toast(netHint(e), "bad"));
+};
+$("btn-refresh").onclick = async () => {
+  // 清掉各块的签名：手动刷新要强制重渲，否则读不到别人在文件层面改过的产物
+  ["d-stages", "d-ckpt-list", "d-verify-body", "d-graph", "d-overview", "d-issues", "d-patch-audit", "d-prd", "d-handoff", "d-log"].forEach(id => {
+    const el = $(id);
+    if(el) el.dataset.sig = "";
+  });
+  flowCache = null;   // 手动刷新时重取流定义（配置改动后校验结果可能变化）
+  Object.keys(LOG_CACHE).forEach(k => delete LOG_CACHE[k]);  // 强制重读各阶段日志
+  GP.sig = "";
+  try {
+    await loadRuns();
+    if(S.current) await loadDetail();
+  } catch(e){ toast("刷新失败: " + netHint(e), "bad"); }
+};
+$("btn-report").onclick = () => loadReport();
+$("btn-config").onclick = () => loadConfig();
+$("btn-config-close").onclick = () => {
+  $("config-view").hidden = true;
+  if(S.current) $("detail").hidden = false; else $("empty").hidden = false;
+};
+$("cfg-save").onclick = saveConfig;
+$("cfg-reset").onclick = resetConfig;
+function bindCopy(btnId, sourceId){
+  const btn = $(btnId);
+  if(!btn) return;
+  btn.onclick = async () => {
+    try{
+      await navigator.clipboard.writeText($(sourceId).textContent || "");
+      btn.textContent = "已复制";
+    } catch(e){ btn.textContent = "复制失败"; }
+    setTimeout(() => { btn.textContent = "复制"; }, 1500);
+  };
+}
+bindCopy("btn-copy-req", "d-req");
+bindCopy("btn-copy-prd", "d-prd");
+bindCopy("btn-copy-flow", "d-flow-mermaid");
+$("btn-report-close").onclick = () => {
+  $("report-view").hidden = true;
+  if(S.current) $("detail").hidden = false; else $("empty").hidden = false;
+};
+$("btn-resume").onclick = () => resume(null, "");
+$("btn-stop").onclick = async () => {
+  if(!await askConfirm(
+    "中断流水线",
+    "中断当前流水线进程？\n已落盘的阶段产物会保留，可用「继续执行」续跑。",
+    "中断"
+  )) return;
+  try{
+    await api(`/api/runs/${encodeURIComponent(S.current)}/stop`, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    setTimeout(loadDetail, 800); await loadRuns();
+  } catch(e){ toast("中断失败: " + e.message, "bad"); }
+};
+$("btn-open-log").onclick = () => {
+  const c = $("d-log-card");
+  c.hidden = !c.hidden;
+  if(!c.hidden) c.scrollIntoView({behavior:"smooth", block:"nearest"});
+};
+$("btn-new").onclick = () => {
+  const f = $("new-form");
+  f.hidden = !f.hidden;
+  if(!f.hidden){
+    $("detail").hidden = true; $("empty").hidden = true;
+    // 默认**不勾**任何显式闸门。原先这里硬编码勾了 ["pm"]，后果有两个：
+    //   1) 每次新建运行都必然在 pm 结束后停下等人 —— 想让运行一路跑到底的人
+    //      即使把配置里三个闸门开关全关了，照样被这里拦住（真机 run 20260925-153925
+    //      的 initial_pause_after=['pm'] 就是这么来的）；
+    //   2) 它让「PM 未决项闸门」（配置项 pause_on_open_questions，只在 PM 真的提出
+    //      未决项时才停）永远轮不到 —— 无条件停把条件停盖住了。
+    // 需要人看 PM 产物时，在下面把「产品经理」勾上即可（勾选是显式闸门，一定会停）。
+    renderGates("nf-gates", "nf", []);
+    $("nf-note").textContent = "";
+    applyPType();
+    f.scrollIntoView({behavior:"smooth", block:"nearest"});
+  }
+};
+$("nf-cancel").onclick = () => { $("new-form").hidden = true; if(S.current) $("detail").hidden = false; else $("empty").hidden = false; };
+$("nf-submit").onclick = createRun;
+$("j-close").onclick = () => {
+  $("job-view").hidden = true; JS.cur = null; renderJobList();
+  if(S.current) $("detail").hidden = false; else $("empty").hidden = false;
+};
+$("j-refresh").onclick = () => { if(JS.cur) openJob(JS.cur); };
+$("j-resume").onclick = resumeJob;
+$("nf-browse").onclick = () => openDirModal($("nf-repo").value);
+$("dir-up").onclick = () => { if(dirState.parent) dirModalNavigate(dirState.parent); };
+$("dir-cancel").onclick = closeDirModal;
+$("dir-pick").onclick = dirPick;
+$("dir-input").addEventListener("keydown", e => {
+  if(e.key === "Enter") dirModalNavigate($("dir-input").value.trim() || DIR_COMPUTER);
+});
+$("dir-modal").onclick = e => { if(e.target === $("dir-modal")) closeDirModal(); };
+document.querySelectorAll('input[name="nf-ptype"]').forEach(r => r.onchange = applyPType);
+
+loadRuns().catch(e => { $("run-list").innerHTML = `<div class="errbox">${esc(netHint(e))}</div>`; });
+</script>
+</body>
+</html>

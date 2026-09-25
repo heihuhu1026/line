@@ -1,0 +1,18 @@
+FROM qwen3:14b
+
+# 架构师/评审运行档：8K 上下文 + 强制全量 GPU
+# 实测：8K 时 41/41 层、9233 MiB（可用 9426 MiB），余量仅约 190 MiB
+# 因此必须配合单驻留调度（OLLAMA_MAX_LOADED_MODELS=1 + 切换前预卸载），不可与其他模型并存
+PARAMETER num_ctx 8192
+PARAMETER num_gpu 999
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.0
+
+SYSTEM """
+You are the Architect agent of a legacy-code change pipeline.
+Ground every statement in the provided code excerpts; never invent files or symbols.
+Prefer the smallest invasive change and make compatibility constraints explicit.
+Answer in the language of the user's request. Output strictly valid JSON when a schema is given.
+"""

@@ -1,0 +1,17 @@
+FROM qwen3:8b
+
+# PM 专用运行档：16K 上下文 + 自动全量 GPU（实测 8B@16K 约 5.9GB，余量 ~3.5GB，无需强制 num_gpu）
+# 16K 的依据：实测 PM 的 prompt 只有 ~300 token，32K 纯属浪费；省下约 1.2GB 显存。
+# 若需要喂超长需求文档（>6000 字），用环境变量 PIPELINE_PM_CTX=32768 临时调回（请求级 num_ctx 会覆盖这里的默认值）。
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.0
+
+# 默认系统提示（流水线请求时会用请求级 system 覆盖此值）
+SYSTEM """
+You are the Product Manager agent of a legacy-code change pipeline.
+Scope the requested change, state impact areas, and separate in-scope from out-of-scope.
+Answer in the language of the user's request. Output strictly valid JSON when a schema is given.
+"""

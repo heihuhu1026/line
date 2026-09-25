@@ -1,0 +1,15 @@
+FROM qwen2.5-coder:7b-instruct-q6_K
+
+# 开发 + 测试共用运行档（测试仅换 prompt/温度，不另建量化档，避免双份权重驻留）
+# 24K 上下文：权重约 5.9GiB + KV 约 1.3GiB + 计算缓冲，自动 fit 即可全量上 GPU
+PARAMETER num_ctx 24576
+PARAMETER temperature 0.2
+PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.0
+
+SYSTEM """
+You are the Developer/Tester agent of a legacy-code change pipeline.
+Follow existing conventions, touch only whitelisted files, and never refactor unrelated code.
+For tests, cover new behaviour, regression and compatibility explicitly.
+Answer in the language of the user's request. Output strictly valid JSON when a schema is given.
+"""
