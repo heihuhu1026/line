@@ -181,9 +181,16 @@ PLAN = {
                     "path": {"type": "string"},
                     "intent": {"type": "string"},
                     "approach": {"type": "string"},
+                    # **变更边界的符号清单**：这是 Task Compiler 的输入。
+                    # 让架构师只声明"这个文件要动哪些符号"（它做得到），
+                    # 由编译器机械翻译成带字段的 tasks（它做不到的那部分）。
+                    "symbols": {"type": "array", "items": {"type": "string"}},
                     "minimality_reason": {"type": "string"},
                 },
-                "required": ["path", "intent", "approach", "minimality_reason"],
+                # `minimality_reason` 已从必填降为可选：14B/8K 下，每文件都要写一段
+                # "为什么这是最小改动"会吃掉后半段的预算，导致 tasks 缩水
+                # （真机 011207：前半 strategy/changes 质量高，后半 tasks 字段全空）。
+                "required": ["path", "intent", "approach"],
             },
         },
         "tasks": {
@@ -194,17 +201,46 @@ PLAN = {
                 "properties": {
                     "id": {"type": "string"},
                     "title": {"type": "string"},
+                    # `change` = **改什么**（一句话）。这是 DEV 最需要、而此前 schema 里
+                    # 根本没有的字段：objective/symbols 说的是"目标与涉及符号"，
+                    # 唯独没人告诉它"这次具体改成什么样"。
+                    "change": {"type": "string"},
                     "target_files": {"type": "array", "items": {"type": "string"}},
                     "acceptance": {"type": "string"},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
+                    # ---- 以下 6 个字段**必须**在这里声明（2026-09-27 修）
+                    # 系统提示词一直要求 tasks 每项带 symbols/interface/contracts/data_model/
+                    # constraints/test_hint，而本 schema 只声明了上面 5 个、且 additionalProperties
+                    # 默认被 _close_objects 关成 false —— ollama 的 `format` 是 gram**mar** 约束，
+                    # 所以模型**结构上不可能**产出这些字段。后果（全部在真机上长期存在）：
+                    #   · `_plan_contract_gaps()` 每轮必报「缺 symbols / 缺 test_hint」→ 12 项缺失
+                    #     → 触发「全部缺 → 直接降级为提示」，这两个字段**永远**是空的；
+                    #   · `verify.contract_check()` 读 `tasks[].contracts.exposes/uses` 与
+                    #     `tasks[].interface`，永远是空的 → 跨文件契约比对 `checked: 0`，形同虚设；
+                    #   · `task_focus_block` 的「要定义的符号」永远是空的 → 只能靠骨架回填兜底。
+                    # 一句话：**契约要求与 schema 允许不一致，等于该字段不存在**。
+                    "symbols": {"type": "array", "items": {"type": "string"}},
+                    "interface": {"type": "string"},
+                    "contracts": {
+                        "type": "object",
+                        "properties": {
+                            "exposes": {"type": "array", "items": {"type": "string"}},
+                            "uses": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    "data_model": {"type": "string"},
+                    "constraints": {"type": "string"},
+                    "test_hint": {"type": "string"},
                 },
-                "required": ["id", "title", "target_files", "acceptance"],
+                "required": ["id", "title", "change", "target_files", "acceptance"],
             },
         },
         "rollback": {"type": "string"},
         "risks": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["strategy", "changes", "tasks", "rollback"],
+    # `strategy` / `rollback` 降为可选：它们是**解释性**输出，14B/8K 下写在前面会
+    # 把预算吃光，让真正要执行的 tasks 缩水。执行所需的是 changes / tasks。
+    "required": ["changes", "tasks"],
 }
 
 # --------------------------------------------------------------- 开发：编码实现产物

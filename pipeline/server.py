@@ -97,6 +97,35 @@ def _job(run_id: str) -> dict[str, Any] | None:
         return job
 
 
+def _reconcile_stale_runs(runs_dir: Path) -> list[str]:
+    """启动期对账：把「`state.status=running` 但进程已不在」的运行降级为 `paused`。
+
+    判据用 ``_run_alive``（内存注册表 + ``presence`` 的 pid/心跳双重判定），
+    与页面判断"是否真的在跑"用的是同一套 —— 不能另立一套口径。
+
+    为什么只改状态不动产物：产物是这一轮真实跑出来的证据，降级状态只是让人能续跑；
+    真要重跑由 `--from` / 打回决定，不由启动流程代劳。
+    """
+    fixed: list[str] = []
+    if not runs_dir.is_dir():
+        return fixed
+    for entry in sorted(runs_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith((".", "_")):
+            continue
+        state = runstore.read_state(entry)
+        if not isinstance(state, dict) or str(state.get("status") or "") != "running":
+            continue
+        alive, _mark = _run_live(entry.name, entry)
+        if alive:
+            continue
+        state["status"] = "paused"
+        # 留痕：让人知道这个"暂停"是启动对账改的，不是人工或流程暂停的
+        state["stale_recovered"] = True
+        runstore.write_state(entry, state)
+        fixed.append(entry.name)
+    return fixed
+
+
 def _runs_root() -> Path:
     """当前服务的 runs 目录（模块级函数没有 self，只能从 Handler 上取）。"""
     return Path(getattr(Handler, "runs_dir", RUNS_DIR))
@@ -1533,6 +1562,16 @@ def main(argv: list[str] | None = None) -> int:
     flow.assert_valid()
     Handler.runs_dir = Path(args.runs_dir)
     Handler.runs_dir.mkdir(parents=True, exist_ok=True)
+
+    # 服务启动期**先对账**：把「状态写着 running 但进程早没了」的运行降级为 paused。
+    # 不对账的后果（§23.3 第 1 条，已反复踩到）：前端 `runPhase` 只看 `state.status`，
+    # 于是这种运行被显示成「运行中」—— 续跑按钮置灰、停止按钮可点却无进程可停，
+    # **UI 直接死路**，只能绕到 API/命令行续跑。冒烟里的 `orphaned=True` 就是它。
+    fixed = _reconcile_stale_runs(Handler.runs_dir)
+    if fixed:
+        print(f"启动对账：{len(fixed)} 次运行实为已中断，状态已改为 paused 以便续跑")
+        for run_id in fixed[:5]:
+            print(f"  - {run_id}")
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"

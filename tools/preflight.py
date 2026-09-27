@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from pipeline import perfguard  # noqa: E402
 from pipeline.config import (  # noqa: E402
     BASELINE_PREFILL,
     DEFAULT_BASELINE_PREFILL,
@@ -49,26 +50,17 @@ def get(path: str, host: str, timeout: int = 30) -> dict:
 
 
 def probe(tag: str, host: str, tokens: int, num_ctx: int = 8192) -> dict:
-    prompt = ""
-    while len(prompt) < tokens * 1.6:
-        prompt += "预检探针占位文本。" * 8 + "\n"
-    payload = {
-        "model": tag,
-        "messages": [{"role": "user", "content": prompt + "\n只回复 OK"}],
-        "stream": False,
-        "think": False,
-        "options": {"num_ctx": num_ctx, "num_predict": 4},
-    }
+    """探针：prefill 速率走 `pipeline.perfguard`（与运行期护栏**同一套实现**，避免两处口径漂移），
+    显存占比另外从 /api/ps 取。
+    """
     t0 = time.time()
-    data = post("/api/chat", payload, host)
+    tps = perfguard.probe_prefill(tag, num_ctx, tokens=tokens, host=host, timeout=900)
     wall = time.time() - t0
-    prompt_tokens = data.get("prompt_eval_count", 0)
-    prompt_s = (data.get("prompt_eval_duration") or 1) / 1e9
     loaded = next((m for m in get("/api/ps", host).get("models", []) if m.get("name", "").startswith(tag)), {})
     size, vram = loaded.get("size") or 0, loaded.get("size_vram") or 0
     return {
         "tag": tag,
-        "prefill_tps": round(prompt_tokens / prompt_s, 1) if prompt_s else None,
+        "prefill_tps": round(tps, 1) if tps else None,
         "wall_s": round(wall, 1),
         "ctx": loaded.get("context_length"),
         "vram_ratio": round(vram / size, 3) if size else None,

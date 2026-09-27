@@ -486,7 +486,18 @@ def merge_new_file_blocks(patches_text: list[str]) -> str:
 
 
 def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
-    """核对整份实现产物。repo 为空时返回 unchecked（不产生问题，只说明无法核对）。"""
+    """核对整份实现产物。repo 为空时返回 unchecked（不产生问题，只说明无法核对）。
+
+    **核对基准是「本份 edits 累积出的工作区」，不是仓库快照**（2026-09-27 修）。
+    新建项目的文件正是靠**同一份 edits 里的 `add`** 创建出来的；若 `modify` 仍去仓库
+    找原文，它必然判 ``unchecked``（"目标文件不存在"）—— 而 `apply_all` 只收
+    ``status == "ok"`` 的行，于是**返工轮的修复被整批静默丢弃**，verify 在未修复的
+    代码上报同一个错、再返工、再丢，永远修不上：
+
+      真机 20260927-123032：5 条 `add` + 5 条 `modify`，5 条 modify 全判 unchecked，
+      其中一条正是把 `from tkinter import event` 改成 `Event as event` 的修复。
+      verify 于是照旧报 ImportError，评审据此再要求 rework_dev —— 8 轮全 fail。
+    """
     edits = [e for e in ((impl or {}).get("edits") or []) if isinstance(e, dict)]
     audit: dict[str, Any] = {
         "source_available": bool(repo),
@@ -495,23 +506,44 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
         "problems": 0,
         "problem_detail": [],
     }
+    repo_path = Path(repo) if repo else None
     cache: dict[str, str | None] = {}
+
+    def _repo_text(path: str) -> str | None:
+        """仓库里该文件的原文（不存在 / 读不了 → None，并缓存结果避免重复 IO）。"""
+        if path not in cache:
+            try:
+                cache[path] = (repo_path / path).read_text(encoding="utf-8", errors="replace")  # type: ignore[operator]
+            except OSError:
+                cache[path] = None
+        return cache[path]
+
+    # 「本路径不在仓库、靠本份 edits 里的 add 新建」的补丁正文，按路径聚合。
+    # 物化（apply_all）会把同一路径的多个 add 合并成这一个文件，所以 modify 的核对
+    # 基准必须是**它们的合并结果** —— 与 apply_all 的 new_file 合并写入完全同源，
+    # 两边的"文件长什么样"才不会各说各话。
+    new_blocks: dict[str, list[str]] = {}
+    if repo_path is not None:
+        for edit in edits:
+            path = str(edit.get("path") or "")
+            if path and str(edit.get("change_type")) == "add" and _repo_text(path) is None:
+                new_blocks.setdefault(path, []).append(str(edit.get("patch") or ""))
+
     for edit in edits:
         path = str(edit.get("path") or "")
         source: str | None = None
-        if repo:
-            if path not in cache:
-                file_path = Path(repo) / path
-                try:
-                    cache[path] = file_path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    cache[path] = None
-            source = cache[path]
-            if source is None:
-                # 允许新增文件（add）：此时没有原文可核对
-                source = "" if edit.get("change_type") == "add" else None
+        if repo_path is not None:
+            if str(edit.get("change_type")) == "add" and _repo_text(path) is None:
+                # 新增文件：没有原文可核对，整份写入（见 analyze_edit 的 source == "" 分支）
+                source = ""
+            elif path in new_blocks:
+                # modify 打在**同一份 edits 的 add 新建出来的**文件上：
+                # 基准 = 那些 add 的合并结果（= 物化后文件里的真实内容）
+                source = merge_new_file_blocks(new_blocks[path])
+            else:
+                source = _repo_text(path)
         row = analyze_edit(source, edit)
-        if source is None and repo:
+        if source is None and repo_path is not None:
             row["status"] = "unchecked"
             row["notes"].append(
                 "目标文件不存在（modify 要求文件已在仓库里；新建文件要用 add）—— 仓库路径本身没问题"
@@ -570,6 +602,29 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
                 row["notes"].append(
                     f"新增文件 `{path}`：与另外 {len(rows) - 1} 条补丁**合并写入同一份文件**"
                     "（各自单独套用会互相覆盖）"
+                )
+        # **合并后**的正文也要校验：物化写出去的是 `merge_new_file_blocks` 的结果，
+        # 而上面那一遍只看了每一条 add 各自的正文 —— "两段各自配平、拼起来才崩"因此一路
+        # 放行到 verify（真机 20260927-173023 的 verify 里就有一条「新增文件的内容本身有
+        # 语法错误」走到最后一关才发现，白烧 test+verify+review 一整轮）。
+        # 这里按**将要写出去的那一份**判：`audit["edits"]` 与 `edits` 是同序一一对应的，
+        # 按索引 zip 取该路径上所有 `new_file` 块的正文再合并。
+        payload = [
+            str(edit.get("patch") or "")
+            for edit, other in zip(edits, audit["edits"], strict=False)
+            if str(other.get("patch_mode_used") or "") == "new_file"
+            and str(other.get("path") or "") == path
+        ]
+        merged_problem = check_new_file_content(merge_new_file_blocks(payload), path)
+        # 只在「这一遍查出了**新**东西」时记（至少有一条原先判 ok）—— 否则单块文件会在
+        # 上一遍的逐条校验与这一遍之间被重复记一次，问题清单噪声变大。
+        if merged_problem and any(r["status"] == "ok" for r in rows):
+            for row in rows:
+                if row["status"] == "ok":
+                    row["status"] = "new_file_syntax_error"
+                row["notes"].append(
+                    f"**合并后**的新文件内容有语法问题：{merged_problem}"
+                    "（逐条看都正常，拼起来才崩 —— 物化写出的就是这一份）"
                 )
 
     # 统计放在状态改写之后算，避免计数与被改写后的状态不一致
@@ -676,15 +731,40 @@ def write_patch_files(run_dir: Path, repo: str | Path | None, impl: dict | None,
 
 
 # --------------------------------------------------------------------- 套用
-def _apply_one(source_lines: list[str], edit: dict, row: dict) -> list[str]:
-    mode = row.get("patch_mode_used") or "insert_after"
+def _locate_span(source_lines: list[str], edit: dict, row: dict) -> tuple[int, int] | None:
+    """在**当前**内容里重新定位这条补丁该贴的区间（0-based 含端点）；定位不到返回 None。
+
+    为什么不复用审计里的 ``anchor_span`` / ``symbol_span``（它们是行号）：同一文件上
+    有多条补丁是常态（真机 20260927-123032 的 ``main.py`` 上有 4 条 modify），第一条
+    套用后行号就全变了，照抄旧行号会**贴错位置** —— 那比不贴更危险（写出残码、
+    ``patch_span_mismatch`` 想拦的正是这种）。这里按 anchor / 符号名**重新找**，
+    找不到或不唯一一律返回 None，交给调用方记「跳过 + 原因」。
+
+    刻意不复用 :func:`analyze_edit` 的结论：它判的是「这条补丁自身合不合法」
+    （基准是**当时**那份原文），而这里要的是「此刻该贴哪儿」。两者基准不同，
+    混用就会退回行号错位。
+    """
+    mode = str(row.get("patch_mode_used") or "insert_after")
+    if mode == "full_symbol":
+        symbol = str(row.get("symbol") or "")
+        return symbol_span(source_lines, symbol) if symbol else None
+    hits = find_anchor("\n".join(source_lines), str(edit.get("anchor") or ""))
+    if len(hits) != 1:
+        # 0 处 = 定位不到；>1 处 = 有歧义。两种都不猜位置（贴错比不贴危险）。
+        return None
+    start, end = hits[0]
+    if mode == "insert_after":
+        return (end + 1, end)
+    return (start, end)
+
+
+def _apply_one(source_lines: list[str], edit: dict, span: tuple[int, int]) -> list[str]:
+    """把一条补丁贴到 ``span``（0-based 含端点）上。
+
+    区间由 :func:`_locate_span` 在**当前**内容上算出 —— 调用方不要传审计里的旧行号。
+    """
+    start, end = span
     patch_lines = str(edit.get("patch") or "").splitlines()
-    if mode == "full_symbol" and row.get("symbol_span"):
-        start, end = row["symbol_span"][0] - 1, row["symbol_span"][1] - 1
-    else:
-        start, end = (row.get("anchor_span") or [1, 1])[0] - 1, (row.get("anchor_span") or [1, 1])[1] - 1
-        if mode == "insert_after":
-            start, end = end + 1, end
     return [*source_lines[:start], *patch_lines, *source_lines[end + 1 :]]
 
 
@@ -969,6 +1049,14 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
 
     **安全约定**：只有显式 `in_place=True` 才会写回原仓库，且会先留 `*.orig` 备份；
     否则必须给 `out_dir`（把结果写到副本里），绝不动原仓库。
+
+    **读基准是"累积写入的副本"，不是仓库快照**（2026-09-27 修）：新建项目的文件由
+    本份 edits 里的 `add` 创建，若 `modify` 去仓库找原文，它永远找不到 —— 修复被
+    静默丢弃，verify 在未修复的代码上判负、再返工、再丢（真机 20260927-123032：
+    5 条 modify 全丢，其中一条正是修 `from tkinter import event` 的那条）。现在：
+      1) 新增文件仍**同路径合并**后整份写出（防互相覆盖，见 merge_new_file_blocks）；
+      2) 其余补丁按 edits **列表顺序**逐条套用，每条都在"此刻的内容"上重新定位
+         （见 _locate_span）—— 读的是 out_dir 里的既有内容，没有再退回仓库。
     """
     repo = Path(repo)
     if not in_place and out_dir is None:
@@ -979,14 +1067,6 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
     # 只改 path 字段、不增删条目 —— edits 与 audit["edits"] 是靠 zip 一一对应的。
     edits = [_normalize_edit_path(repo, e) for e in edits]
     rows = audit.get("edits") or []
-    by_path: dict[str, list[tuple[dict, dict]]] = {}
-    for edit, row in zip(edits, rows, strict=False):
-        # new_file 的行不进这条路径：目标文件本来就不在仓库里，逐条套用只会得到
-        # 一堆误导性的「跳过：文件不存在」，真正该做的是下面的合并写入。
-        if (row.get("status") == "ok" and row.get("patch_kind") == "block"
-                and row.get("patch_mode_used") != "new_file"):
-            by_path.setdefault(str(edit.get("path") or ""), []).append((edit, row))
-
     report: dict[str, Any] = {"in_place": in_place, "files": [], "skipped": []}
     # 越界路径：绝对路径且不在 repo 内。``in_place=False`` 的语义是「写到 out_dir」，
     # 而绝对路径会整体吃掉 out_dir、写到文件系统任意位置 —— 一律拒绝并记 skipped。
@@ -1019,52 +1099,96 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
             {"path": path, "written": str(dest), "patches": len(items), "new_file": True}
         )
 
-    for path, items in by_path.items():
-        if path in blocked:
+    # ------------------------------------------------------------------ 逐条顺序套用
+    # **顺序即语义**：按 edits 的**列表顺序**依次套，每条都在"此刻的内容"上重新定位
+    # （见 _locate_span）。不再按文件分组、也不再按旧行号倒序 —— 那套的前提是
+    # "行号来自同一份原文"，同一文件多条补丁时必然错位。
+    #
+    # 读基准：**先看 out_dir**（本次已经写进去的，含上面 new_file 的合并写入），
+    # 没有再退回仓库。这一条是"新建文件被同批 modify 修改"能成立的前提 ——
+    # 以前固定读 `repo / path`，而新建项目的仓库是空的，于是 modify 全部跳过、
+    # 返修静默丢失（真机 20260927-123032：5 条修复全丢）。
+    write_root = repo if in_place else Path(out_dir)  # type: ignore[arg-type]
+    contents: dict[str, list[str]] = {}
+    applied_count: dict[str, int] = {}
+
+    def _read_current(path: str) -> list[str] | None:
+        for root in (write_root, repo):
+            candidate = root / path
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+        return None
+
+    for edit, row in zip(edits, rows, strict=False):
+        path = str(edit.get("path") or "")
+        if not path or path in blocked:
             continue
-        target = repo / path
-        if not target.exists():
-            report["skipped"].append({"path": path, "reason": "文件不存在"})
+        # new_file 的行不进这里：目标文件本来就不在仓库里，逐条套用只会得到
+        # 一堆误导性的「跳过：文件不存在」，真正该做的是上面的合并写入。
+        if row.get("status") != "ok" or row.get("patch_kind") != "block":
             continue
-        source_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-        # 同一文件多条补丁：从后往前应用，避免行号失效
-        ordered = sorted(items, key=lambda item: (item[1].get("symbol_span") or item[1].get("anchor_span"))[0], reverse=True)
-        applied = 0
-        for edit, row in ordered:
-            # 幂等闸：内容已经在文件里了就别再套一遍。
-            # 同一份审计会被套用多次（闸门预览 + 放行后正式交付、续跑再结束），
-            # 而审计里的行号/符号是**第一次**那份原文的 —— 直接照套会把同一个
-            # 改动追加第二遍（真机复现：full_symbol 连套两次，方法出现两份）。
-            if is_already_applied(source_lines, edit):
-                report["skipped"].append({"path": path, "symbol": row.get("symbol"),
-                                          # status 是给消费方判定「良性 / 真缺失」用的：
-                                          # 内容本就在文件里 ⇒ 无需再套，不算交付物残缺。
-                                          "status": "already_applied",
-                                          "reason": STATUS_CN["already_applied"]})
-                continue
-            try:
-                source_lines = _apply_one(source_lines, edit, row)
-                applied += 1
-            except Exception as exc:  # noqa: BLE001
-                report["skipped"].append({"path": path, "reason": f"{type(exc).__name__}: {exc}"})
-        if not applied:
-            # 一条都没真套上（全都已应用过 / 全异常）：**不要重写文件**。
-            # 照写会得到一个「内容没变、但报告说已写入 N 个文件」的假成功。
+        if row.get("patch_mode_used") == "new_file":
             continue
-        text = "\n".join(source_lines) + "\n"
+        source_lines = contents.get(path)
+        if source_lines is None:
+            source_lines = _read_current(path)
+        if source_lines is None:
+            report["skipped"].append(
+                {"path": path, "symbol": row.get("symbol"),
+                 "reason": "文件不存在（本批里没有 add 创建它，仓库里也没有）"}
+            )
+            continue
+        # 幂等闸：内容已经在文件里了就别再套一遍。
+        # 同一份审计会被套用多次（闸门预览 + 放行后正式交付、续跑再结束），
+        # 第二次读到的已经是改过的文件 —— 直接照套会把同一个改动追加第二遍
+        # （真机复现：full_symbol 连套两次，方法出现两份）。
+        if is_already_applied(source_lines, edit):
+            report["skipped"].append({"path": path, "symbol": row.get("symbol"),
+                                      # status 是给消费方判定「良性 / 真缺失」用的：
+                                      # 内容本就在文件里 ⇒ 无需再套，不算交付物残缺。
+                                      "status": "already_applied",
+                                      "reason": STATUS_CN["already_applied"]})
+            continue
+        span = _locate_span(source_lines, edit, row)
+        if span is None:
+            # 定位不到 / 有歧义：**宁可跳过也不猜位置**。原因是真实的模型侧缺陷
+            # （anchor 与产物对不上，或被前一条补丁改掉了），交给重问去修。
+            report["skipped"].append(
+                {"path": path, "symbol": row.get("symbol"),
+                 "reason": "在当前内容里定位不到 anchor（不唯一 / 已被前一条补丁改动），"
+                           "无法确定该贴哪儿 —— 请重新给出可定位的 anchor"}
+            )
+            continue
+        contents[path] = _apply_one(source_lines, edit, span)
+        applied_count[path] = applied_count.get(path, 0) + 1
+
+    # 交付清单**按路径去重**：同一文件可能先由 new_file 整份写出、再被 modify 改动
+    # （新建项目里的常态）。不去重的话列表会写「6 个文件」而实际只有 5 个 ——
+    # 人工闸门看到的第一个信号就自相矛盾。
+    seen_files = {str(item.get("path")): item for item in report["files"]}
+    for path, applied in applied_count.items():
+        text = "\n".join(contents[path]) + "\n"
         if in_place:
+            target = repo / path
             backup = target.with_suffix(target.suffix + ".orig")
-            if not backup.exists():
+            if target.is_file() and not backup.exists():
                 backup.write_text(target.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
-            report["files"].append({"path": path, "written": str(target), "backup": str(backup),
-                                    "patches": applied})
         else:
-            out = Path(out_dir) if out_dir else repo  # 调用方必须给 out_dir
-            dest = out / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(text, encoding="utf-8")
-            report["files"].append({"path": path, "written": str(dest), "patches": applied})
+            target = write_root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        existing = seen_files.get(path)
+        if existing is not None:
+            existing["patches"] = int(existing.get("patches") or 0) + applied
+            existing["modified_after_create"] = True
+            continue
+        entry: dict[str, Any] = {"path": path, "written": str(target), "patches": applied}
+        if in_place:
+            entry["backup"] = str(backup)
+        report["files"].append(entry)
+        seen_files[path] = entry
     for _edit, row in zip(edits, rows, strict=False):
         if row.get("status") != "ok":
             # 把行内备注一并带出来：只给「未核对」三个字，人会去猜 —— 真机上就有人

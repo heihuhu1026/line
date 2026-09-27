@@ -414,8 +414,10 @@ def main() -> int:
         check(code == 200, "POST /resume", f"HTTP {code} {resumed}")
         detail = wait_done_with_gate(port, run_id, {"done"})
         check(detail["summary"].get("verdict") == "pass", "跑完 verdict=pass", str(detail["summary"].get("verdict")))
-        check(len(detail["stages"]) == 10,
-              "10 个阶段产物（补强/pm/评估/方案/dev两遍/test/运行验证/评审/人工审核）",
+        # dev 会落 **3** 份快照：两遍模式的两次调用 + 末尾的**累积实现**
+        # （见 `_save_impl_snapshot` —— 它才是 dev 阶段的产物，续跑时按它恢复实现）
+        check(len(detail["stages"]) == 11,
+              "11 个阶段产物（补强/pm/评估/方案/dev两遍+累积实现/test/运行验证/评审/人工审核）",
               str(len(detail["stages"])))
         check(any(s["stage"] == "verify" for s in detail["stages"]), "运行验证产物在页面上可见",
               str([s["stage"] for s in detail["stages"]]))
@@ -436,8 +438,9 @@ def main() -> int:
         )
         check(code == 200, "POST /resume --from dev", f"HTTP {code}")
         detail = wait_done_with_gate(port, run_id, {"done"})
-        check(detail["superseded"] == 6,
-              "dev/test/运行验证/review/人工审核 旧产物归档（dev 两遍+闸门占位）", str(detail["superseded"]))
+        check(detail["superseded"] == 7,
+              "dev/test/运行验证/review/人工审核 旧产物归档（dev 两遍+累积实现+闸门占位）",
+              str(detail["superseded"]))
         dev = next(s for s in detail["stages"] if s["stage"] == "dev")
         check("打回：补测大结果集" in dev["request_preview"], "打回意见注入 dev")
         check(detail["summary"].get("verdict") == "pass", "重跑后仍为 pass")

@@ -273,6 +273,10 @@ _IMPORT_CHECK = (
 )
 
 
+#: 这些「文件名」不算遮蔽标准库：`__init__.py` 本来就是包入口，`__main__.py` 是入口约定。
+_SHADOW_EXEMPT = {"__init__", "__main__"}
+
+
 def _module_name(work: Path, rel: str) -> str | None:
     """把沙箱里的相对路径换算成可 import 的点分模块名（不合法的返回 None）。"""
     path = Path(rel)
@@ -294,6 +298,128 @@ def _python_bin() -> str:
     return f'"{sys.executable}"' if " " in sys.executable else sys.executable
 
 
+def import_check_spec(work: Path, written: list[str]) -> dict | None:
+    """产出模块的**导入探针**命令（真跑一次 import），没有可导入的模块时返回 None。
+
+    py_compile 只查语法，抓不到「用了没导入的名字」—— 真机 run 20260924-135801 的
+    graphics_renderer.py 在签名里用了未导入的 `Tuple`，语法完全合法、**import 才炸**。
+
+    抽成函数是为了让**两处共用同一套口径**：verify 的命令计划，以及 **dev 阶段的自检**。
+    后者是关键：只在 verify 跑，这类硬错要等 test + verify + review 一整轮（≈5 分钟 +
+    一次 14B 评审）之后才暴露；放进 dev 自检，几十秒就能带原文重问。
+    """
+    modules = [name for name in (_module_name(work, rel) for rel in written) if name]
+    modules = [m for m in modules if m.split(".")[-1] not in _SHADOW_EXEMPT]
+    if not modules:
+        return None
+    return {
+        "command": f'{_python_bin()} -c "{_IMPORT_CHECK}" ' + " ".join(modules[:SYNTAX_MAX_FILES]),
+        "source": "import",
+        "display": "导入检查（能抓到语法合法但用了未导入名字的模块）",
+    }
+
+
+def _defined_names(tree: ast.Module, self_module: str = "") -> set[str]:
+    """模块里出现过的「顶层可导入名」（保守：宁可多认，不可误报）。
+
+    刻意用 ``ast.walk`` 收集（**连函数体里的定义也算**）—— 这是**故意放宽**：
+    漏判几个真缺失，代价是"少拦一次"；而把其实有定义的名字报成缺失，代价是
+    把**正确的实现**打回去重做（正是我们要根除的白跑）。
+
+    `self_module` 用于**掐掉"自我作证"**：文件里那句 `from main import main` 会把
+    `main` 这个名字加进本模块的命名空间，若照单全收，它就替自己证明了"main 有定义"
+    —— 于是 `from main import main`（真机 20260927-123032 的形态）永远抓不到。
+    传本模块名即可把这类自导入引入的名字排除。
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                base = (alias.asname or alias.name).split(".")[0]
+                if (
+                    self_module
+                    and isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and node.module.split(".")[0] == self_module
+                ):
+                    continue  # 自导入不能给自己作证
+                names.add(base)
+    return names
+
+
+def import_symbol_problems(work: Path, written: list[str]) -> list[str]:
+    """产出文件里的 `from X import Y` 有没有毛病（**纯 AST、零执行、零副作用**）。
+
+    只查两类**确定性**问题（真机反复踩，且都能毫秒级判出来）：
+
+      ① `from m import f`，而 `m` 是本轮产出的文件、里面**没有** `f`
+         —— 真机 20260927-123032：`main.py` 里 `from main import main`，而 main.py
+         根本没定义 `main`（自导入 + 未定义，两条叠在一起）。
+      ② 产出文件与**标准库同名**（`importlib.py` / `random.py` / `typing.py`）
+         —— 它在沙箱里会**遮蔽**标准库：`import importlib` 会 import 到这个文件，
+         导入探针、pyright 甚至测试自己都会跟着失真（真机 20260927-134222 的缺陷单里
+         出现过 `importlib.py`）。
+
+    刻意**不查外部符号是否存在**（`from tkinter import event` 这一类）：判它要么真 import
+    （有副作用，`antigravity` 那种还会弹浏览器），要么需要 stubs。而那类错误
+    **导入探针已经覆盖**（它真跑一次 import，拿到的是执行级证据）。
+    """
+    out: list[str] = []
+    local: dict[str, Path] = {}
+    for rel in written:
+        rel = str(rel)
+        if rel.endswith(".py"):
+            local.setdefault(Path(rel).stem, work / rel)
+    stdlib = set(getattr(sys, "stdlib_module_names", frozenset()))
+    seen_shadow: set[str] = set()
+    for rel in written:
+        rel = str(rel)
+        if not rel.endswith(".py"):
+            continue
+        stem = Path(rel).stem
+        if stem in stdlib and stem not in _SHADOW_EXEMPT and stem not in seen_shadow:
+            seen_shadow.add(stem)
+            out.append(
+                f"`{rel}` 与标准库模块 `{stem}` 同名 —— 在沙箱里它会**遮蔽**标准库"
+                f"（`import {stem}` 会 import 到这个文件），导入检查与类型检查都会失真。"
+                f"请换个文件名（例如 `{stem}_util.py`）。"
+            )
+        path = work / rel
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue  # 文件读不到 / 语法坏掉由别的档去报，这里不重复报
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module or node.level:
+                continue  # 相对导入（from . import x）不在这里判
+            target = local.get(node.module.split(".")[0])
+            if target is None:
+                continue  # 外部依赖：交给导入探针
+            try:
+                defined = _defined_names(
+                    ast.parse(target.read_text(encoding="utf-8", errors="replace")),
+                    # 传目标模块名：掐掉它内部的自导入"自我作证"
+                    Path(node.module.split(".")[0]).stem,
+                )
+            except (OSError, SyntaxError):
+                continue
+            for alias in node.names:
+                if alias.name == "*" or alias.name in defined:
+                    continue
+                out.append(
+                    f"`{rel}` 里写了 `from {node.module} import {alias.name}`，"
+                    f"但 `{target.name}` 里没有定义 `{alias.name}` —— import 时必然 ImportError。"
+                )
+    return out
+
+
 def plan_commands(
     work: Path,
     written: list[str],
@@ -313,15 +439,9 @@ def plan_commands(
                 "display": "语法检查（py_compile：只解析不执行，零副作用）",
             }
         )
-        modules = [name for name in (_module_name(work, rel) for rel in py_files) if name]
-        if modules and len(specs) < max_commands:
-            specs.append(
-                {
-                    "command": f'{_python_bin()} -c "{_IMPORT_CHECK}" ' + " ".join(modules[:SYNTAX_MAX_FILES]),
-                    "source": "import",
-                    "display": "导入检查（能抓到语法合法但用了未导入名字的模块）",
-                }
-            )
+        spec_import = import_check_spec(work, written)
+        if spec_import and len(specs) < max_commands:
+            specs.append(spec_import)
 
     # 开发自己声明的入口命令。为什么值得单独一档：测试阶段的命令常写成
     # `python <库模块>.py`（空跑、rc=0 却什么都没做），而**写代码的人**最清楚该怎么跑。
@@ -764,10 +884,14 @@ def command_param_problems(commands: Any, digest: Any) -> list[str]:
 
 
 def _declared_symbols(text: str) -> dict[str, list[str]]:
-    """一个文件里**对外可用**的符号 → 形参名列表（模块级 def/class + 类的方法）。
+    """一个文件里**对外可用**的符号 → 形参名列表（模块级 def/class/常量 + 类的方法）。
 
     与 `api_digest` 同源（都是 ast），但那个是给模型看的**描述**，这份是给机械断言用的
     **事实**：键是符号名（`foo` / `Class.method`），值是除 `self`、`cls` 之外的形参名。
+
+    **模块级赋值也要收**（`SNAKE_DIRECTIONS = {...}`）：方案的 `contracts.uses` 里常写
+    「我要用 `snake.SNAKE_DIRECTIONS`」这种**常量**，只收 def/class 会让它永远被判
+    「产物里没有这个符号」—— 真机 20260927-123032 就是这么误报的（而那条已经进阻断项）。
     """
     try:
         tree = ast.parse(text)
@@ -791,6 +915,12 @@ def _declared_symbols(text: str) -> dict[str, list[str]]:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     out[f"{node.name}.{sub.name}"] = _params(sub)
                     out.setdefault(sub.name, _params(sub))
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out.setdefault(tgt.id, [])
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.setdefault(node.target.id, [])
     return out
 
 
@@ -921,6 +1051,14 @@ def contract_check(work: str | Path, written: list[str], plan: Any) -> dict:
         out["unresolved"].append("沙箱里没有可解析的 Python 文件，契约比对无法进行")
         return out
 
+    #: 本项目产出的文件主干名 —— 用来区分「项目内符号」与「外部依赖」。
+    project_stems = {
+        str(rel).replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".py") for rel in actual
+    }
+    #: 标准库模块名（3.10+）。模型在 `contracts.uses` 里常写 `random`/`tkinter.event`
+    #: 这类外部依赖，它们不该被当作"跨文件接口"去核对。
+    _STDLIB = set(getattr(sys, "stdlib_module_names", ()) or ())
+
     def _norm(p: Any) -> str:
         return str(p or "").replace("\\", "/")
 
@@ -952,6 +1090,24 @@ def contract_check(work: str | Path, written: list[str], plan: Any) -> dict:
                 out["by_file"].setdefault(files[0] if files else "?", []).append(msg)
         # ② 声明要用、目标侧没有（snake-v2 那一类）
         for sym in [str(s) for s in (contracts.get("uses") or []) if str(s).strip()]:
+            # **外部依赖不算**：`uses` 里模型经常顺手写标准库/第三方（真机 20260927-123032：
+            # `random`、`tkinter.event`），把它们当"项目内符号"去核，报出来的全是假阳性
+            # —— 而这条已经进了 `_contract_blockers`（会强制返工），噪声代价很大。
+            #
+            # 判据演进：最初写的是「带点号 ⇒ 前缀必须在**本批产出**里，否则跳过」。于是
+            # 兄弟模块只要这轮没被写进 written（`db.py` 不在列表里），它声明的
+            # `db.nonexistent` 就被一起放过了 —— 契约校验直接漏判
+            # （`smoke_merge` ⑨「依赖了不存在的接口 ⇒ 判出」长期挂红）。
+            # 现在按「**这个前缀是不是可导入的模块**」判：
+            #   `tkinter` / `random` 可导入 ⇒ 外部依赖，跳过；
+            #   `db` 不可导入、也不在本批产出里 ⇒ 项目内（或模型笔误的模块名），照核。
+            head = sym.split(".", 1)[0].strip()
+            if head in project_stems:
+                pass  # 本项目文件 -> 必须核
+            elif patches._importable_module(head):
+                continue  # 外部依赖（标准库 / 本环境已装的包）
+            elif sym == head and (head in _STDLIB or hasattr(builtins, head)):
+                continue  # 裸名字且是标准库/builtin
             out["checked"] += 1
             where, _ = _find(sym, [])
             if where is None:
@@ -1815,6 +1971,9 @@ def verify(
     static_problems += [f"产出文件无法解析（会掩盖其它问题）：{item}" for item in interfaces["unparsable"]]
     # 「用了别处的东西却没 import」：静态就能查出来，且不会像执行类检查那样被语法错短路
     static_problems += [f"引用未导入：{item}" for item in interfaces["undefined_names"]]
+    # 「from X import Y 而 Y 根本不存在」/「产出文件与标准库同名会遮蔽标准库」：
+    # 纯 AST 判定，不受执行路径影响 —— 导入探针只覆盖"这一条真的被执行到时"的错。
+    static_problems += import_symbol_problems(work, list(mat["written"]))
     # 「产物到底跑起来过没有」：只有 rc=0 但零输出/无入口 ⇒ 视为没有可运行的证据。
     # **单独留一份**：它既可能是产物真有问题，也可能只是**测试命令质量差**（命令写错 ⇒
     # 一条都没真跑起来）。归因要靠"有没有真正的产物失败"来定，见下方的 test_defects / impl_fail。

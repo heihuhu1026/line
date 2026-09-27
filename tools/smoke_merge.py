@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import copy
+import json
 import sys
 from pathlib import Path
 
@@ -72,6 +74,25 @@ def main() -> int:
     out = merge(prev, cur)
     joined = "\n".join(str(e.get("patch")) for e in out["edits"])
     check("Food" in joined, "本轮漏掉的 Food 仍被保留（防越改越少）", joined[:120])
+
+    print("== ③b 部分覆盖：只删被重写的那个类，文件头与别的类都要留住 ==")
+    # 为什么单独锁这一条：③ 只查了"Food 还在"。真正的风险是**两个方向**都错 ——
+    # 既不能把 Food 丢掉，也不能因为保留了整块而让 Snake 出现两份（重复定义会写残），
+    # 同时整文件补丁头部的 import 不能跟着被删（否则保留下来的类缺依赖）。
+    prev = {"edits": [{"path": "game.py", "change_type": "add", "patch_mode": "full_symbol",
+                       "patch": "import os\n\n\nclass Snake:\n    pass\n\n\nclass Food:\n    pass\n",
+                       "covers_tasks": ["T-01"]}]}
+    cur = {"edits": [{"path": "game.py", "change_type": "add", "patch_mode": "full_symbol",
+                      "patch": "class Snake:\n    def eat(self):\n        return os.getcwd()\n",
+                      "covers_tasks": ["T-01"]}]}
+    out = merge(prev, cur)
+    joined = "\n".join(str(e.get("patch")) for e in out["edits"])
+    check("Food" in joined, "漏掉的 Food 保住了", joined[:160])
+    check(joined.count("class Snake") == 1,
+          "被本轮重写的 Snake 只有一份（不重复定义）", str(joined.count("class Snake")))
+    check("import os" in joined, "整文件补丁头部的 import 跟着保留（保留的类不缺依赖）",
+          joined[:160])
+    check("def eat" in joined, "用的是**本轮**那版 Snake（不是旧的）", joined[:160])
 
     print("== ④ 不同任务改同一文件的**不同符号** ⇒ 本来就并存 ==")
     prev = {"edits": [mod("cli.py", "CLI.add", "T-01")]}
@@ -137,9 +158,20 @@ def main() -> int:
         {"id": "T-01", "target_files": ["db.py"]},
         {"id": "T-02", "target_files": ["cli.py"]},
         {"id": "T-03", "target_files": ["main.py"]},
-    ]}, "bug_report": {"affected": {"cli.py": []}}}
+    ]}, "verify_report": {}}
+    o.fixes = ["[文件 cli.py] 修复参数解析"]
     hit = [t["id"] for t in o._tasks_for_bugfix()]
     check(hit == ["T-02"], "返工只重做受影响的 T-02（最小改动由调度保证）", str(hit))
+    # 存档过期时也必须能归因（真机 20260927-192001：state 上的 affected 是空的，
+    # 但按当前 fixes 重算明明有内容 —— 读过期存档会让"只重做受影响任务"整个失效）
+    o.state = {"plan": {"tasks": [
+        {"id": "T-01", "target_files": ["db.py"]},
+        {"id": "T-02", "target_files": ["cli.py"]},
+    ]}, "bug_report": {"affected": {}}, "verify_report": {}}
+    o.fixes = ["[文件 cli.py] 修复语法错误"]
+    hit = [t["id"] for t in o._tasks_for_bugfix()]
+    check(hit == ["T-02"], "**存档过期也能归因**（改用当前 fixes 重算）", str(hit))
+    o.fixes = []
 
     print("== ⑧ 施工图机械自检（漏定义符号的判定） ==")
     gaps = Orchestrator._task_symbol_gaps
@@ -309,20 +341,32 @@ def main() -> int:
     print("== ⑬ 施工图必填字段的强制（symbols / test_hint） ==")
     o3 = Orchestrator.__new__(Orchestrator)
     # 全空（真机 20260927-002903 的形态）
-    o3.state = {"plan": {"tasks": [
-        {"id": "T-01", "target_files": ["ledger.py"]},
-        {"id": "T-02", "target_files": ["cli.py"]},
-    ]}}
+    # 边界里声明了符号 ⇒ symbols 才算必填（没声明的文件不要求它凭空造）
+    o3.state = {"plan": {
+        "changes": [{"path": "ledger.py", "symbols": ["f"]}, {"path": "cli.py", "symbols": ["g"]}],
+        "tasks": [
+            {"id": "T-01", "target_files": ["ledger.py"]},
+            {"id": "T-02", "target_files": ["cli.py"]},
+        ]}}
     g = o3._plan_contract_gaps()
-    check(len(g) == 4, "两张图全空 ⇒ 4 项缺失（各缺 symbols + test_hint）", str(g))
-    check("T-01 缺 symbols" in g and "T-02 缺 test_hint" in g, "点名到任务与字段", str(g))
-    # 只缺一个字段
-    o3.state = {"plan": {"tasks": [{"id": "T-01", "symbols": ["f"], "test_hint": "python -c x"}]}}
+    # 三必填：symbols / test_hint / change（change = 「改什么」，DEV 最需要的一条）
+    check(len(g) == 6, "两张图全空 ⇒ 6 项缺失（各缺 symbols + test_hint + change）", str(g))
+    check("T-01 缺 symbols" in g and "T-02 缺 test_hint" in g and "T-01 缺 change" in g,
+          "点名到任务与字段", str(g))
+    # 字段齐全
+    o3.state = {"plan": {"tasks": [
+        {"id": "T-01", "symbols": ["f"], "test_hint": "python -c x", "change": "新增 f()"}
+    ]}}
     check(o3._plan_contract_gaps() == [], "字段齐全 ⇒ 无缺失")
-    o3.state = {"plan": {"tasks": [{"id": "T-01", "symbols": ["f"]}]}}
+    # 只缺一个字段
+    o3.state = {"plan": {"tasks": [
+        {"id": "T-01", "symbols": ["f"], "change": "新增 f()"}
+    ]}}
     check(o3._plan_contract_gaps() == ["T-01 缺 test_hint"], "只缺 test_hint ⇒ 精确点名")
     # interface/contracts 不强制（避免小模型编造）
-    o3.state = {"plan": {"tasks": [{"id": "T-01", "symbols": ["f"], "test_hint": "x"}]}}
+    o3.state = {"plan": {"tasks": [
+        {"id": "T-01", "symbols": ["f"], "test_hint": "x", "change": "新增 f()"}
+    ]}}
     check(o3._plan_contract_gaps() == [], "interface/contracts 缺失**不**判负（只提示）")
     # 没有 tasks / 空产物不崩
     o3.state = {"plan": {}}
@@ -362,6 +406,150 @@ def main() -> int:
     joined_re = "\n".join(str(p) for p in rework)
     check("上一版方案" in joined_re and "ledger.py" in joined_re,
           "返工轮喂入上一版方案（差分修改的基础）")
+
+    print("== ⑯ 返修替换（_apply_repair）：键够细 + 修复不许被丢 ==")
+    # 真机 20260927-150931 的 mock 回放暴露的缺陷：原先只用 (path, 符号) 当键，
+    # 同一符号上的 `full_symbol`（整符号替换）与 `replace_span`（只改签名）会被**并成一条**，
+    # 静默丢掉其中一处改动 —— 连问题清单里的 `patch_incomplete` 都跟着消失（少一条真问题）。
+    repair = Orchestrator._apply_repair
+
+    def _edit(symbol, mode, anchor, patch, path="mod.py"):
+        return {"path": path, "change_type": "modify", "target_symbol": symbol,
+                "patch_mode": mode, "anchor": anchor, "patch": patch}
+
+    merged = {"edits": [
+        _edit("index_all", "full_symbol", "def index_all(conn):", "def index_all(conn):\n    return {}\n"),
+        _edit("index_all", "replace_span", "def index_all(conn):", "def index_all(conn):\n"),
+    ]}
+    again = {"edits": [
+        # 同一处改动的"修正版"：anchor 抄全了签名，精确键认不出，但必须替换掉旧的那条
+        _edit("index_all", "replace_span", "def index_all(conn, roots, batch=300):",
+              "def index_all(conn, roots, batch=300):\n"),
+    ]}
+    out = repair(json.loads(json.dumps(merged)), again)
+    modes = [(e.get("target_symbol"), e.get("patch_mode"), e.get("anchor")) for e in out["edits"]]
+    check(len(out["edits"]) == 2, "同符号的两条补丁不被并成一条（full_symbol 保留）", str(modes))
+    check(any(m[1] == "full_symbol" for m in modes),
+          "整符号替换那条**没被吞掉**（否则 patch_incomplete 这类真问题会消失）", str(modes))
+    check(any(m[2] == "def index_all(conn, roots, batch=300):" for m in modes),
+          "修正版（anchor 变了）认领成功、替换掉旧的那条", str(modes))
+    check(not any(m[2] == "def index_all(conn):" and m[1] == "replace_span" for m in modes),
+          "旧的那条 replace_span 已被替换（不会新旧并存）", str(modes))
+
+    # 重出给了整符号替换 ⇒ 该符号上其它分片补丁一并去掉（留着套用后会有两份定义）
+    merged2 = {"edits": [
+        _edit("build", "replace_span", "def build(a):", "def build(a):\n"),
+        _edit("build", "replace_span", "def build_extra():", "def build_extra():\n"),
+    ]}
+    again2 = {"edits": [_edit("build", "full_symbol", "def build(a, b):", "def build(a, b):\n    pass\n")]}
+    out2 = repair(json.loads(json.dumps(merged2)), again2)
+    check(len(out2["edits"]) == 1 and out2["edits"][0]["patch_mode"] == "full_symbol",
+          "整符号替换取代该符号上的分片补丁（防两份定义）",
+          str([(e.get("patch_mode"), e.get("anchor")) for e in out2["edits"]]))
+
+    # 重出新增的锚点（旧实现里没有）⇒ 必须留下，丢掉等于白问一次
+    merged3 = {"edits": [_edit("run", "replace_span", "def run():", "def run():\n")]}
+    again3 = {"edits": [_edit("helper", "insert_after", "def run():", "def helper():\n    pass\n")]}
+    out3 = repair(json.loads(json.dumps(merged3)), again3)
+    symbols = {e.get("target_symbol") for e in out3["edits"]}
+    check(symbols == {"run", "helper"}, "重出新增的补丁被追加（不静默丢弃）", str(sorted(symbols)))
+
+    # 精确键命中 ⇒ 直接替换（既有行为不许退化）
+    merged4 = {"edits": [_edit("run", "replace_span", "def run():", "def run():\n    return 1\n")]}
+    again4 = {"edits": [_edit("run", "replace_span", "def run():", "def run():\n    return 2\n")]}
+    out4 = repair(json.loads(json.dumps(merged4)), again4)
+    check(len(out4["edits"]) == 1 and "return 2" in out4["edits"][0]["patch"],
+          "同一处改动的修正 ⇒ 替换（不是并存）", str(out4["edits"]))
+
+    print("== ⑯ 施工图太薄时兜底给整份方案（防 dev 在真空里施工） ==")
+    thin = Orchestrator._task_drawing_is_thin
+    check(thin({}) is True, "空 task ⇒ 判定为薄")
+    check(thin({"id": "T-01", "title": "x", "target_files": ["a.py"]}) is True,
+          "只有 id/title/文件清单 ⇒ 仍算薄（真机 150931 就是这种）")
+    check(thin({"id": "T-01", "symbols": ["f"]}) is False, "有 symbols ⇒ 够厚")
+    check(thin({"id": "T-01", "test_hint": "python -c 1"}) is False, "有 test_hint ⇒ 够厚")
+    check(thin({"id": "T-01", "contracts": {"uses": ["g"]}}) is False, "有 contracts ⇒ 够厚")
+
+    print("== ⑰ Task Compiler（确定性拆任务） ==")
+    from pipeline import taskcompiler as TC
+    plan = {"changes": [
+        {"path": "ledger/db.py", "intent": "存取记录", "approach": "用 sqlite3 建表与增删查",
+         "symbols": ["init_db", "insert", "list_all", "delete"]},
+        {"path": "cli/parser.py", "intent": "解析子命令", "approach": "用 argparse 子命令",
+         "symbols": ["build_parser", "parse_args", "add", "list_cmd", "remove"]},
+        {"path": "main.py", "intent": "入口", "approach": "串联解析与存储"},
+    ]}
+    t1 = TC.compile_tasks(plan)
+    t2 = TC.compile_tasks(plan)
+    check(t1 == t2, "**确定性**：同一输入两次生成完全一致")
+    check(len(t1) == 4, f"4 符号一组 / 5 符号切两张 + main 一张 = 4 张（实际 {len(t1)}）", str([t["id"] for t in t1]))
+    # 符号切分：5 个符号必须切成两张，单张不超上限
+    parser_tasks = [t for t in t1 if "cli/parser.py" in t["target_files"]]
+    check(len(parser_tasks) == 2, "5 个符号 ⇒ 切成 2 张图", str(len(parser_tasks)))
+    check(all(len(t["symbols"]) <= TC.MAX_SYMBOLS_PER_TASK for t in t1),
+          "每张图的符号数都不超上限")
+    # 无 symbols ⇒ 整文件一张
+    check(any(t["target_files"] == ["main.py"] and not t["symbols"] for t in t1),
+          "没声明符号的文件 ⇒ 整文件一张")
+    # 字段齐全（这正是架构师填不出的部分）
+    check(all(t.get("symbols") or not t.get("symbols") for t in t1), "结构正常")
+    check(all(str(t.get("change") or "").strip() for t in t1), "每张图都有 change（改什么）")
+    check(all(str(t.get("test_hint") or "").strip() for t in t1), "每张图都有 test_hint（机械生成）")
+    check(all(str(t.get("acceptance") or "").strip() for t in t1), "每张图都有 acceptance")
+    # 单文件不会被多张图之外的图覆盖
+    per_file = {}
+    for t in t1:
+        for f in t["target_files"]:
+            per_file.setdefault(f, []).append(t["id"])
+    check(all(len(v) == 1 for f, v in per_file.items() if f == "main.py"),
+          "main.py 只由一张图负责")
+    # 线性依赖：后一张依赖前一张（保证跨文件接口先建后引用）
+    check(t1[0]["depends_on"] == [] and t1[1]["depends_on"] == [t1[0]["id"]],
+          "线性 depends_on", str([t["depends_on"] for t in t1]))
+
+    # 编译后应通过字段强制校验
+    o4 = Orchestrator.__new__(Orchestrator)
+    o4.state = {"plan": {"changes": plan["changes"], "tasks": t1}}
+    check(o4._plan_contract_gaps() == [], "编译出的 tasks **通过**字段强制校验",
+          str(o4._plan_contract_gaps()))
+
+    # 什么时候该由编译器接管
+    good = {"changes": plan["changes"], "tasks": [
+        {"id": "T-01", "symbols": ["f"], "change": "新增 f", "test_hint": "python -c x",
+         "target_files": ["a.py"]}]}
+    check(TC.plan_needs_compile(good) == [], "合格的 tasks ⇒ 保留架构师自己的（不覆盖）")
+    check(TC.plan_needs_compile({"changes": []}) == ["方案没有 tasks"], "没有 tasks ⇒ 接管")
+    bad = {"changes": plan["changes"], "tasks": [{"id": "T-01", "target_files": ["a.py"]}]}
+    check(bool(TC.plan_needs_compile(bad)), "缺字段 ⇒ 接管", str(TC.plan_needs_compile(bad)))
+    many = {"changes": plan["changes"], "tasks": [
+        {"id": f"T-{i:02d}", "symbols": ["f"], "change": "x", "test_hint": "y",
+         "target_files": ["a.py"]} for i in range(1, 8)]}
+    check(any("超过上限" in r for r in TC.plan_needs_compile(many)), "超任务数 ⇒ 接管")
+
+    print("== ⑱ 单文件覆盖上限（真机 192001 的教训） ==")
+    from pipeline import taskcompiler as TC
+    from pipeline.config import MAX_TASKS_PER_FILE
+    # 同一文件被 3 张图覆盖 ⇒ 必须接管
+    covered3 = {"changes": [{"path": "a.py", "symbols": ["f", "g", "h"]}],
+                "tasks": [{"id": "T-01", "target_files": ["a.py"], "symbols": ["f"],
+                           "change": "x", "test_hint": "y"},
+                          {"id": "T-02", "target_files": ["a.py"], "symbols": ["g"],
+                           "change": "x", "test_hint": "y"},
+                          {"id": "T-03", "target_files": ["a.py"], "symbols": ["h"],
+                           "change": "x", "test_hint": "y"}]}
+    rs = TC.plan_needs_compile(covered3)
+    check(any("被 3 张图覆盖" in r for r in rs),
+          "同一文件被 3 张图覆盖 ⇒ 编译器接管", str(rs))
+    # 编译结果：单文件图数不超上限
+    compiled = TC.compile_tasks({"changes": [{"path": "a.py", "symbols": ["f", "g", "h", "i", "j"]}]})
+    per_file: dict[str, int] = {}
+    for t in compiled:
+        for f in (t.get("target_files") or []):
+            per_file[f] = per_file.get(f, 0) + 1
+    check(all(v <= MAX_TASKS_PER_FILE for v in per_file.values()),
+          f"编译结果：单文件图数 ≤ {MAX_TASKS_PER_FILE}", str(per_file))
+    check(len(compiled) <= MAX_TASKS_PER_FILE, "5 个符号 ⇒ 不超过 2 张图（切分大小被放宽）",
+          str(len(compiled)))
 
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0

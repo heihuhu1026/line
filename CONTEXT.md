@@ -257,6 +257,16 @@ python models\verify_tags.py
 # 跑前预检（30 秒）：三个档位是否全量在显存、prefill 是否正常 —— 有告警就先别跑
 python tools\preflight.py
 
+# **离线回归一条命令跑全**（9 套 ~42s：文档引用 / 规则 / 客户端 / 导入 / 补丁套用 /
+#   合并与分派 / 缺陷修复 / mock 端到端 / 控制台；--quick 可跳过较慢的 smoke_console）
+python tools/smoke_all.py
+# 只查文档引用漂移（行号/符号名是否与代码一致）
+python tools/check_refs.py
+# 导出某次运行的「每次调用的完整输入 / 原始输出」（优化提示词用）：
+#   产物落到 runs/<id>/io/：单次 .md + _index.md 一览 + _all.md 合并稿
+#   可选 --stage dev / --last 3 / --no-raw / --out <目录>
+python tools/export_io.py <run_id>
+python tools/export_io.py 20260927-192001 --stage dev --last 3
 # 离线冒烟（不加载模型，秒级）：契约 + 回流 + 评审频率 + 闸门续跑 + 人工编辑生效
 python tools\smoke_mock.py
 
@@ -1336,10 +1346,14 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 
 ### 23.3 待办改进点（用户要求"先不动手"，仅列此清单）
 
-1. **重启/崩溃恢复（本次直接踩中，优先级最高）**：
-   无活进程但 `state.status=running` → 前端 `runPhase`（`console.html:772`）只看 `state.status`，
+1. ✅ **重启/崩溃恢复（2026-09-27 已修）**：
+   无活进程但 `state.status=running` → 前端 `runPhase`（`console.html:842`）只看 `state.status`，
    把运行判成"运行中"：`btn-resume` 置灰、`btn-stop` 可点却无进程可停 → UI 死路，只能 API/命令行续跑。
-   建议：服务启动期扫描"有 state 但无对应活进程"的运行，把 `running` 降级为 `paused`（或加 `stale` 相位允许续跑）。
+   **修法**：服务启动期做一次对账 `server._reconcile_stale_runs()`，用与页面同一套口径
+   （`_run_live`：内存注册表 + `presence` 的 pid/心跳双重判定）找出僵死运行，
+   把 `status` 降级为 `paused` 并置 `stale_recovered=True`（**只改状态，不动产物**）。
+   **实测**：重启后一次救回 22 个僵死运行 —— 其中包括 §26.6 列为最高优先级的
+   `20260927-150931`（它本来也是卡死的，现在可以续跑了）。断言见 `tools/smoke_recovery.py`。
 2. **评审反自指**：语法/导入类 blocker 必须附**可定位证据**（行号/报错原文）；对本轮机械证据已证伪的旧
    blocker 显式剔除或标注「已由 verify 证伪，勿重复引用」，而不是原样塞回 `fixes`。
 3. **dev 重写退化**：attempt 3 已 pass，第 4 轮却把 `renderer.py` 写残、`__main__` 入口丢失（"越改越少"）；
@@ -1355,9 +1369,17 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 - 看状态：`Invoke-RestMethod -Uri http://127.0.0.1:8787/api/runs/20260924-185507`
 - 续跑/打回：`POST /api/runs/20260924-185507/resume`（body 可选 `from`/`feedback`/`max_rework`/`pause_after`），
   或直接命令行 `cd D:\AI\line && python -m pipeline.cli --resume 20260924-185507`。
-- 关键文件行号：评审提示词 `prompts.py:1044 parts_review`（fixes 注入在 `:1095`）；
-  fix 列表污染源 `orchestrator.py:1630`；运行态相位 `console.html:772 runPhase`、续跑按钮 `:988`；
-  入口探测 `verify.py:307 entry_script_problems`。
+- 关键位置（**2026-09-27 已核对；行号会漂移，优先按符号名找**）：
+  评审提示词 `prompts.py:2264 parts_review`；fix 列表拼装 `orchestrator.py:4269 self.fixes = fixes`；
+  运行态相位 `console.html:842 runPhase`、续跑按钮 `console.html:1262 btn-resume`；
+  入口探测 `verify.py:502 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
+  跨文件契约比对 `verify.py:1020 contract_check`；跨轮合并 `orchestrator.py:1582 _merge_impl_across_rounds`；
+  缺陷单 `tasktype.py:90 bug_report_from_state`；施工图字段强制 `orchestrator.py:1244 _plan_contract_gaps`；
+  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:3078 _task_drawing_is_thin`；
+  确定性拆任务 `taskcompiler.compile_tasks` / `taskcompiler.plan_needs_compile`；
+  fix 列表拼装 `orchestrator.py:4365 self.fixes = fixes`。
+  复检脚本：`python tools/check_refs.py`（抽 CONTEXT.md 里所有 `文件:行号` 并比对当前代码；
+  含"该行附近是否还有文档声称的符号名"这一层，能抓出"行号还在但内容已换"的漂移）。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。
 
 ---
@@ -1736,3 +1758,63 @@ def system_prompt(stage: str, project_type: str = "secondary") -> str:
 - 编排层：返工轮（`self.fixes` 非空）⇒ `round_kind=bugfix`，dev 收到【缺陷单】而非裸 fixes 列表。
 - 判定"文件是否存在"的依据改成【当前项目已有代码】（`current_code`），修掉 `prompts.py:1488` 只认检索池的问题。
 - 后续批次：test / plan / review 各自的 bugfix 口径；`rules` 加 `change_type` 维度；`covers_tasks` 返工允许空。
+
+### 26.6 待办清单（2026-09-27 整理 · 质量优化 Q1–Q5 路线）
+
+**已落地（真机/冒烟见证）**
+- **Q1 补丁累积应用**：`patches.py` 按同一份 edits 累积套用；`_merge_impl_across_rounds` / `_merge_dev`
+  跨轮累积（无符号 add 按路径后写覆盖、delete 移除旧 edit）；真机 `20260927-150931` 迭代2「未能套用」3→0。
+- **Q2 Dev 前置 import probe**（代码已落，待真机续证）：`verify.py` 的 `import_symbol_problems` + `_defined_names`
+  （掐自导入自我作证）+ `contract_check` 用 `patches._importable_module` 判外部依赖；`orchestrator._dev_selfcheck`
+  新增"无条件导入正确性"（mock 跳过）。`ollama_client._looks_degenerate` 失控生成止损也已并入。
+- 全量冒烟绿：`smoke_patch_apply 25 / smoke_client 18 / smoke_merge 80 / smoke_bugfix 23 / smoke_rules 94 / smoke_console 150 / smoke_mock 646`；lint 干净。
+
+**未执行 / 进行中**
+1. **（最高优先级）真机续跑见证 Q2**：跑 `20260927-150931` 续跑，确认 `dev_import_audit` 稳定非空（需落累积 dev 快照才根治），
+   看导入自检能否把"文件凭空消失/返工不收敛"再压一档；对照基线 `snake-impfix`（wall 3228s / 重问 9 次 / 180s 超时 3 次 / 3 轮未收敛）。
+2. **Q3 Review 拆三层**：机械事实层 / 窄语义层 / 决策层；实测 review 4809 tok 仍被尾裁，需收缩机械事实层 + 尾裁防护。
+3. **Q4 Review 纪律块固定（pin）**：纪律/契约块 pin 住不被尾裁；与 Q3 同批做。
+4. **Q5 Bugfix 结构化字段**：`round_kind ∈ {feature, bugfix}` 进 state；`tasktype.bug_report_from_state` 把
+   verify/test/review 机械证据规范化成缺陷单；返工轮 dev 收【缺陷单】而非裸 fixes；`prompts.SYSTEM_NEW_BUGFIX["dev"]`；
+   判定"文件存在"改 `current_code`（修 `prompts.py:1488`）。**暂缓**：Header 抽取 / Self Review / `preconditions_checked` / `change_surface`。
+5. **test / assess / review 三岗的返工口径**：排在 dev 之后（§24.4 已记），需各补一套与 dev 同构的最小改/不扩范围契约。
+6. **补测试盲区**：① `smoke_mock` 已补"按 task 分派"覆盖、"dev 快照=累积实现"不变量，仍要查 `importlib.py`
+   遮蔽标准库的判定（`verify` 的 shadow 豁免只放了 `__init__`/`__main__`）；② 续跑 `_restore` 跳过 `dev·` 产物的路径需冒烟固化。
+7. **超范围告警比例真机确认**：`_out_of_scope_edits` 目前只记告警不判负，需真机看命中占比是否健康（不喧宾夺主）。
+8. **（暂不做）GA 全局架构师无 `fixes` 重入分支**。
+9. **（可选）方案漏文件闸门**：plan 阶段校验需求点名文件是否被 `changes`/`target_files` 覆盖（④ 防得住 dev 漏、防不住 plan 自己漏）。
+
+**环境状态**：`snake-fix2` 已停、`.running.json` 已删；`config` 全 qwen；`_req_snake.md` 仍在 `D:\AI\line`；
+重起命令见 §24.5（`--run-id snake-impfix2` / 现可复用 `20260927-150931` 续跑）。
+
+### 26.7 架构师环节：吸收外部《提示词优化建议》（2026-09-27）
+
+外部建议的前提**与我们完全吻合**：`architect_plan` 正是 14B / ctx 8192 / 输出上限 3072。
+诊断也一致：让它同时做「架构判断 + 拆任务 + 填字段」三个角色，必然前半段质量高、后半段 tasks 缩水
+（真机 011207：5 版方案文件划分次次不同，`symbols`/`test_hint`/`change` 100% 为空）。
+
+**已采纳**
+
+| 建议 | 落地 |
+|---|---|
+| Plan 输出改为 Design Contract（短输出） | `minimality_reason` 降为可选；`strategy`/`rollback` 从方案必填移除 → 只留 `changes`+`tasks` |
+| 固定输出顺序 | 提示词写死：① changes（边界）→ ② tasks → ③ 解释（可选）；并说明"8K 下解释会吃光预算" |
+| 禁止解释性文字（部分） | 禁"为什么选这个方案/教程/复述代码现状"，但保留 `minimality_reason` 可选（防过度设计有用） |
+| 任务数上限 ≤5 | `config.MAX_PLAN_TASKS=5`，提示词与机械校验**共用同一份值**；审计 `over_task_count` |
+| 每 Task 加 `change` | schema 新增 `change`（"这次具体改成什么样"）并入必填 |
+| **拆出 Task Compiler** | `pipeline/taskcompiler.py`：从 `changes[].symbols` 确定性生成 `tasks` |
+
+**Task Compiler 的关键设计**
+- 输入：架构师给的 `changes[]`（文件 + 该文件要动的符号）—— 这是它**做得到**的边界判断
+- 规则：每文件至少一张；符号 > 4 就切分；线性 `depends_on`；`test_hint` 机械生成
+  （`python -c "import <module>"`）—— 它**从来没填过**这个字段
+- **不无条件覆盖**：`plan_needs_compile()` 判定架构师自己的 tasks 是否合格，
+  合格就保留（它可能带更贴合设计的 acceptance），不合格才接管
+- 断言：同一输入两次生成完全一致、单张符号不超上限、编译结果**通过**字段强制校验
+
+**暂缓**：复用 14B 驻留保 KV prefix（收益依赖 ollama 前缀缓存行为，改 system 有破坏风险）。
+**不单独做**：8K 预算表（做完上面两项后自然满足）。
+
+**一个教训**：要求字段前先确认 **schema 允许**它产出。此前提示词一直要求 `symbols`/`interface`/…
+而 schema 没声明且 `additionalProperties` 被关成 false —— ollama 的 `format` 是语法约束，
+模型**结构上不可能**产出这些字段（另一会话已补上 schema 声明）。契约要求与 schema 允许不一致 = 该字段不存在。

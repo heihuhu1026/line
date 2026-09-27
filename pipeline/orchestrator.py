@@ -29,7 +29,8 @@ from typing import Any, Callable
 
 from . import flow
 from . import issues as issues_mod
-from . import evidence, patches, prd, presence, prompts, retrieval, rules, runstore, tasktype
+from . import evidence, patches, perfguard, prd, presence, prompts, retrieval, rules, runstore
+from . import taskcompiler, tasktype
 from . import semantics
 from . import verify as verify_mod
 from .budget import chars_for_tokens, estimate_tokens, fit_prompt
@@ -44,7 +45,9 @@ from .config import (
     HUMAN_REWORK_TOPUP_MAX,
     INTAKE_PAUSE_ON_GAPS,
     LSP_ENABLED,
+    MAX_PLAN_TASKS,
     MAX_REWORK_ROUNDS,
+    MAX_TASKS_PER_FILE,
     MAX_TOTAL_TOKENS,
     MAX_WALL_S,
     REWORK_STAGNATION_LIMIT,
@@ -166,11 +169,13 @@ def feedback_target(cursor: str | None, from_stage: str | None = None) -> str:
 MAX_TASK_FILES = 2      # 一个 task 最多改动几个文件
 MAX_TASK_SYMBOLS = 4    # 一个 task 最多定义几个顶层符号
 
-#: **同一个文件最多被几张施工图覆盖**。
-#: 这条比"总 task 数"更能反映"拆太碎"：真机 run 20260927-002903 把 3 个文件拆成 5 张图，
-#: 其中 `cli.py` 独占 3 张 —— 同一文件被 3 次 dev 调用分别改动，合并与依赖顺序风险陡增，
-#: 而"总 task 数 > 文件数×2"这种整体判据（5 < 6）根本抓不到它。
-MAX_TASKS_PER_FILE = 2
+#: 「同一个文件最多被几张施工图覆盖」这个上限在 `config.MAX_TASKS_PER_FILE`
+#: （提示词、机械校验、Task Compiler 共用同一份值，不要在这里再写一个数字）。
+#: 它比"总 task 数"更能反映"拆太碎"：真机 20260927-192001 里 `command.py` / `database.py`
+#: 各被 3 张图覆盖 ⇒ 同一文件被三次 dev 调用分别改动 ⇒ 合并与 anchor 冲突，
+#: 表现为「新增文件写残」「anchor 找不到」；而整体判据根本抓不到它。
+
+
 
 #: 施工图**必填字段**缺了最多让方案重做几次。
 #: 强制的理由：真机 run 20260927-002903 的 5 张施工图 `symbols`/`interface`/`contracts`/
@@ -321,10 +326,38 @@ class Orchestrator:
     # 分头维护必然漂移（这一整轮修的就是这类问题）。
 
     # ------------------------------------------------------------------ 埋点落盘
-    def _record(self, stage: str, artifact: Any, meta: dict, request_preview: str) -> None:
+    def _record(
+        self,
+        stage: str,
+        artifact: Any,
+        meta: dict,
+        request_preview: str,
+        *,
+        system: str = "",
+        raw_text: str = "",
+        raw_thinking: str = "",
+    ) -> None:
+        """落阶段快照。**输入与输出都完整留存，不做截断**。
+
+        为什么必须完整：优化提示词的唯一依据就是「这次到底喂了什么、模型到底吐了什么」。
+        原先 `request_preview` 截到 4000 字、且只存 user 不存 system —— 照那种预览调提示词
+        等于盲人摸象（真机上对 `prompt_version` 归因时，只能回头翻 traces.jsonl 才对得上号）。
+        """
         self._seq += 1
         assert self.run_dir is not None
-        payload = {"stage": stage, "meta": meta, "artifact": artifact, "request_preview": request_preview[:4000]}
+        payload = {
+            "stage": stage,
+            "meta": meta,
+            "artifact": artifact,
+            # 完整用户输入（不再截断）
+            "request_preview": request_preview,
+            # 完整系统提示词：换了提示词之后产出质量的变化才能归因
+            "system_prompt": system,
+            # 模型**原始**输出（含 thinking）：解析后的 artifact 是被 schema 约束过的，
+            # 看不出模型原本想说什么、有没有跑偏
+            "response_text": raw_text,
+            "response_thinking": raw_thinking,
+        }
         runstore.write_json(self.run_dir / f"{self._seq:02d}-{stage}.json", payload)
         with (self.run_dir / "llm-calls.jsonl").open("a", encoding="utf-8") as fh:
             # 规整成固定列（见 runstore.CALL_FIELDS）：列一定在，聚合脚本可以无条件取；
@@ -333,6 +366,32 @@ class Orchestrator:
                 {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage, **meta}
             )
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _save_impl_snapshot(self, artifact: Any) -> None:
+        """把**累积实现**落成 dev 阶段快照（它才是 dev 阶段的产物）。
+
+        为什么必须单独落一次：dev 阶段会有**很多次调用**（逐张施工图、重问修正、两遍模式的
+        中间版），`_call` 会把每一次的产物都按 stage 写成快照。而续跑时 `_restore` 取的是
+        「dev 阶段**最后一次**快照」当 `state["implementation"]` —— 拿到的却是某一次**调用**
+        的产物，于是在跑的实现被缩成那一份：上一轮 add 出来的文件整份消失，本轮对它们发
+        modify 一律判「目标文件不存在」，沙箱里只剩一个 main.py（真机实测：
+
+          · 20260927-134222：累积 17 条 → 续跑后 4 条，返工轮白烧
+          · 20260927-150931：内存里 16 条 → `state.json` 里只剩 1 条）
+
+        在 `_stage_dev` 末尾落这一次，不变量才成立：**最新 dev 快照 = 累积实现**。
+        逐张施工图的产物另有独立 artifact_stage（`dev-T-01`），不会来抢这个位置。
+        """
+        if self.run_dir is None:
+            return
+        self._seq += 1
+        payload = {
+            "stage": "dev",
+            "meta": {"note": "dev-accumulated", "kind": "snapshot"},
+            "artifact": artifact,
+            "request_preview": "",
+        }
+        runstore.write_json(self.run_dir / f"{self._seq:02d}-dev.json", payload)
 
     def _record_trace(
         self,
@@ -480,8 +539,32 @@ class Orchestrator:
         user, truncated = fit_prompt([p for p in parts if p], budget, pin=pinned)
         record_stage = artifact_stage or stage
         self.log(f"  [{record_stage}] {spec.tag} ctx={spec.num_ctx} think={spec.think} 切换={sched['switched']}")
+        # prefill 退化护栏：ollama（本机 AMD + Vulkan）会**按请求**退化，约 1/6 请求的 prefill
+        # 掉到 1/12~1/30（实测评审 4.4 t/s vs 健康 74~308 t/s），而 `ollama ps` 仍报 100% GPU。
+        # 探一下只花 ~1s（退化时 ~40s），却能挡掉一次 1000s 级的白等。见 pipeline/perfguard.py。
+        # mock 下不探：没有真实服务，探针必然失败。
+        if not isinstance(self.client, MockClient):
+            gcheck = perfguard.guard(spec.tag, spec.num_ctx, log=self.log)
+            if gcheck.get("checked"):
+                self.state.setdefault("prefill_checks", []).append(
+                    {"stage": record_stage, "tag": spec.tag, **gcheck}
+                )
         t0 = time.time()
         data, meta = self.client.chat_json(spec, system, user, schema or STAGE_SCHEMAS[stage])
+        # 调用**之后**再判一次：探针通过不等于这次一定健康（退化是逐请求翻转的，
+        # 实测 P(退化|上一请求健康)=0.22 —— 本轮 plan 就是这样：探针通过、真调用只有 10.2 t/s）。
+        # 只记录不干预 —— 它只影响这一次调用的耗时，不会污染下游（实测退化时生成速率仍正常）。
+        # 注意 `meta["prefill_tps"]` 是在下面的 meta 收尾里才算出来的，这里必须**自己算**，
+        # 否则 `_pf` 恒为 None、告警永远不触发（第一版就是这样漏掉的）。
+        _pf = meta.get("prefill_tps")
+        if not _pf and meta.get("prompt_s") and meta.get("prompt_tokens"):
+            _pf = round(float(meta["prompt_tokens"]) / float(meta["prompt_s"]), 1)
+        if _pf and float(_pf) < perfguard.baseline_for(spec.tag) * perfguard.DEGRADED_RATIO:
+            self.log(
+                f"        [prefill 告警] 本次 prefill 仅 {_pf} t/s"
+                f"（{spec.tag} 基线 {perfguard.baseline_for(spec.tag):.0f}）"
+                f" —— 已白等 {meta.get('prompt_s')}s；退化是逐请求翻转的，下一次大概率恢复正常"
+            )
         # 记录用素材：完整 system/user 与模型原始输出（含 thinking），写进 traces.jsonl，不进 llm-calls.jsonl
         raw_text = str(meta.pop("_raw_text", ""))
         raw_thinking = str(meta.pop("_raw_thinking", ""))
@@ -524,7 +607,10 @@ class Orchestrator:
             # （人工照页面裁决，下游却按另一份跑）。
             data = post(data)
         self.calls.append(meta)
-        self._record(record_stage, data, meta, user)
+        self._record(
+            record_stage, data, meta, user,
+            system=system, raw_text=raw_text, raw_thinking=raw_thinking,
+        )
         self._record_trace(record_stage, system, user, raw_text, raw_thinking, failed_attempts, meta)
         self.log(
             f"        完成 {meta['wall_s']}s (load {meta['load_s']}s, "
@@ -631,8 +717,14 @@ class Orchestrator:
         parts: list[str],
         note: str | None = None,
         pin: list[str] | None = None,
+        artifact_stage: str | None = None,
     ) -> Any:
         """带事实接地的阶段调用。
+
+        `artifact_stage` 原样透传给 :meth:`_call`：给「同一阶段的多次调用」各自一个
+        独立的快照名（逐张施工图、接口骨架都走它），避免它们冒充该阶段的正式产物 ——
+        续跑时 `_restore` 会用阶段快照覆盖 `state`，冒充的后果是**累积实现被缩成
+        最后一次调用的输出**（真机 20260927-134222）。
 
         产物里出现的路径必须能在检索池 / 需求原文 / 方案清单里找到依据；找不到就先带
         纠正说明重试一次，仍不合格则记入 grounding_warnings（issues 里是**阻断级**）。
@@ -640,7 +732,7 @@ class Orchestrator:
         真机教训：编造的路径不会自己消失 —— 它会被下游当成「上游结论里已有的依据」
         承接下去（assess 编出 pipeline/db/*，方案阶段接着把「数据库查询结果」写进验收标准）。
         """
-        data = self._call(stage, parts, note=note, pin=pin)
+        data = self._call(stage, parts, note=note, pin=pin, artifact_stage=artifact_stage)
         if not self._grounding_enabled(stage):
             return data
         bad = self._ungrounded(data, stage)
@@ -649,7 +741,7 @@ class Orchestrator:
         self.log(f"        [事实校正] {stage} 以下路径无依据，重试一次: {bad[:5]}")
         retry_parts = parts + [prompts.fact_correction_block(bad, has_code=bool(self.pool))]
         retry_note = f"{note}+grounding-retry" if note else f"{stage}-grounding-retry"
-        data = self._call(stage, retry_parts, note=retry_note, pin=pin)
+        data = self._call(stage, retry_parts, note=retry_note, pin=pin, artifact_stage=artifact_stage)
         still = self._ungrounded(data, stage)
         if still:
             self.grounding_warnings.append({"stage": stage, "paths": still})
@@ -931,6 +1023,23 @@ class Orchestrator:
                 f"        [施工图字段] 重做 {PLAN_CONTRACT_RETRIES} 次后仍有 {len(gaps)} 项缺失"
                 " → 降级为提示（跨文件契约比对将无从下手，已记入 plan_contract_gaps）"
             )
+        # ---- Task Compiler：架构师自己做不好的那部分，交给确定性编译器
+        # 让 14B/8K 同时「做架构判断 + 拆任务 + 填字段」必然顾此失彼（真机 011207：
+        # 5 版方案文件划分次次不同，symbols/test_hint/change 100% 为空）。
+        # 它做得到「改哪些文件、动哪些符号」，剩下的机械翻译由这里接管。
+        reasons = taskcompiler.plan_needs_compile(self.state.get("plan"))
+        self.state["plan_compiled_reasons"] = reasons
+        if reasons:
+            compiled = taskcompiler.compile_tasks(self.state.get("plan"))
+            if compiled:
+                self.state["plan"]["tasks"] = compiled
+                self.state["plan"]["tasks_compiled"] = True
+                # 重新算一次：编译后的 tasks 应当**字段齐全**
+                self.state["plan_contract_gaps"] = self._plan_contract_gaps()
+                self.log(
+                    f"        [Task Compiler] 架构师的 tasks 不合格（{'；'.join(reasons[:3])}）"
+                    f" → 已由编译器重新生成 {len(compiled)} 张施工图"
+                )
         self.state["plan"] = self._normalize_plan_ids(self.state["plan"])
         self.state["plan"] = self._ensure_entry_task(self.state["plan"])
         # 方案定稿后**冻结接口基准**（同一段 14B 驻留内的第二次调用，不额外切换模型）。
@@ -1142,15 +1251,33 @@ class Orchestrator:
         `interface` / `contracts` 只提示不强制：它们依赖跨文件设计，强行要求会让小模型编造。
         """
         plan = self.state.get("plan") or {}
+        # 每个文件在**边界里声明了哪些符号**（架构师的能力范围内）。
+        # 没声明的文件（如只有入口逻辑的 main.py）不该被要求"必须有 symbols"——
+        # 那等于要求它凭空造出边界里没有的东西。
+        declared: dict[str, list[str]] = {}
+        for change in (plan.get("changes") or []):
+            if not isinstance(change, dict):
+                continue
+            path = str(change.get("path") or "").replace("\\", "/").strip()
+            if path:
+                declared.setdefault(path, []).extend(
+                    str(s).strip() for s in (change.get("symbols") or []) if str(s).strip()
+                )
         gaps: list[str] = []
         for task in (plan.get("tasks") or []):
             if not isinstance(task, dict):
                 continue
             tid = str(task.get("id") or "?")
-            if not [s for s in (task.get("symbols") or []) if str(s).strip()]:
+            files = [str(f).replace("\\", "/") for f in (task.get("target_files") or [])]
+            expects_symbols = any(declared.get(f) for f in files)
+            if expects_symbols and not [s for s in (task.get("symbols") or []) if str(s).strip()]:
                 gaps.append(f"{tid} 缺 symbols")
             if not str(task.get("test_hint") or "").strip():
                 gaps.append(f"{tid} 缺 test_hint")
+            if not str(task.get("change") or "").strip():
+                # 「改什么」是 DEV 最需要的一条：objective 说目标、symbols 说涉及符号，
+                # 唯独它说"这次具体改成什么样"。schema 已必填，这里再兜一次。
+                gaps.append(f"{tid} 缺 change")
         return gaps
 
     @staticmethod
@@ -1417,7 +1544,39 @@ class Orchestrator:
         # 破坏性迁移都是毫秒级正则能判的 —— 早一轮发现就省下 test + verify + 一次 14B 评审。
         # `reset=True`：这一轮的红线**只反映这一轮的代码**，绝不带上上一轮的陈旧条目。
         self._rule_findings(merged, reset=True)
-        self.state["implementation"] = self._merge_impl_across_rounds(prev, merged)
+        merged_impl = self._merge_impl_across_rounds(prev, merged)
+        # ---- 累积兑现率埋点 ----
+        # 「上一轮的实现」必须**一条不丢地**活到这一轮（`_merge_impl_across_rounds` 的并集语义）。
+        # 真机 20260927-134222：返工轮之后 `state["implementation"]` 只剩 4 条小补丁，
+        # 上一轮 add 出来的 collision.py / food.py **整份不见** —— 于是返工轮对它们的 modify
+        # 判「目标文件不存在」，沙箱里只剩一个 main.py。这类"越改越少"必须能被**看见**：
+        # 只记数字（不判负），下一次就能一眼看出是 prev 空、还是本轮输出把 prev 顶掉了。
+        prev_n = len((prev or {}).get("edits") or [])
+        cur_n = len((merged or {}).get("edits") or [])
+        out_n = len(merged_impl.get("edits") or [])
+        prev_keys = {
+            (str(e.get("path") or ""), str(e.get("change_type") or ""))
+            for e in (prev or {}).get("edits") or []
+            if isinstance(e, dict)
+        }
+        out_keys = {
+            (str(e.get("path") or ""), str(e.get("change_type") or ""))
+            for e in merged_impl.get("edits") or []
+            if isinstance(e, dict)
+        }
+        lost = sorted(f"{p}({ct})" for p, ct in prev_keys - out_keys)
+        self.state["impl_accumulation"] = {
+            "prev_edits": prev_n, "round_edits": cur_n, "merged_edits": out_n,
+            "lost_from_prev": lost[:20], "lost_count": len(lost),
+        }
+        self.log(
+            f"        [实现累积] 上一轮 {prev_n} 条 + 本轮 {cur_n} 条 → 合并后 {out_n} 条"
+            + (f"；⚠ 上一轮有 {len(lost)} 条未进合并结果：{'、'.join(lost[:4])}" if lost else "")
+        )
+        self.state["implementation"] = merged_impl
+        # 把累积实现落成 dev 阶段唯一的产物快照（见 _save_impl_snapshot 的原由：
+        # 不落这一次，续跑时 `_restore` 会拿"某次调用的产物"当实现，越改越少）。
+        self._save_impl_snapshot(merged_impl)
         return self.state["implementation"]
 
     @staticmethod
@@ -1497,6 +1656,52 @@ class Orchestrator:
                 return (p, "__add__", i)
             return mod_key(e)
 
+        def _survivor_key(kept: dict, path: str) -> tuple:
+            """给「保留下来的旧 add 块」一个**不会被本轮 add 顶掉**的键。
+
+            真机教训（2026-09-27，`smoke_merge` ③ 长期挂红）：旧的 add 块用**它自己
+            列表里的序号**当键（``(path, "__add__", 0)``），而本轮的 add 也是从 0 开始
+            编号 ⇒ 两者同键 ⇒ 本轮的块把它**整体顶掉**。于是本轮漏写的类（`Food`）
+            连同上一轮**正确的实现**一起消失 —— 正是 ``vanished_symbols`` 要防的
+            「越改越少」，却在合并层就把防线拆了。
+            """
+            n = 0
+            while (path, "__add_kept__", n) in kept:
+                n += 1
+            return (path, "__add_kept__", n)
+
+        def _top_span(lines: list[str], symbol: str) -> tuple[int, int] | None:
+            """**零缩进**定义的区间（找不到返回 None）。
+
+            只认顶层：方法名与顶层符号同名时，按「任意缩进」匹配会删错块 ——
+            静默丢代码比不删危险得多，所以宁可返回 None 让它原样保留。
+            """
+            pat = re.compile(rf"^(?:async\s+)?(?:def|class)\s+{re.escape(symbol)}\b")
+            for idx, line in enumerate(lines):
+                if not pat.match(line):
+                    continue
+                block = retrieval.symbol_span(lines, idx)
+                if not block:
+                    return None
+                start, end = block[0], block[1]
+                while end > start and not lines[end].strip():
+                    end -= 1
+                return (start, end)
+            return None
+
+        def _drop_covered(patch: Any, covered: set[str]) -> str:
+            """从整文件 add 块里删掉这些顶层符号的定义，其余（import / 常量 / 别的类）原样保留。
+
+            为什么是「删掉被覆盖的」而不是「只留没被覆盖的」：整文件补丁的头部通常是
+            import 与常量，只挑符号会把这些一起丢掉，被保留下来的类就会缺依赖。
+            """
+            lines = str(patch or "").split("\n")
+            spans = sorted({s for s in (_top_span(lines, sym) for sym in covered) if s}, reverse=True)
+            for start, end in spans:
+                del lines[start : end + 1]
+            text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip("\n")
+            return text + "\n" if text.strip() else ""
+
         kept: dict[Any, dict] = {}
 
         # 1) prev 的全部 edit（原顺序），本轮已作废的跳过
@@ -1507,8 +1712,21 @@ class Orchestrator:
             p = _norm(e.get("path"))
             if p in deleted_paths:
                 continue
-            if _is(e, "add") and p in cur_add_syms and _top_symbols(e.get("patch")) <= cur_add_syms[p]:
-                continue  # 本轮已完整覆盖该块定义的全部符号 -> 丢弃旧的，避免重复定义
+            if _is(e, "add") and p in cur_add_syms:
+                syms = _top_symbols(e.get("patch"))
+                covered = syms & cur_add_syms[p]
+                if not covered:
+                    # 本轮的 add 没碰这个块里的任何符号 ⇒ 整块保留（独立键，别被顶掉）
+                    kept[_survivor_key(kept, p)] = e
+                    continue
+                rest = syms - covered
+                if not rest:
+                    continue  # 本轮已完整覆盖该块定义的全部符号 -> 丢弃旧的，避免重复定义
+                # 部分覆盖：删掉被覆盖的符号，**保住本轮漏写的那些**（防越改越少）
+                trimmed = _drop_covered(e.get("patch"), covered)
+                if trimmed.strip():
+                    kept[_survivor_key(kept, p)] = {**e, "patch": trimmed}
+                continue
             kept[_key(e, prev_ord)] = e
 
         # 2) cur 的 edit：同键替换（保留 prev 的位置），新键追加到末尾
@@ -1772,8 +1990,56 @@ class Orchestrator:
         # 落进 state：重问要用它当准绳，**下一轮** dev 也要（跨轮投喂，见 _stage_dev 的 _dev_parts）。
         if out["digest"]:
             self.state["api_digest"] = out["digest"]
+        problems: list[str] = []
+        # ---- ①② 导入正确性（**无条件跑**，与「有没有测试」无关）----
+        # 为什么必须**无条件**：真机 20260927-134222/150931 的交付物里，dev 写出的
+        # `from tkinter import event`（幻觉导入）、`from main import main`（自导入 + 未定义）
+        # 都是**连 import 都过不去**的硬错；而这一档原先只在"存在 test_*.py"时才执行，
+        # 这些新建项目一个测试文件都没有 ⇒ dev 自检等于没有执行级检查 ⇒ 硬错一路活到 verify
+        # （那时已烧掉 test + verify + 一次 14B 评审）。
+        #
+        # mock 下不跑（与 `_orphan_modify_files` / 覆盖审计同一条约定）：mock 的 dev 产物是
+        # 按 schema 合成的**占位数据**（路径形如 `<path>`），对它做导入核对只会产出噪声、
+        # 触发注定修不好的重问，把「流程机制」的测试带偏。mock 测流程，不测内容质量。
+        static: list[str] = []
+        if not isinstance(self.client, MockClient):
+            # ① 纯 AST：本地符号缺失 / 产出文件与标准库同名（毫秒级、零副作用）
+            static = verify_mod.import_symbol_problems(probe, written)
+            # ② 真跑一次 import：语法合法但 import 时炸的，只有真 import 才知道
+            import_spec = verify_mod.import_check_spec(probe, written)
+            if import_spec is not None:
+                ires = verify_mod.run_command(
+                    import_spec,
+                    cwd=probe,
+                    timeout=self._DEV_EXEC_TIMEOUT,
+                    allowed_bins=VERIFY_ALLOWED_BINS,
+                    deny_patterns=VERIFY_DENY_PATTERNS,
+                )
+                istatus = str(ires.get("status") or "")
+                self.state["dev_import_audit"] = {
+                    "status": istatus,
+                    "exit_code": ires.get("exit_code"),
+                    "command": import_spec["command"],
+                }
+                if istatus == "ok":
+                    self.log("        [自检·导入] 产出模块全部 import 正常")
+                elif istatus != "unavailable":
+                    # unavailable = 环境里没有这个程序，与产物无关（verify 里有同一套区分）
+                    detail = (
+                        str(ires.get("stderr_tail") or "").strip()
+                        or str(ires.get("stdout_tail") or "").strip()
+                    )
+                    self.log(f"        [自检·导入] 产出模块 import 不过（{istatus}）")
+                    static.append(
+                        f"你本轮产出的模块 **import 不起来**（`{import_spec['command']}` "
+                        f"退出码 {ires.get('exit_code')}）。把下面这段原文读完再改 —— "
+                        "导入级错误会让整份产物跑不起来，优先级高于任何功能问题：\n"
+                        + (detail[-1200:] or "(没有输出)")
+                    )
+        problems += static
         modules = verify_mod.test_modules(probe, written)
         if not modules:
+            out["problems"] = problems
             return out
         out["ran"] = modules
         spec = {
@@ -1797,27 +2063,33 @@ class Orchestrator:
         }
         if status == "ok":
             self.log(f"        [自检·执行] 产物自带测试通过（{', '.join(modules)}）")
+            out["problems"] = problems
             return out
         if status == "unavailable":
             # 环境里没这个程序 —— 与产物无关，不该拿去重问（verify 里有同一套区分）
+            out["problems"] = problems
             return out
         detail = str(res.get("stderr_tail") or "").strip() or str(res.get("stdout_tail") or "").strip()
         self.log(f"        [自检·执行] 产物自带测试没跑通（{status}）")
-        out["problems"] = [
+        problems.append(
             f"你本轮产出的测试自己没跑通（`{spec['command']}` 退出码 {res.get('exit_code')}）。"
             "把下面这段原文读完再改 —— **不要改测试去迁就实现**，除非你确认实现才是错的那一方：\n"
             + (detail[-1600:] or "(没有输出)")
-        ]
+        )
+        out["problems"] = problems
         return out
 
     def _dev_selfcheck(self, impl: Any) -> list[str]:
-        """dev 阶段的三档自检 —— **问题累积，不串成短路链**。
+        """dev 阶段的自检 —— **问题累积，不串成短路链**。
 
           ① 字面（写残 / 未闭合 / 缺依赖）—— 毫秒级
           ② 类型诊断（物化 + pyright）—— 秒级；**只在 ① 干净时跑**：
              语法残片会让 pyright 报一堆连锁错误，把真正的问题淹掉
-          ③ 真跑产物自带的测试 —— 秒级，**无条件跑**
-          ④ 方案点名的文件有没有产出 —— 毫秒级，**无条件跑**
+          ③ 导入正确性（① 纯 AST：本地符号缺失 / 与标准库同名；② 真跑一次 import）
+             —— 毫秒~秒级，**无条件跑**（真机：连 import 都过不去的硬错必须在这里拦住，
+             否则要等 test + verify + review 一整轮）
+          ④ 真跑产物自带的测试 —— 秒级，**无条件跑**
+          ⑤ 方案点名的文件有没有产出 —— 毫秒级，**无条件跑**
 
         ③ 为什么要无条件跑（而不是接在 ①② 后面短路）：拿真机 run snake-v3 的产物回放，
         第 1 轮的字面自检就报了 6 处，于是 ③ **一次都没运行过** —— 而「单测跑不过」
@@ -1924,23 +2196,91 @@ class Orchestrator:
 
     @staticmethod
     def _apply_repair(merged: dict, again: Any) -> dict:
-        """用重出的那一版**替换**对应 (path, target_symbol) 的补丁。
+        """用重出的那一版**替换**它针对的那些补丁（按 :meth:`_edit_key` 认身份）。
 
-        刻意不走 `_merge_dev`：重出时 anchor / patch_mode 很可能与上一版不同，
-        按「后写覆盖」的键合并会同时留下两条同符号补丁（合并写新文件时会得到两份定义）。
+        刻意不走 `_merge_dev`（那是并集）：重出时 anchor / patch_mode 很可能与上一版不同，
+        若按并集处理会同时留下"旧版 + 新版"两条同处补丁。
+
+        认领顺序（真机 20260927-150931 的 mock 回放暴露了粗键的两种错法，这里是修法）：
+          ① **精确键**（path, 符号, 模式, anchor）—— 同一处改动的两次尝试，直接替换；
+          ② 再退一档 **(path, 符号, 模式)** —— 重出时 anchor 常被写得更"正"（原样抄全签名），
+             精确键认不出它，但那仍是**同一处改动的修正**：认不出就会把修复丢掉，比不修更糟；
+          ③ 都认不到的（重出新增的锚点）**追加** —— 那同样是对问题的修复，丢掉等于白问一次。
+        另外：重出给了 `full_symbol` 时，该符号上其它分片补丁一并去掉（留着套用后会有两份定义）。
+
+        反面教材（原先的实现）：只用 (path, 符号) 当键 → 同一符号上合法存在的多条补丁
+        （`full_symbol` 整符号替换 + `replace_span` 只改签名、两遍分片重构的多条 replace_span）
+        会被**并成一条**，静默丢掉其中一处改动，问题清单里也跟着少一条真问题。
         """
-        fresh = {
-            (str(e.get("path") or ""), str(e.get("target_symbol") or "")): e
-            for e in ((again or {}).get("edits") or [])
-            if isinstance(e, dict)
-        }
-        if not isinstance(merged, dict) or not fresh:
+        if not isinstance(merged, dict):
             return merged
-        merged["edits"] = [
-            fresh.get((str(e.get("path") or ""), str(e.get("target_symbol") or ""))) or e
-            for e in merged.get("edits") or []
-        ]
+        remaining = [e for e in ((again or {}).get("edits") or []) if isinstance(e, dict)]
+        if not remaining:
+            return merged
+
+        superseded = {
+            (str(e.get("path") or ""), str(e.get("target_symbol") or "").strip())
+            for e in remaining
+            if str(e.get("patch_mode") or "") == "full_symbol" and e.get("target_symbol")
+        }
+
+        def _claim(old: dict) -> dict | None:
+            """在尚未认领的重出补丁里找 `old` 的对应版（精确键优先，再退 (path,符号,模式)）。"""
+            wanted = Orchestrator._edit_key(old)
+            loose = (
+                str(old.get("path") or ""),
+                str(old.get("target_symbol") or "").strip(),
+                old.get("patch_mode"),
+            )
+            for i, cand in enumerate(remaining):
+                if Orchestrator._edit_key(cand) == wanted:
+                    return remaining.pop(i)
+                if loose[1] and loose == (
+                    str(cand.get("path") or ""),
+                    str(cand.get("target_symbol") or "").strip(),
+                    cand.get("patch_mode"),
+                ):
+                    return remaining.pop(i)
+            return None
+
+        out: list[dict] = []
+        for edit in merged.get("edits") or []:
+            if not isinstance(edit, dict):
+                continue
+            hit = _claim(edit)
+            if hit is not None:
+                out.append(hit)
+                continue
+            pair = (str(edit.get("path") or ""), str(edit.get("target_symbol") or "").strip())
+            if pair in superseded:
+                continue  # 被整符号替换取代（留着会得到两份定义）
+            out.append(edit)
+        out.extend(remaining)  # 重出新增的（没认领到的）：留下
+        merged["edits"] = out
         return merged
+
+    @staticmethod
+    def _edit_key(e: dict) -> tuple:
+        """补丁的身份键：**同键 = 同一处改动的两次尝试**（后写覆盖）。
+
+        只用 (path, target_symbol) 是不够的：同一个符号上**合法地**会有多条补丁 ——
+        `full_symbol` 整符号替换 + `replace_span` 只改签名、两遍分片重构时同一主函数产出
+        多条 `replace_span`（见 `_merge_dev` 的注释）。粗键会把它们并成一条、
+        **静默丢掉其中一处改动**。合并、返修替换两处共用这一个键，口径才不会各说各话。
+        """
+        path = str(e.get("path") or "")
+        symbol = str(e.get("target_symbol") or "").strip()
+        if symbol:
+            return (path, symbol, e.get("patch_mode"), e.get("anchor") or "")
+        if str(e.get("change_type") or "") == "add":
+            return (path, "__new_file__")
+        return (
+            path,
+            "",
+            e.get("patch_mode"),
+            e.get("anchor") or "",
+            hashlib.md5(str(e.get("patch") or "").encode("utf-8", "replace")).hexdigest(),
+        )
 
     @staticmethod
     def _merge_dev(p1: dict, p2: dict) -> dict:
@@ -1963,26 +2303,11 @@ class Orchestrator:
             # 沙箱没有入口、`python main.py` 必然失败。符号**缺失不等于这条 edit 无效**。
             if not (isinstance(e, dict) and e.get("path")):
                 continue
-            symbol = str(e.get("target_symbol") or "").strip()
-            if symbol:
-                # 同 (path, 符号, 模式, anchor) 视为「同一处改动的两次尝试」，后写（第二遍）覆盖先写。
-                # 第二遍分片重构时会对同一主函数输出多条 replace_span（锚点各不相同），必须带上 anchor 区分，
-                # 否则会被去重成一条、其余分片丢失，主函数重组不完整。
-                key: tuple = (e["path"], symbol, e.get("patch_mode"), e.get("anchor") or "")
-            elif str(e.get("change_type") or "") == "add":
-                # 整份新建文件且没写符号：后写覆盖 —— 再产出一次就是「以这一版为准」，
-                # 两份都留会拼出重复定义（new_file_duplicate_symbol）。
-                key = (e["path"], "__new_file__")
-            else:
-                # 没符号的 modify：按内容去重，内容不同的块都保留（锚点分片可能确实有多条）
-                key = (
-                    e["path"],
-                    "",
-                    e.get("patch_mode"),
-                    e.get("anchor") or "",
-                    hashlib.md5(str(e.get("patch") or "").encode("utf-8", "replace")).hexdigest(),
-                )
-            merged[key] = e
+            # 身份键统一走 `_edit_key`：合并与返修替换共用一套口径，否则同一件事在两处
+            # 会被判成不同的键（真机踩过：返修替换用粗键，把同符号的多条分片并成了一条）。
+            # 语义见那里的注释 —— 同 (path, 符号, 模式, anchor) = 同一处改动的两次尝试，
+            # 后写（第二遍）覆盖先写；整份新建且没写符号时按路径后写覆盖，避免重复定义。
+            merged[Orchestrator._edit_key(e)] = e
         out["edits"] = list(merged.values())
         # 第一遍搭脚手架时常先把「待第二遍补齐」的任务声明成 not_implemented，第二遍补上之后
         # 这些声明就过期了。若不清理，同一批 task id 会同时出现在 covered 与 declared_ids 里，
@@ -2357,13 +2682,18 @@ class Orchestrator:
                 work, list(report.get("materialized") or []), self.state.get("skeleton")
             )
             if conformance.get("missing"):
-                self.state["contract_problems"] = [
-                    *(self.state.get("contract_problems") or []),
-                    *conformance["missing"],
-                ]
+                # **不进 `contract_problems`（不判负）**：它核的是「骨架（方案期第二次调用）
+                # 与产物」的一致性，而骨架与方案本身可能互相不一致 —— 真机 20260927-123032：
+                # 骨架声明 `class Collision`，方案 T-03 要的却是函数 `check_collision`，
+                # 开发照方案实现 ⇒ 这里报"类不存在"。那是**两次 14B 输出不一致**，不是实现缺陷；
+                # 把它当阻断项会强制返工、白烧一轮。真正该判负的「声明了却没定义」由
+                # `verify.contract_check`（核**方案**的 contract/interface）与 `interface_audit`
+                # 独立覆盖 —— 那两条才是权威。
+                self.state["skeleton_problems"] = list(conformance["missing"])
                 self.log(
-                    f"        [接口基准] {len(conformance['missing'])} 处方案声明的接口在产物里不存在"
-                    f"（核对 {conformance.get('checked', 0)} 条）"
+                    f"        [接口基准] 骨架与产物有 {len(conformance['missing'])} 处不一致"
+                    f"（核对 {conformance.get('checked', 0)} 条；**只记录不判负** —— "
+                    "骨架与方案可能各说各话，权威以方案的 contract/interface 为准）"
                 )
                 for line in conformance["missing"][:3]:
                     self.log(f"          - {line[:100]}")
@@ -2573,6 +2903,8 @@ class Orchestrator:
             "tasks_without_symbols": no_symbols[:6],
             "over_covered_files": over_covered[:6],
             "over_split": over_split,
+            # 任务总数上限：8K/3K 的架构师，task 越多后半段越缩水
+            "over_task_count": len(tasks) > MAX_PLAN_TASKS,
             # 施工图**没声明契约字段** ⇒ 后续的跨文件契约比对无从下手。
             # 必须显式记下来：否则"0 条契约问题"会被读成"接口都对得上"，
             # 而真实情况是**根本没得比**（真机 20260927-002903：5 张图字段全空）。
@@ -2670,10 +3002,12 @@ class Orchestrator:
         这是「最小改动」的真正保证 —— 不是靠提示词叫模型别乱动，而是**根本不派给它
         别的任务**。它拿到哪张施工图，就只能改哪张图覆盖的文件。
         """
-        affected = {
-            str(p).replace("\\", "/")
-            for p in ((self.state.get("bug_report") or {}).get("affected") or {})
-        }
+        # **在使用点重算**，不读 `state["bug_report"]`：那份存档可能是过期的
+        # —— 真机 20260927-192001 里 state 上的 affected 是空的，但按当前 fixes 重算
+        #   明明是 {errors.py, test_all.py, test_command.py}。读过期存档会让
+        #   「只重做受影响任务」整个失效，退化成整批重做（最小改动也就没了）。
+        report = tasktype.bug_report_from_state(self.state, list(getattr(self, "fixes", None) or []))
+        affected = {str(p).replace("\\", "/") for p in (report.get("affected") or {})}
         if not affected:
             return []
         hit: list[dict] = []
@@ -2743,6 +3077,29 @@ class Orchestrator:
                     _add(tok)
         return out
 
+    @staticmethod
+    def _task_drawing_is_thin(task: dict) -> bool:
+        """这张施工图是不是**实质为空**（只有 id/title/文件清单，没有可施工的内容）。
+
+        真机 `20260927-150931`：8B 架构师不填 `symbols`/`test_hint`/`contracts`
+        （强制重做 2 次也填不出来），施工图里全是「（未声明）」。此时若再把整份方案
+        也从 dev 输入里去掉，dev 就**几乎没有任何信息** —— 于是又退回瞎出 `modify` 补丁
+        （`modify` 打在不存在的文件上 ⇒ unchecked ⇒ 一条都落不了盘）。
+
+        所以：**施工图够厚就只给施工图，太薄就退回给整份方案**。宁可多给一点，
+        也不能让 dev 在真空里施工。
+        """
+        if not isinstance(task, dict):
+            return True
+        if [s for s in (task.get("symbols") or []) if str(s).strip()]:
+            return False
+        if str(task.get("test_hint") or "").strip():
+            return False
+        contracts = task.get("contracts")
+        if isinstance(contracts, dict) and contracts:
+            return False
+        return True
+
     def _dev_by_tasks(self, parts_fn: Any, plan_pin: Any, tasks: list[dict]) -> dict:
         """一次 dev 调用只做一张施工图，逐张产出并累积合并。
 
@@ -2765,25 +3122,34 @@ class Orchestrator:
                 data = self._grounded_call(
                     "dev",
                     # 施工图放最前：`fit_prompt` 从末尾开始丢片段，而它是本次调用的**全部权威**。
-                    # include_plan=False：既然只做这一张图，就别再把整份方案塞进来
-                    # （同一内容两份，既占预算又把注意力引向这次不用做的文件）。
+                    # include_plan：施工图**太薄**时（架构师填不出 symbols/test_hint/contracts
+                    # 是常态，不是例外）必须退回给整份方案 —— 否则 dev 在真空里施工，
+                    # 又退回瞎出 `modify` 补丁（真机 20260927-150931）。够厚才只给施工图。
                     [
                         focus,
                         *parts_fn(
-                            include_plan=False,
+                            include_plan=self._task_drawing_is_thin(task),
                             only_paths=paths,
                             current_code=self._current_code_text(paths),
                         ),
                     ]
                     if focus
-                    else parts_fn(include_plan=False),
+                    else parts_fn(include_plan=self._task_drawing_is_thin(task)),
                     pin=plan_pin,
                     note=f"dev·{tid}",
+                    # **别占 dev 的阶段槽位**：续跑时 `_restore` 会用「dev 阶段最后一次快照」
+                    # 覆盖 `state["implementation"]`（那是**累积实现**），而逐张施工图的产物
+                    # 只是**这一次调用**的输出 —— 覆盖的后果是累积实现被缩成"最后一张图"，
+                    # 上一轮 add 出来的文件整份消失，下一轮对它们发 modify 一律判
+                    # 「目标文件不存在」（真机 20260927-134222 实测：17 条累积 → 4 条，
+                    # 沙箱里只剩 main.py）。给它独立 artifact_stage，文件名与埋点仍留档，
+                    # 但不再冒充 dev 的阶段产物。
+                    artifact_stage=f"dev-{tid}",
                 )
             except Exception as exc:  # noqa: BLE001
                 self.log(
                     f"        [按 task 分派] {tid} 本次调用失败（{type(exc).__name__}："
-                    f"{str(exc)[:90]}）→ 跳过这张，其余图继续施工"
+                    f"{str(exc)[:300]}）→ 跳过这张，其余图继续施工"
                 )
                 self.state.setdefault("dev_task_failures", []).append(
                     {"task": tid, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
@@ -2797,21 +3163,36 @@ class Orchestrator:
                     f"        [施工图自检] {tid} 漏了 {len(gaps)} 个声明过的符号"
                     f"（{'、'.join(gaps[:3])}）→ 只重做这一张"
                 )
-                data = self._merge_dev(
-                    data,
-                    self._grounded_call(
+                try:
+                    again = self._grounded_call(
                         "dev",
                         [
                             focus,
                             "【补漏】上一版漏掉了施工图里声明的这些符号："
                             f"{'、'.join(gaps)}。请补齐它们的**完整定义**，"
                             "不要改动其他文件、不要重写已完成的部分。",
-                            *parts_fn(include_plan=False),
+                            *parts_fn(include_plan=self._task_drawing_is_thin(task)),
                         ],
                         pin=plan_pin,
                         note=f"dev·{tid}·补符号{retry}",
-                    ),
-                )
+                        # 同上：补符号也是**逐张图的调用**，不占 dev 的阶段槽位
+                        artifact_stage=f"dev-{tid}-repair",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # **补漏也要吞异常**：它与主调用同属"一次调用"，抛出去会直接终结整个
+                    # 运行 —— 真机 20260927-150931 就是这里抛的 `OllamaError`（7B 输出撞上限后
+                    # 陷入重复、止损抛错），整轮开发作废、进程退出、state 却还停在 running
+                    # （页面上看是"还在跑"），白等 24 分钟才发现。保留这一版，漏的符号留给评审。
+                    self.log(
+                        f"        [施工图自检] {tid} 补符号这次调用失败（{type(exc).__name__}："
+                        f"{str(exc)[:200]}）→ 保留这一版，其余图继续施工"
+                    )
+                    self.state.setdefault("dev_task_failures", []).append(
+                        {"task": tid, "phase": "补符号",
+                         "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                    )
+                    break
+                data = self._merge_dev(data, again)
             merged = self._merge_dev(merged, data) if merged else data
             self.log(f"        [按 task 分派] {tid} 完成（{idx}/{len(tasks)}）")
         return merged
@@ -3722,12 +4103,32 @@ class Orchestrator:
         self.elapsed_s = float(snap.get("elapsed_s") or 0.0)
         self.pool = [Excerpt(**item) for item in (snap.get("pool") or [])]
         self.state = dict(snap.get("artifacts") or {})
-        # 人工编辑优先：阶段快照文件里的 artifact 覆盖 state.json 中的旧值
+        # 人工编辑优先：阶段快照文件里的 artifact 覆盖 state.json 中的旧值。
+        # **但「逐张施工图的调用产物」不算阶段产物**（见 `_dev_by_tasks` 的 artifact_stage）：
+        # 拿它覆盖 `implementation` 会把**累积实现**缩成"最后一张图" —— 于是续跑之后
+        # 越改越少：上一轮 add 出来的文件整份消失，本轮对它们发 modify 一律判
+        # 「目标文件不存在」，沙箱里只剩一个 main.py，白烧一整轮（真机 20260927-134222
+        # 实测：17 条累积 → 4 条）。老 run 的这类快照仍以 `dev` 为阶段名存在，
+        # 所以这里按 `meta.note`（`dev·T-01` 这种）精确识别并跳过。
         assert self.run_dir is not None
-        for stage, artifact in runstore.latest_artifacts(self.run_dir).items():
+        skipped_calls: list[str] = []
+        for row in runstore.stage_snapshots(self.run_dir):
+            stage = str(row.get("stage") or "")
+            artifact = row.get("artifact")
             key = runstore.STAGE_STATE_KEY.get(stage)
-            if key:
-                self.state[key] = artifact
+            if not key or artifact is None:
+                continue
+            note = str((row.get("meta") or {}).get("note") or "")
+            if stage == "dev" and note.startswith("dev·"):
+                skipped_calls.append(str(row.get("file") or ""))
+                continue
+            self.state[key] = artifact
+        if skipped_calls:
+            self.log(
+                f"== [恢复] 跳过 {len(skipped_calls)} 份「逐张施工图」的调用产物"
+                f"（{', '.join(skipped_calls[-3:])}）—— 它们不是本轮累积实现，"
+                "拿它覆盖 implementation 会把已产出的文件整份丢掉"
+            )
         # 人工裁决**在读取时**再并一次（幂等）：裁决的真源是 state，产物只是载体。
         # 保存接口若因任何原因没并回（真机出过两次：子进程用新契约、服务端还是旧代码，
         # 结果一条都没并上），下游就会把**已经裁决过**的条目当成「还没定」再问一遍。
@@ -4171,17 +4572,36 @@ class Orchestrator:
                 self.log(f"  [强控] {gate_stage} 的待裁决项仍未解决 —— 不放行，继续停在这里")
                 self._interrupt(it)
                 return
-        while self.cursor != "done":
-            stage = self.cursor
-            nxt = self._step(stage)
-            self.cursor = nxt
-            # 闸门统一走 interrupt 语义：_gate_after 判「要不要停」，_interrupt 负责
-            # 落盘/留痕/打印提示。human_review 首次到达时 _step 返回自身（nxt == stage），
-            # 所以这里把 nxt 一并交给判定函数（mandatory 闸门需要它区分「首达 / 人工已提交」）。
-            it = self._gate_after(stage, nxt)
-            if it is not None:
-                self._interrupt(it)
-                return
+        try:
+            while self.cursor != "done":
+                stage = self.cursor
+                nxt = self._step(stage)
+                self.cursor = nxt
+                # 闸门统一走 interrupt 语义：_gate_after 判「要不要停」，_interrupt 负责
+                # 落盘/留痕/打印提示。human_review 首次到达时 _step 返回自身（nxt == stage），
+                # 所以这里把 nxt 一并交给判定函数（mandatory 闸门需要它区分「首达 / 人工已提交」）。
+                it = self._gate_after(stage, nxt)
+                if it is not None:
+                    self._interrupt(it)
+                    return
+                self._persist()
+        except Exception as exc:  # noqa: BLE001
+            # ---- 任何阶段异常都**不许让运行隐身死掉** ----
+            # 以前异常直接冒到 cli 顶层：进程退出，而 `state.json` 还停在 `status=running`、
+            # 心跳停摆、页面上看是"还在跑"，实际什么都没发生 —— 真机 20260927-150931 就是
+            # 这样白等了 24 分钟（符号补漏调用抛 OllamaError 崩溃）。
+            # 这里落成**可恢复的失败态**：留痕（问题记录里看得到）+ 停在人工闸门；
+            # `cursor` **不前移**，人工点"继续"就从同一个阶段重新进入。
+            detail = f"{type(exc).__name__}: {exc}"
+            self.state.setdefault("stage_errors", []).append(
+                {"stage": self.cursor, "error": detail[:1200]}
+            )
+            self.log(
+                f"== [中止] {self.cursor} 阶段异常，已停在人工闸门（cursor 不动，续跑可重试）："
+                f"{detail[:300]}"
+            )
+            self.needs_human = True
+            self.status = "paused"
             self._persist()
 
     # ------------------------------------------------------------------ 入口：新运行

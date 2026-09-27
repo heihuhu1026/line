@@ -2729,7 +2729,19 @@ function renderStages(stages){
           <button data-act="format">格式化</button>
           <span class="note out"></span>
         </div>
-        <details><summary>该次调用的输入预览（截断）</summary><pre class="preview"></pre></details>
+        <details><summary>该次调用的**完整输入**（系统提示词 + 用户输入，未截断）</summary>
+          <div class="row" style="margin:6px 0"><button data-act="copy-io" data-copy="system">复制系统提示词</button><button data-act="copy-io" data-copy="user">复制用户输入</button><span class="note io-out"></span></div>
+          <label>系统提示词（<span class="sys-len"></span> 字）</label>
+          <pre class="system"></pre>
+          <label>用户输入（<span class="usr-len"></span> 字）</label>
+          <pre class="preview"></pre>
+        </details>
+        <details><summary>该次调用的**完整原始输出**（模型吐出的原文，解析前）</summary>
+          <label>thinking（<span class="thk-len"></span> 字）</label>
+          <pre class="thinking"></pre>
+          <label>正文（<span class="out-len"></span> 字）</label>
+          <pre class="raw"></pre>
+        </details>
         <details><summary>调用元数据</summary><pre class="meta"></pre></details>
         <div style="margin-top:10px">
           <label>打回原因 / 修改要求（作为人工意见注入该阶段）</label>
@@ -2746,10 +2758,34 @@ function renderStages(stages){
   box.querySelectorAll(".stage").forEach(el => {
     const sn = stages.find(s => s.seq == el.dataset.seq && s.stage === el.dataset.stage);
     el.querySelector(".artifact").value = JSON.stringify(sn.artifact ?? null, null, 2);
-    el.querySelector(".preview").textContent = sn.request_preview || "（无）";
-    el.querySelector(".meta").textContent = JSON.stringify(sn.meta || {}, null, 2);
-    el.querySelectorAll("[data-act]").forEach(btn =>
-      btn.onclick = () => onStageAction(el, sn, btn.dataset.act));
+    // 非模型调用的快照（累积实现快照、运行验证）本来就没有输入/输出 —— 必须**明确标注**，
+    // 否则页面显示成"空"会让人误判成"模型吐了空"（真机反馈即是如此）。
+    const kind = (sn.meta || {}).kind || "";
+    const notAModelCall = kind === "snapshot" || !(sn.system_prompt || sn.request_preview || sn.response_text);
+    const NA = "（本阶段不是模型调用：没有提示词与模型输出。运行验证是真跑命令，累积实现快照只记产物。）";
+    el.querySelector(".preview").textContent = notAModelCall ? NA : (sn.request_preview || "（空）");
+    el.querySelector(".system").textContent = notAModelCall ? NA : (sn.system_prompt || "（空）");
+    el.querySelector(".raw").textContent = notAModelCall ? NA : (sn.response_text || "（空）");
+    el.querySelector(".thinking").textContent =
+      notAModelCall ? NA : (sn.response_thinking || "（本阶段未开启 thinking）");
+    const len = s => String((s || "").length);
+    el.querySelector(".sys-len").textContent = len(sn.system_prompt);
+    el.querySelector(".usr-len").textContent = len(sn.request_preview);
+    el.querySelector(".out-len").textContent = len(sn.response_text);
+    el.querySelector(".thk-len").textContent = len(sn.response_thinking);
+    el.querySelectorAll("[data-act]").forEach(btn => {
+      if(btn.dataset.act === "copy-io"){
+        btn.onclick = async () => {
+          const text = btn.dataset.copy === "system" ? (sn.system_prompt || "") : (sn.request_preview || "");
+          try{ await navigator.clipboard.writeText(text); }
+          catch(e){ /* 剪贴板不可用时退回选中 */ }
+          const out = el.querySelector(".io-out");
+          if(out){ out.textContent = `已复制 ${text.length} 字`; setTimeout(()=>{out.textContent="";}, 2000); }
+        };
+        return;
+      }
+      btn.onclick = () => onStageAction(el, sn, btn.dataset.act);
+    });
 
     // 恢复重渲前的展开状态与未保存编辑
     const prev = keep.get(el.dataset.seq);

@@ -371,10 +371,13 @@ def main() -> int:
             "只重跑了 dev/test/review",
         )
         superseded = sorted(p.name for p in (result.run_dir / runstore.SUPERSEDED_DIR).glob("*.json"))
-        check(len(superseded) == 5, "旧产物归档到 superseded/（dev 两遍多一个文件）", str(superseded))
+        # dev 会落 **3** 份快照：两遍模式的两次调用（脚手架 / 回填）+ 末尾的**累积实现**
+        # （见 `_save_impl_snapshot` —— 它才是 dev 阶段的产物，续跑时按它恢复实现）。
+        check(len(superseded) == 6, "旧产物归档到 superseded/（dev 两遍 + 累积实现快照）", str(superseded))
         check(
-            superseded == ["05-dev.json", "06-dev.json", "07-test.json", "08-verify.json", "09-review.json"],
-            "归档文件名符合两遍编号（含 verify）",
+            superseded == ["05-dev.json", "06-dev.json", "07-dev.json",
+                           "08-test.json", "09-verify.json", "10-review.json"],
+            "归档文件名符合编号（dev 两遍 + 累积实现 + test/verify/review）",
             str(superseded),
         )
         check(
@@ -772,6 +775,30 @@ def main() -> int:
         check((patch_result.run_dir / "patches").exists(), "补丁目录已生成")
         p_issues = {i.kind for i in issues.collect_issues(patch_state, "patchrun")}
         check("patch_incomplete" in p_issues and "anchor_not_found" in p_issues, "补丁问题进了问题记录", str(sorted(p_issues)))
+        # 阶段异常（`_execute` 顶层兜底落的痕）必须出现在问题记录里 —— 否则人工闸门上看不出
+        # "这轮是崩在半路"（真机 20260927-150931 白等 24 分钟才发现）。
+        se_kinds = {
+            i.kind
+            for i in issues.collect_issues(
+                {"stage_errors": [{"stage": "dev", "error": "OllamaError: boom"}]}, "se"
+            )
+        }
+        check("stage_error" in se_kinds, "阶段异常中止记成问题（人工闸门看得到）", str(sorted(se_kinds)))
+        # dev 阶段的**产物**必须是累积实现：续跑时 `_restore` 取"最后一次 dev 快照"当
+        # `state["implementation"]`，若那其实是**某一次调用**的产物（重问修正 / 两遍中间版 /
+        # 逐张施工图），在跑的实现就被缩成那一份 —— 上一轮 add 出的文件整份消失
+        # （真机 20260927-134222：17→4 条；150931：16→1 条）。
+        p_devs = sorted(patch_result.run_dir.glob("*-dev.json"))
+        check(bool(p_devs), "dev 阶段落了产物快照")
+        p_last = json.loads(p_devs[-1].read_text(encoding="utf-8")) if p_devs else {}
+        check((p_last.get("meta") or {}).get("note") == "dev-accumulated",
+              "最新的 dev 快照就是**累积实现**（不是某次调用的产物）",
+              str((p_last.get("meta") or {}).get("note")))
+        check(len((p_last.get("artifact") or {}).get("edits") or [])
+              == len((patch_state["artifacts"].get("implementation") or {}).get("edits") or []),
+              "快照与 state 里的实现一致（续跑不会缩水）",
+              f"{len((p_last.get('artifact') or {}).get('edits') or [])} vs "
+              f"{len((patch_state['artifacts'].get('implementation') or {}).get('edits') or [])}")
         review_trace = [t for t in runstore.read_traces(patch_result.run_dir) if t["stage"] == "review"][-1]
         check("补丁机械校验" in review_trace["user"], "补丁校验结论 pin 进评审 prompt")
         check("不可能是一次完整替换" in review_trace["user"] or "会留下原函数体" in review_trace["user"],
@@ -3812,6 +3839,44 @@ def main() -> int:
         _no_ver = [s for s in prompts.SYSTEM if s not in prompts.PROMPT_VERSIONS]
         _no_ver += [s for s in prompts.SYSTEM_NEW if s not in prompts.PROMPT_VERSIONS]
         check(not _no_ver, "每个阶段的系统提示词都登记了版本号", str(_no_ver))
+
+        # ---------------------------------------------------- 方案契约 vs schema 的一致性
+        # 真机 2026-09-27：系统提示词一直要求 tasks 每项带 symbols/test_hint（`_plan_contract_gaps`
+        # 也强制要求），而 `schemas.PLAN` 只声明了 5 个字段、且 `additionalProperties=false`
+        # （24/24 对象节点全封闭，ollama 的 `format` 是 grammar 约束）⇒ **模型结构上产不出这些
+        # 字段** ⇒ 每轮必报「12 项缺失 → 降级为提示」，`verify.contract_check` 永远 checked:0。
+        # 契约要求与 schema 允许不一致，等于该字段不存在 —— 这里把它钉住。
+        _plan_task_fields = [
+            "id", "title", "target_files", "acceptance", "depends_on",
+            "symbols", "interface", "contracts", "data_model", "constraints", "test_hint",
+        ]
+        _plan_allowed = sorted(
+            ((schemas.PLAN.get("properties") or {}).get("tasks") or {})
+            .get("items", {}).get("properties", {})
+        )
+        _missing_in_schema = [f for f in _plan_task_fields if f not in _plan_allowed]
+        check(
+            not _missing_in_schema,
+            "方案任务的**全部**字段都在 schemas.PLAN 里声明（封闭契约下漏声明=该字段产不出来）",
+            f"schema 缺 {_missing_in_schema}；schema 现有 {_plan_allowed}",
+        )
+        # 两个变体（二开 / 新建）必须描述同一套字段：只在一处要求、schema 又只认另一套，
+        # 正是这次踩的坑。
+        for _variant, _text in (
+            ("二开", prompts.SYSTEM.get("architect_plan", "")),
+            ("新建", prompts.SYSTEM_NEW.get("architect_plan", "") or ""),
+        ):
+            _absent = [f for f in _plan_task_fields if f not in _text]
+            check(
+                not _absent,
+                f"{_variant}变体的方案提示词描述了全部任务字段",
+                str(_absent),
+            )
+        check(
+            ((schemas.PLAN.get("properties") or {}).get("tasks") or {})
+            .get("items", {}).get("additionalProperties") is False,
+            "方案任务对象仍是封闭契约（新增字段必须显式声明）",
+        )
         check(
             prompts.prompt_version("dev") == f"dev.{prompts.PROMPT_VERSIONS['dev']}",
             "版本标识形如 <stage>.vN",
@@ -4392,6 +4457,47 @@ def main() -> int:
             "覆盖判定是 _audit_implementation 与 _missing_plan_files 共用的唯一真源",
             str(_cov["missing"]),
         )
+
+        # ---- 按 task 分派：调用契约 + 快照命名 ----
+        # 为什么单独锁这一档：mock 的合成方案只有 **1 张**施工图 ⇒ `per_task=[]` ⇒
+        # `_dev_by_tasks` **从来没被跑过**。于是真机 20260927-150931 踩到的
+        # `_grounded_call() got an unexpected keyword argument 'artifact_stage'`
+        # （整轮 5 张图全部"跳过"、本轮 0 产出）在冒烟里**一片绿**。
+        # 这里把它直接调起来，锁两件事：① kwargs 契约对得上；
+        # ② 逐张施工图的产物用**独立快照名**（不冒充 dev 阶段产物 —— 否则续跑时
+        #    `_restore` 会用"最后一张图"覆盖累积实现，越改越少）。
+        pt_repo = root / "_pertask_repo"
+        pt_repo.mkdir(parents=True, exist_ok=True)
+        (pt_repo / "mod.py").write_text(PATCH_REPO_SOURCE, encoding="utf-8")
+        pt_orch = make(root, "pertask", client=PatchClient(), repo=pt_repo)
+        pt_run = root / "pertask" / "20260927-pt"
+        pt_run.mkdir(parents=True, exist_ok=True)
+        pt_orch.run_id = "20260927-pt"
+        pt_orch.run_dir = pt_run
+        pt_orch.state = {
+            "plan": {
+                "changes": [{"path": "mod.py"}],
+                "tasks": [
+                    {"id": "T-01", "target_files": ["mod.py"]},
+                    {"id": "T-02", "target_files": ["mod.py"]},
+                ],
+            },
+            "scope": {},
+            "assessment": {},
+        }
+        try:
+            pt_merged = pt_orch._dev_by_tasks(
+                lambda **_: ["【施工图】"], ["pin"], pt_orch.state["plan"]["tasks"]
+            )
+            pt_ok, pt_err = bool((pt_merged or {}).get("edits")), ""
+        except Exception as exc:  # noqa: BLE001
+            pt_ok, pt_err = False, f"{type(exc).__name__}: {exc}"
+        check(pt_ok, "按 task 分派能跑通（_grounded_call 的 kwargs 契约对得上）", pt_err)
+        pt_names = sorted(p.name for p in pt_run.glob("*.json"))
+        check(any("dev-T-01" in n for n in pt_names),
+              "逐张施工图的产物用独立快照名（不占 dev 阶段槽位）", str(pt_names[:5]))
+        check(not [n for n in pt_names if n.endswith("-dev.json")],
+              "逐张施工图的调用**不写** dev 阶段快照（只有累积实现才配 dev 快照）", str(pt_names[:5]))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

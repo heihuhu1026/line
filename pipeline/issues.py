@@ -51,6 +51,7 @@ KINDS: list[str] = [
     "slow_call",
     "gpu_partial_offload",
     "prefill_degraded",
+    "stage_error",
     "ungrounded_path",
     "review_rework_architect",
     "review_required_fix",
@@ -99,6 +100,7 @@ KIND_CN: dict[str, str] = {
     "slow_call": "单次调用过慢",
     "gpu_partial_offload": "模型没全量上显存（环境问题）",
     "prefill_degraded": "推理吞吐退化一个数量级（服务需重启）",
+    "stage_error": "阶段异常中止（运行停在人工闸门，可续跑重试）",
     "ungrounded_path": "路径未接地（疑似编造）",
     "review_rework_architect": "评审判定方案返工",
     "review_required_fix": "评审要求必改项",
@@ -303,6 +305,18 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
             f"{warn.get('stage')} 产出 {len(paths)} 个未接地路径（疑似编造）",
             "、".join(paths[:12]),
             paths=paths[:12],
+        )
+
+    # 2.5) 阶段异常中止（`_execute` 顶层兜底落的痕）。**必须让人工看到**：它意味着
+    # 这一轮是**崩在半路**而不是跑完的，页面上的"还在跑"曾经骗过我们一次
+    # （真机 20260927-150931：符号补漏调用抛 OllamaError，白等 24 分钟才发现）。
+    for item in state.get("stage_errors") or []:
+        if not isinstance(item, dict):
+            continue
+        add(
+            "stage_error", str(item.get("stage") or "?"), "blocker", "system",
+            f"{item.get('stage')} 阶段异常中止（已停在人工闸门，可续跑重试）",
+            str(item.get("error") or "")[:400],
         )
 
     # 3) 评审各轮次的结论

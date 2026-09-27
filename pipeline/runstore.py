@@ -313,7 +313,11 @@ def stage_snapshots(run_dir: Path, include_superseded: bool = False) -> list[dic
                 "path": path,
                 "meta": payload.get("meta") or {},
                 "artifact": payload.get("artifact"),
+                # 完整输入（不再截断）与完整原始输出：优化提示词要靠它们
                 "request_preview": payload.get("request_preview") or "",
+                "system_prompt": payload.get("system_prompt") or "",
+                "response_text": payload.get("response_text") or "",
+                "response_thinking": payload.get("response_thinking") or "",
             }
         )
     return rows

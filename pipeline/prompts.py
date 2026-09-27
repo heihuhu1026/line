@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from .budget import distill_json, truncate_text
+from .config import MAX_PLAN_TASKS
 
 _TAIL = (
     "【输出要求】只输出一个符合给定 JSON Schema 的对象；不要输出解释、不要 markdown 代码块；"
@@ -184,9 +185,16 @@ SYSTEM: dict[str, str] = {
         "  · strategy 必须与 changes / tasks 自洽，并**写明技术栈（语言 + 运行环境）**；\n"
         "  · changes 每项 {path, intent, approach, minimality_reason}：minimality_reason **必须具体**，"
         "要讲清「为什么这是最小改法、相比其它做法少动了什么」，「改动少」这类空话不合格；\n"
-        "  · tasks 每项 {id, title, target_files, acceptance, depends_on}：id 按 T-01、T-02… 编号"
-        "（开发要用它填 covers_tasks，编号必须规范）；acceptance 必须能直接转成测试用例；"
-        "depends_on 只引用本方案里已定义的 id；\n"
+        "  · tasks 每项字段（**逐个填实；留空会被机械判缺并打回**）：\n"
+        "      id＝T-01/T-02… 编号（开发要用它填 covers_tasks，编号必须规范）；title＝一句话任务名；"
+        "target_files＝只引用 changes 里出现过的路径；acceptance＝能直接转成测试用例；"
+        "depends_on＝只引用本方案已定义的 id；\n"
+        "      symbols＝本 task 要定义/修改的符号名列表（它是**粒度**的机械判据，也是开发的自检清单）；\n"
+        "      interface＝本 task 对外暴露的签名（如 `add(amount, note)` 或 `Class.method(a)`）；\n"
+        "      contracts＝{exposes: [我提供给别处的符号], uses: [我依赖别处的符号]} —— "
+        "跨文件接口靠猜必然 `AttributeError`，写在这里各 task 才能独立施工还拼得上；\n"
+        "      data_model＝涉及的数据结构/字段（没有就留空串）；constraints＝本 task 必须遵守的约束；\n"
+        "      test_hint＝**一条可直接执行的验收命令**（它直接就是运行验证要跑的命令）。\n"
         "  · rollback 说明回滚方式；risks 记录本次变更引入的残余风险。\n"
         "步骤：① 读 PM 范围/验收标准与存量评估结论 → ② 逐文件设计最小侵入变更 → "
         "③ 拆任务并编号、给出依赖 → ④ 自检后输出 JSON。\n"
@@ -1235,6 +1243,11 @@ def plan_audit_block(audit: dict) -> str:
         lines.append(
             f"- **这些施工图没有声明 interface / contracts**：{'、'.join(audit['contracts_missing'])}"
             " —— 跨文件接口没写清，各张图独立施工必然拼不上，且无法被机械比对"
+        )
+    if audit.get("over_task_count"):
+        lines.append(
+            f"- **任务数超过上限**：最多 {MAX_PLAN_TASKS} 张施工图，请合并同类任务"
+            "（8K 上下文下 task 越多，后半段的字段越容易缩水）"
         )
     if audit.get("over_split"):
         lines.append(
@@ -2402,8 +2415,9 @@ SYSTEM_NEW: dict[str, str] = {
         "intent 说明该文件承载什么职责；approach 说明内部结构与关键设计；"
         "minimality_reason 说明**为什么这是最小可行设计**"
         "（不做过度的扩展性预留、更重的替代方案为什么不必要），「改动少」这类空话不合格；\n"
-        "  · tasks 每项 {id, title, target_files, acceptance, depends_on, symbols, interface, "
+        "  · tasks 每项 {id, title, change, target_files, acceptance, depends_on, symbols, interface, "
         "contracts, data_model, constraints, test_hint}：id 按 T-01、T-02… 编号"
+        "，change 用一句话写清「这次具体改成什么样」（DEV 最需要的一条，不能省）；"
         "（开发要用它填 covers_tasks，编号必须规范）；target_files 只能引用 changes 里出现过的路径；"
         "acceptance 必须可独立验收、能直接转成测试用例；depends_on 只引用本方案里已定义的 id；\n"
         "  · **每张 task 必须是一份完整施工图**：开发按 task 分派施工，**不再回头看需求与 PRD**，"
@@ -2421,9 +2435,14 @@ SYSTEM_NEW: dict[str, str] = {
         "超了说明这张图一轮写不完，**必须拆成多张**；反过来也别拆太碎 —— "
         "task 数超过 changes 文件数的 2 倍会被提示「拆过细」。\n"
         "  · rollback：说明整体回滚方式；risks 记录本次设计引入的残余风险。\n"
-        "执行步骤：① 承接 PRD，梳理核心需求、目标与验收标准；② 划分模块并明确职责边界；"
-        "③ 定义模块间接口与核心数据结构；④ 落成文件级 changes 并给出最小可行性理由；"
-        "⑤ 拆成可独立验收的任务并编号、给出依赖；⑥ 自检后输出 JSON。\n"
+        "**输出顺序（不得颠倒）**：① changes（变更边界）→ ② tasks（施工任务）→ "
+        "③ strategy / rollback / risks（解释，**可选，写不出来就留空**）。\n"
+        "为什么必须这个顺序：本阶段只有 8K 上下文 / 3K 输出预算。先写解释性文字会把预算吃光，"
+        "导致后半段的 tasks 缩水 —— 真机上表现为「前半方案质量高、后半 task 字段全空」。"
+        "**执行所需的信息必须排在前面，解释排在最后且可省**。\n"
+        "禁止：不要解释「为什么选这个方案」、不要写教程、不要复述代码现状 —— 只输出执行所需信息。\n"
+        "任务数量：最多 5 个 task。超过就**合并同类**，不要拆微小修改（同一文件被 3 张以上"
+        "施工图覆盖会被机械判负）。\n"
         "自检：① 有没有写具体代码实现？② 每个 changes[].path 都是本次新建的文件且职责单一吗？"
         "③ changes 与 tasks 相互覆盖了吗（有没有落单的文件或悬空的任务）？"
         "④ 有没有需求没要求的过度设计？⑤ 有没有编造技术组件或依赖？"
@@ -2558,7 +2577,14 @@ PROMPT_VERSIONS: dict[str, str] = {
     "intake": "v1",
     "pm": "v1",
     "architect_assess": "v1",
-    "architect_plan": "v1",
+    # v2：二开变体补齐了 tasks 的 6 个字段描述，与**新建变体、schemas.PLAN 三方对齐**。
+    # 起因（真机 2026-09-27）：新建变体一直要求 symbols/interface/contracts/data_model/
+    # constraints/test_hint，而 schemas.PLAN 只声明了 5 个字段且 additionalProperties=false
+    # （ollama 的 format 是 grammar 约束）⇒ 模型**结构上产不出**这些字段 ⇒
+    # `_plan_contract_gaps` 每轮必报缺、`verify.contract_check` 永远 checked:0。
+    # 二开变体的提示词原文**没变**（它本来就没提这 6 个字段），但它的契约口径跟着一起变了，
+    # 所以两个变体共用同一个版本号（避免"同一阶段两套口径却共用一个版本"更难归因）。
+    "architect_plan": "v2",
     "dev": "v1",
     "test": "v1",
     "review": "v1",

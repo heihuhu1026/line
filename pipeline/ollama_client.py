@@ -30,6 +30,90 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 #: 同 prompt 同上限重试必然在同一处再断，而「模型写错 JSON」重试才有意义。
 _DONE_REASON_LENGTH = "length"
 
+#: 撞上限后最多抬高几次上限。
+#: 真机 20260927-134222 实测：一次「输出陷入重复」的 dev 调用按 6144 → 12288 → 20161
+#: 连撞三次顶，白烧约 38k token（≈16 分钟）**最后还是失败**，两次跑到这里共约 30 分钟。
+#: 抬高上限只对「内容合法、只是写长了」有意义；对重复循环是纯粹的放大。
+_MAX_ESCALATIONS = 1
+#: 判定「输出陷入重复」后下压到的输出上限下限（逼它写短，而不是给更多空间重复）。
+_MIN_PREDICT = 512
+#: 判定重复时只看结尾这么多字符 —— 重复循环的表现是**尾部**在打转。
+_DEGENERATE_TAIL = 4000
+#: 同一行连续出现这么多次 ⇒ 判为重复循环。
+_DEGENERATE_RUN = 12
+#: 行数至少这么多、且不同行占比低于 ``_DEGENERATE_DISTINCT`` ⇒ 判为重复循环。
+_DEGENERATE_MIN_LINES = 30
+_DEGENERATE_DISTINCT = 0.25
+#: **字符级**兜底：`format=schema` 的产物常常整段没有换行（真机 20260927-134222 就是
+#: 这种 —— 行判据只看得到 1 行，完全抓不到重复）。判据用「周期性」而不是「固定窗口切分」：
+#: 后者在重复单元长度与窗口长度不整除时会**每刀错开相位**（实测：60 字符的重复单元
+#: 配 80 字符窗口 ⇒ 窗口各不相同、判不出来）。周期性判据与相位无关。
+_DEGENERATE_PERIOD_MIN = 4
+_DEGENERATE_PERIOD_MAX = 400
+#: 某个周期下「错位相同字符」的占比超过它就判为重复。
+_DEGENERATE_PERIOD_SAME = 0.9
+#: **n-gram 支配**判据：尾段里最常出现的 12-gram 若占了这个比例，判为重复。
+#: 真机 20260927-150931 的实际形态：`segment_segment_segment_…` 一路复述，但偶尔夹
+#: `_direction` / `, ` —— 周期性判据的"尾两轮必须完全相等"预筛被这种**脏重复**漏掉了。
+#: 正常代码里最常见的 12-gram 只出现个位数次，占比远低于阈值，不会误伤。
+_DEGENERATE_NGRAM = 12
+_DEGENERATE_NGRAM_SHARE = 0.5
+#: n-gram 判据只看尾部这么多字符（够看出支配性，又不至于被前面的正常代码稀释）。
+_DEGENERATE_NGRAM_WINDOW = 2000
+
+
+def _looks_degenerate(text: str) -> bool:
+    """输出尾段是否陷入**重复循环**（撞上限也写不完的那一类）。
+
+    为什么需要判它：`format=schema` 的语法约束**不阻止无限重复**（同一个对象反复写仍然
+    合法），于是 7B 偶尔会一直吐同一段内容直到撞 num_ctx 上限。这时抬高上限只会让它重复
+    得更久，必须改成压低上限 + 明确叫停。
+
+    判据刻意**保守**（宁可漏判，也不能误伤正常的长输出 —— 误判会让好产物被砍短）：
+      · 只看结尾 ``_DEGENERATE_TAIL`` 个字符；
+      · 非空行 > ``_DEGENERATE_MIN_LINES`` 且不同行占比 < ``_DEGENERATE_DISTINCT``；或
+      · 同一行连续出现 >= ``_DEGENERATE_RUN`` 次；或
+      · **存在某个短周期 p**，使「错位 p 位后字符仍相同」的占比 > ``_DEGENERATE_PERIOD_SAME``
+        —— 这一条专门兜「整段没有换行」的重复（真机 20260927-134222 的实际形态）。
+    正常产物（每行、每个周期都在描述不同东西）三个条件都不满足。
+    """
+    body = str(text or "")[-_DEGENERATE_TAIL:]
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if lines:
+        run = 1
+        for prev, cur in zip(lines, lines[1:]):
+            run = run + 1 if cur == prev else 1
+            if run >= _DEGENERATE_RUN:
+                return True
+        if len(lines) > _DEGENERATE_MIN_LINES and (
+            len(set(lines)) / len(lines) < _DEGENERATE_DISTINCT
+        ):
+            return True
+    # 字符级兜底（单行 / 无换行的 JSON 也要能判出来）。
+    # 周期**逐个试**而不是按固定步长扫：重复单元的长度是任意的（实测 58 个字符），
+    # 按 10 的倍数扫会全部错过。代价由下面的**廉价预筛**压住 —— 先比尾部相邻两轮，
+    # 不等就直接跳过，只有真正像周期的才做逐字符比对。
+    max_period = min(_DEGENERATE_PERIOD_MAX, len(body) // 4)
+    for period in range(_DEGENERATE_PERIOD_MIN, max_period + 1):
+        if body[-period:] != body[-2 * period : -period]:
+            continue
+        span = len(body) - period
+        same = sum(1 for i in range(span) if body[i] == body[i + period])
+        if same / span > _DEGENERATE_PERIOD_SAME:
+            return True
+    # n-gram 支配：缓一轮的**脏重复**（单元之间夹着零散差异）周期性预筛会漏掉，
+    # 但"某个短串吃掉了尾段一大块"这件事是稳的。
+    sample = body[-_DEGENERATE_NGRAM_WINDOW:]
+    if len(sample) >= 4 * _DEGENERATE_NGRAM:
+        counts: dict[str, int] = {}
+        for i in range(len(sample) - _DEGENERATE_NGRAM + 1):
+            gram = sample[i : i + _DEGENERATE_NGRAM]
+            counts[gram] = counts.get(gram, 0) + 1
+        top = max(counts.values(), default=0)
+        if top * _DEGENERATE_NGRAM >= len(sample) * _DEGENERATE_NGRAM_SHARE:
+            return True
+    return False
+
 #: 抬高输出上限时给 num_ctx 留的余量（token）。prompt 已占掉一部分，上限只能取剩下的再减它 ——
 #: 不留余量的话请求会顶到 ctx，ollama 会按 ctx 静默截断 prompt，症状比截断输出更难查。
 _CTX_SAFETY_MARGIN = 256
@@ -108,6 +192,7 @@ class OllamaClient:
         failed: list[dict] = []  # 未通过契约的那些原始输出也要留档（诊断提示词问题时最关键）
         # 本次实际使用的输出上限。撞到它被截断时会**调高**再试 —— 同上限重试是确定性白费。
         limit = num_predict or spec.num_predict
+        escalations = 0  # 已抬高上限的次数（上限见 _MAX_ESCALATIONS）
         for attempt in range(1, attempts + 1):
             prompt = base_user
             if attempt > 1:
@@ -178,6 +263,24 @@ class OllamaClient:
                 meta["schema_errors"] = [detail]
                 failed.append({"attempt": attempt, "errors": [detail], "raw": content[-3000:]})
                 last_errors = [detail]
+                if _looks_degenerate(content):
+                    # 重复循环：同 prompt 抬高上限必在同一处再陷，只是把白等放大一倍。
+                    # 改成**压低**上限逼它写短，并明确告诉它"你在重复"（换条件重试才有意义）。
+                    limit = max(_MIN_PREDICT, limit // 2)
+                    last_errors = [
+                        detail,
+                        "上次输出陷入**重复循环**：同一段内容反复写，撞上限也没写完。"
+                        "请只输出**最小合法**的 JSON —— 不要重复条目、不要复述输入、不要扩写。",
+                    ]
+                    continue
+                if escalations >= _MAX_ESCALATIONS:
+                    raise OllamaError(
+                        f"{spec.tag} 输出连续被截断，已抬高上限 {escalations} 次仍不完整"
+                        f"（当前上限 {limit} tok / num_ctx={spec.num_ctx}）。"
+                        "继续抬高只是重复烧算力 —— 请调大该阶段的 num_ctx，"
+                        "或让产物更短（拆分任务、减少条目）。"
+                        f"\n最后一次原始输出尾部：\n{content[-700:]}"
+                    )
                 room = spec.num_ctx - prompt_tokens - _CTX_SAFETY_MARGIN
                 raised = min(max(limit * 2, limit + 2048), room)
                 if raised <= limit:
@@ -189,6 +292,7 @@ class OllamaClient:
                         "或让产物更短（拆分任务、减少条目）。"
                     )
                 limit = raised
+                escalations += 1
                 continue
 
             try:
