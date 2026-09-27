@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,7 +23,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import server, runstore  # noqa: E402
+# 隔离**本机配置**（`pipeline/config.local.json`，操作页面「配置」页写入的那份）。
+#
+# 为什么必须做：本套断言里有多条是**针对代码默认闸门行为**的 —— 例如「10 个阶段产物
+# （含人工审核）」「旧产物归档 6 份」。而 `config.apply_overrides()` 会在导入时把
+# config.local.json 的覆盖应用到全局，**服务端起的子进程也照样读到它**：
+# 本机把 human_review_gate 关掉后，human_review 阶段根本不会出现，那两条断言立刻失败
+# （实测 123/127；指开配置即恢复 —— 与 smoke_mock 头部记录的是同一类假阴性）。
+# 覆盖机制本身另有断言去验，这里只保证「代码默认配置下的行为」这一层是干净的。
+if not os.environ.get("PIPELINE_LOCAL_CONFIG"):
+    os.environ["PIPELINE_LOCAL_CONFIG"] = str(
+        Path(tempfile.gettempdir()) / "pipeline_smoke_console_no_local_config.json"
+    )
+
+from pipeline import prompts, runstore, server  # noqa: E402
 
 failures: list[str] = []
 checks = 0
@@ -55,6 +69,23 @@ def call(port: int, path: str, payload: dict | None = None, method: str = "GET")
             return exc.code, body
 
 
+def _stuck_detail(run_id: str, want: set[str], timeout: float, last: dict) -> str:
+    """超时断言的消息：把**所有能解释"为什么没到"的字段都摊开**。
+
+    真机教训：这条断言偶发失败过两次（mock 运行 0.3s 就跑完，却等满 90s），
+    当时的消息只打了一坨 state，看不出是"进程没起来""被别人占着"还是"续跑被拒"。
+    自诊断比事后猜便宜得多 —— 下次它再出现，消息里就有答案。
+    """
+    state = last.get("state") or {}
+    return (
+        f"{run_id} 未在 {timeout}s 内进入 {want}；"
+        f"status={state.get('status')!r} running={last.get('running')!r} "
+        f"orphaned={last.get('orphaned')!r} presence={last.get('presence')!r} "
+        f"busy_with={last.get('busy_with')!r} resume_error={last.get('resume_error')!r}；"
+        f"最后状态={state}"
+    )
+
+
 def wait_done(port: int, run_id: str, want: set[str], timeout: float = 90.0) -> dict:
     deadline = time.time() + timeout
     last: dict = {}
@@ -66,7 +97,26 @@ def wait_done(port: int, run_id: str, want: set[str], timeout: float = 90.0) -> 
             if state.get("status") in want and not detail.get("running"):
                 return detail
         time.sleep(0.35)
-    raise AssertionError(f"{run_id} 未在 {timeout}s 内进入 {want}；最后状态={last.get('state')}")
+    raise AssertionError(_stuck_detail(run_id, want, timeout, last))
+
+
+def wait_paused(port: int, run_id: str, stage: str, timeout: float = 60.0) -> dict:
+    """等到该运行**再次停在**指定闸门上（PM 强控复核用它：判据没解决就不放行）。"""
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        code, detail = call(port, f"/api/runs/{run_id}")
+        if code == 200 and isinstance(detail, dict):
+            last = detail
+            state = detail.get("state") or {}
+            if (
+                state.get("status") == "paused"
+                and state.get("paused_after") == stage
+                and not detail.get("running")
+            ):
+                return detail
+        time.sleep(0.35)
+    raise AssertionError(f"{run_id} 未停在 {stage}；最后状态={last.get('state')}")
 
 
 def wait_done_with_gate(port: int, run_id: str, want: set[str], timeout: float = 90.0) -> dict:
@@ -98,9 +148,13 @@ def wait_done_with_gate(port: int, run_id: str, want: set[str], timeout: float =
                     },
                     "POST",
                 )
-                call(port, f"/api/runs/{run_id}/resume", {}, "POST")
+                code2, payload2 = call(port, f"/api/runs/{run_id}/resume", {}, "POST")
+                # 续跑被拒必须**说出来**：单驻留下 409（已有别的运行在跑）以前被无声吞掉，
+                # 于是"续跑没生效"表现成 90 秒后的一个超时，完全看不出原因。
+                if code2 != 200:
+                    last["resume_error"] = {"code": code2, "body": payload2}
         time.sleep(0.35)
-    raise AssertionError(f"{run_id} 未在 {timeout}s 内进入 {want}；最后状态={last.get('state')}")
+    raise AssertionError(_stuck_detail(run_id, want, timeout, last))
 
 
 def check_frontend_syntax() -> None:
@@ -141,6 +195,43 @@ def main() -> int:
             "页面把 needs_human 当作可操作相位（否则触顶的运行在页面上无路可走）",
         )
         check("人工审核打回" in page or "回流上限" in page, "页面文案提到人工介入与预算的关系")
+        # 缺 state.json 不等于「不能续跑」：入口总闸（GA）期间的运行、以及被拆成作业的运行，
+        # 都**本来就没有** state.json（真机 20260926-154413 因此被页面劝退到「只能查看」）。
+        check(
+            "正在<b>入口总闸</b>（规模判定）阶段" in page,
+            "进程还在跑但缺 state 时，文案指向入口总闸而不是「不能续跑」",
+        )
+        check(
+            'st === "job"' in page and "拆分为作业" in page,
+            "列表区分「拆分为作业」与「启动失败」（不再把跑得好的大运行说成失败）",
+        )
+        # 子进程 stdout 重定向到文件时 Python 会块缓冲（8KB 才落盘）—— 不显式关掉，
+        # 页面日志视图整段滞后，GA 那几分钟更是一个字节都没有。
+        _real_popen = server.subprocess.Popen
+        _spawn_seen: dict = {}
+
+        class _CapturePopen:
+            def __init__(self, args, **kwargs):
+                _spawn_seen["args"] = args
+                _spawn_seen["env"] = kwargs.get("env") or {}
+                self.returncode = 0
+
+            def poll(self):
+                return None
+
+        server.subprocess.Popen = _CapturePopen
+        try:
+            server._spawn("smoke-spawn", ["python", "-c", "pass"],
+                          root / "smoke-spawn" / runstore.LOG_NAME)
+        finally:
+            server.subprocess.Popen = _real_popen
+            server._JOBS.pop("smoke-spawn", None)
+            shutil.rmtree(root / "smoke-spawn", ignore_errors=True)
+        check(
+            (_spawn_seen.get("env") or {}).get("PYTHONUNBUFFERED") == "1",
+            "子进程带 PYTHONUNBUFFERED=1（页面日志才能实时跟随，而不是攒够 8KB 才刷新）",
+            f"PYTHONUNBUFFERED={( _spawn_seen.get('env') or {}).get('PYTHONUNBUFFERED')}",
+        )
 
         print("\n== 新建运行（人工闸门 pm）")
         code, created = call(
@@ -182,15 +273,18 @@ def main() -> int:
         snap0 = next((s for s in detail0["stages"] if s["stage"] == "intake"), None)
         art0 = (snap0 or {}).get("artifact") or {}
         payload = []
-        for x in art0.get("missing_elements") or []:
-            if isinstance(x, dict) and x.get("element"):
+        # 用**产品自己的访问器**读待确认项：契约已从「missing_elements + clarifying_questions
+        # 两个列表」合并为「pending_items 一个列表」，intake_items() 两种形状都认。
+        # 以前这里直接读旧字段名 —— 契约迁移后本段永远拿到空列表，于是
+        # 「裁决并回补强产物」这条路径**静默失去覆盖**（后面几条断言退化成 0==0 恒真，
+        # 而需要真有条目才能成立的两条则恒假）。
+        for x in prompts.intake_items(art0):
+            if x.get("element"):
                 payload.append({"kind": "missing_element", "ref": str(x["element"]),
                                 "decision": "裁决-" + str(x["element"])})
-        for x in art0.get("clarifying_questions") or []:
-            if isinstance(x, dict) and x.get("question"):
-                payload.append({"kind": "clarifying_question", "ref": str(x["question"]),
-                                "decision": "裁决-" + str(x["question"])})
         real = len(payload)
+        check(real > 0, "补强产物里能读出待确认项（否则本段测试形同虚设）",
+              str(prompts.intake_items(art0)[:2]))
         payload.append({"kind": "clarifying_question", "ref": "__不存在的条目__", "decision": "未匹配也应保留"})
         payload.append({"kind": "clarifying_question", "ref": "（这条没填裁决）", "decision": "   "})
 
@@ -202,8 +296,7 @@ def main() -> int:
         detail1 = call(port, f"/api/runs/{run_id}")[1]
         snap1 = next((s for s in detail1["stages"] if s["stage"] == "intake"), None)
         art1 = (snap1 or {}).get("artifact") or {}
-        decided = [x for x in (art1.get("missing_elements") or []) + (art1.get("clarifying_questions") or [])
-                   if isinstance(x, dict) and x.get("final_decision")]
+        decided = [x for x in prompts.intake_items(art1) if x.get("final_decision")]
         check(len(decided) == real, "补强产物（终稿）里带上 final_decision", str(len(decided)))
         check(
             bool(decided) and str(decided[0].get("default_assumption") or decided[0].get("suggested_answer") or ""),
@@ -287,6 +380,29 @@ def main() -> int:
         check(code == 409, "未落盘的阶段拒绝保存", f"HTTP {code}")
         code, _ = call(port, f"/api/runs/{run_id}/artifact", {"stage": "nope", "artifact": {}}, "POST")
         check(code == 400, "未知阶段被拒绝", f"HTTP {code}")
+
+        print("\n== PM 强控：未明确项没解决就不放行")
+        # 到这里 open_questions 已裁决，但产物里还有「未明确项」（unknowns /
+        # clarifying_questions）—— 它们同样"不是陈述"，强控要求解决完才放行。
+        code, _ = call(port, f"/api/runs/{run_id}/resume", {"pause_after": []}, "POST")
+        check(code == 200, "未解决未明确项时请求继续执行", f"HTTP {code}")
+        held = wait_paused(port, run_id, "pm")
+        check(
+            (held.get("state") or {}).get("paused_after") == "pm",
+            "还有未明确项时续跑被原地挡住（不放行，也不推进任何阶段）",
+        )
+        # 人工把未明确项写成确定结论：等价动作是把这两列清空（写成陈述后它们就不该再有内容）
+        pm_now = next((s for s in held["stages"] if s["stage"] == "pm"), None) or {}
+        fixed = dict(pm_now.get("artifact") or {})
+        cleared = sum(len(fixed.get(f) or []) for f in ("unknowns", "clarifying_questions"))
+        for field in ("unknowns", "clarifying_questions"):
+            fixed[field] = []
+        code, _ = call(port, f"/api/runs/{run_id}/artifact", {"stage": "pm", "artifact": fixed}, "POST")
+        check(
+            code == 200 and cleared > 0,
+            "人工把未明确项写成陈述（清空 unknowns / clarifying_questions）",
+            f"{cleared} 条",
+        )
 
         print("\n== 带人工意见继续执行")
         code, resumed = call(
@@ -457,6 +573,80 @@ def main() -> int:
               str([r["run_id"] for r in rows["runs"]]))
         check(bool(dead_row) and dead_row["status"] == "failed", "列表标记为启动失败",
               str(dead_row and dead_row["status"]))
+        # 被入口总闸拆成作业的运行同样只有 console.log，但多一份 gateway.json 指针：
+        # 它**根本不会有** state.json（产物在 runs/_jobs/<job_id>/），必须与「启动失败」分开，
+        # 否则页面会把一个跑得好好的大运行说成失败（真机 20260926-154413 就是这样）。
+        split = root / "smoke-split"
+        split.mkdir()
+        (split / runstore.LOG_NAME).write_text(
+            "== 规模路由：large（gateway）→ 拆分为 5 个模块\n", encoding="utf-8"
+        )
+        (split / runstore.GATEWAY_LINK_NAME).write_text(
+            json.dumps({
+                "job_id": "job-smoke-1",
+                "scale": "large",
+                "reasons": ["拆出 5 个模块"],
+                "status": "running",
+                "modules": 5,
+                "job_dir": str(root / "_jobs" / "job-smoke-1"),
+            }),
+            encoding="utf-8",
+        )
+        code, rows = call(port, "/api/runs")
+        split_row = next((r for r in rows["runs"] if r["run_id"] == "smoke-split"), None)
+        check(bool(split_row) and split_row["status"] == "job",
+              "拆成作业的运行标为 job（不再误报「启动失败」）",
+              str(split_row and split_row["status"]))
+        code, split_det = call(port, "/api/runs/smoke-split")
+        check(code == 200 and (split_det.get("gateway") or {}).get("job_id") == "job-smoke-1",
+              "详情带上作业指针（页面据此给正解，而不是「不能续跑」）",
+              str(split_det.get("gateway")))
+        # 入口总闸的「正在判定」痕迹与日志来源：前者让 GA 期间不再是一条空运行，
+        # 后者让模块运行（没有自己的 console.log）能回退显示作业日志。
+        check("ga" in split_det and "log_source" in split_det,
+              "详情带入口总闸痕迹字段与日志来源字段",
+              f"ga={split_det.get('ga')!r} log_source={split_det.get('log_source')!r}")
+        shutil.rmtree(split, ignore_errors=True)
+
+        # 页面读的是 run_detail 的**白名单 state 视图**（不是整份快照）：产物层的键必须被摊平
+        # 上来，否则会出现「流水线写了、日志也打了、页面一片干净」（真机校准踩到）。
+        ruled = root / "smoke-rules"
+        ruled.mkdir()
+        runstore.write_json(ruled / runstore.STATE_NAME, {
+            "status": "done",
+            "cursor": "done",
+            "artifacts": {
+                "rule_findings": [{"rule": "secret_in_code", "severity": "blocker",
+                                   "title": "硬编码密钥", "path": "config.py", "line": 1}],
+                "refuted_blockers": ["旧的语法错阻断项"],
+                "verify_report": {"verdict": "pass", "unverified": ["覆盖率未测量"]},
+            },
+        })
+        code, ruled_det = call(port, "/api/runs/smoke-rules")
+        ruled_state = (ruled_det or {}).get("state") or {}
+        check(
+            code == 200 and bool(ruled_state.get("rule_findings"))
+            and bool(ruled_state.get("refuted_blockers")),
+            "详情把产物层的红线/被证伪项摊平给页面（防「页面一片干净」）",
+            f"rule_findings={len(ruled_state.get('rule_findings') or [])} "
+            f"refuted={len(ruled_state.get('refuted_blockers') or [])}",
+        )
+        shutil.rmtree(ruled, ignore_errors=True)
+
+        # 规则库清单接口：它是「补丁能不能落盘」的判负来源，必须能被看到与审阅
+        # （以前 catalog() 写好了却没人调用 —— 哪些红线在管你只能翻 json）。
+        code, rule_payload = call(port, "/api/rules")
+        rules_rows = rule_payload.get("rules") if isinstance(rule_payload, dict) else None
+        check(code == 200 and len(rules_rows or []) >= 12,
+              "规则库清单接口可用（配置页据此渲染）", str(len(rules_rows or [])))
+        check(
+            all(str(r.get("negative") or "").strip() for r in (rules_rows or [])),
+            "清单里每条规则都带反例判据（可证伪才允许判负）",
+        )
+        check(
+            any(r.get("severity") == "blocker" for r in (rules_rows or [])),
+            "清单能区分阻断级与提示级",
+        )
         # 无关空目录不能被当成运行列进来
         (root / "smoke-junk").mkdir()
         code, rows2 = call(port, "/api/runs")
@@ -561,6 +751,102 @@ def main() -> int:
         check(code == 404, "未知作业返回 404", f"HTTP {code}")
         code, _ = call(port, "/api/jobs/nosuchjob/resume", {}, "POST")
         check(code == 404, "续跑未知作业返回 404", f"HTTP {code}")
+
+        # 续跑作业的参数透传：argv 是唯一可信观察点。
+        # 此前这条链**无条件**发 --no-pause，且从不带 --project-type —— 于是作业原本的
+        # 闸门被清空、新建项目的模块被当成二次开发重跑（真机 job-20260926-154657）。
+        job_id = "job-smoke-resume"
+        job_root = root / "_jobs" / job_id
+        job_root.mkdir(parents=True, exist_ok=True)
+        (job_root / "job.json").write_text(
+            json.dumps({
+                "version": 1, "job_id": job_id, "modules": [], "execution_order": [],
+                "project_type": "new", "review_every": 3, "max_rework": 5,
+                "pause_after": ["pm"], "repo": None, "forbidden": [],
+            }),
+            encoding="utf-8",
+        )
+
+        def _wait_job_child(rid: str) -> None:
+            for _ in range(80):
+                j = server._job(rid)
+                if not j or not j.get("running"):
+                    server._JOBS.pop(rid, None)
+                    return
+                time.sleep(0.25)
+
+        code, started = call(port, f"/api/jobs/{job_id}/resume", {}, "POST")
+        argv = (started or {}).get("argv") or []
+        _wait_job_child(job_id)
+        check(
+            code == 200 and "--resume-job" in argv and job_id in argv
+            and "--project-type" not in argv and "--no-pause" not in argv,
+            "续跑作业：没显式给参数时不冒充（不再无条件 --no-pause，也不覆盖项目类型）",
+            str(argv),
+        )
+        code, started2 = call(
+            port,
+            f"/api/jobs/{job_id}/resume",
+            {"project_type": "new", "review_every": 3, "max_rework": 7, "pause_after": ["pm"]},
+            "POST",
+        )
+        argv2 = (started2 or {}).get("argv") or []
+        _wait_job_child(job_id)
+        check(
+            code == 200 and "--project-type" in argv2 and "new" in argv2
+            and "--review-every" in argv2 and "--max-rework" in argv2
+            and "--pause-after" in argv2 and "--no-pause" not in argv2,
+            "续跑作业：显式参数照样下传（含闸门，而不是一律 --no-pause）",
+            str(argv2),
+        )
+        code, started3 = call(port, f"/api/jobs/{job_id}/resume", {"pause_after": []}, "POST")
+        argv3 = (started3 or {}).get("argv") or []
+        _wait_job_child(job_id)
+        check(code == 200 and "--no-pause" in argv3, "显式给空闸门＝跑到底（--no-pause）", str(argv3))
+
+        # 作业三阶段：相位视图 + PM 统一人工环节的闸门 + 统一验收接口
+        pm_job = "job-smoke-pm"
+        pm_root = root / "_jobs" / pm_job
+        (pm_root / "modules").mkdir(parents=True, exist_ok=True)
+        (pm_root / "modules" / "01-M-01.md").write_text("需求：模块一", encoding="utf-8")
+        (pm_root / "job.json").write_text(
+            json.dumps({
+                "version": 1, "job_id": pm_job, "phase": "pm",
+                "modules": [{"module_id": "M-01", "status": "pm_paused", "run_dir": None}],
+                "execution_order": ["M-01"], "repo": None, "forbidden": [],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        code, err = call(port, f"/api/jobs/{pm_job}/resume", {}, "POST")
+        check(
+            code == 409 and "PM 待确认项" in str(err),
+            "PM 没确认完就续跑 → 409 并说明原因（统一人工环节的闸门）",
+            f"HTTP {code} {err}",
+        )
+        code, view = call(port, f"/api/jobs/{pm_job}")
+        check(
+            view.get("phase") == "pm" and "PM 前置阶段" in str(view.get("phase_cn"))
+            and "M-01" in (view.get("pm_blockers") or {}),
+            "作业视图带相位与 PM 待确认聚合（页面据此显示「待你确认 PM」）",
+            f"phase={view.get('phase')} blockers={sorted((view.get('pm_blockers') or {}))}",
+        )
+        code, err = call(port, f"/api/jobs/{pm_job}/review", {"verdict": "approve"}, "POST")
+        check(code == 409, "模块还没跑完就提交统一验收 → 409", f"HTTP {code} {err}")
+        code, err = call(port, f"/api/jobs/{pm_job}/review", {"verdict": "bogus"}, "POST")
+        check(code == 400, "统一验收 verdict 非法被拒绝", f"HTTP {code}")
+        (pm_root / "human_review.json").write_text(
+            json.dumps({"verdict": "", "modules": []}, ensure_ascii=False), encoding="utf-8"
+        )
+        code, err = call(port, f"/api/jobs/{pm_job}/review", {"verdict": "reject"}, "POST")
+        check(code == 400, "统一验收打回必须写明问题（否则各模块不知道改什么）", f"HTTP {code}")
+        code, res = call(
+            port, f"/api/jobs/{pm_job}/review", {"verdict": "approve", "notes": "整体通过"}, "POST"
+        )
+        check(
+            code == 200 and res.get("phase") == "done" and res.get("status") == "done",
+            "统一验收通过 → 作业 phase=done / status=done",
+            str(res),
+        )
 
         code, err = call(port, "/api/runs", {"requirement": "x", "gateway": "bogus"}, "POST")
         check(code == 400, "未知 gateway 模式被拒绝", f"HTTP {code}")

@@ -29,7 +29,7 @@ from typing import Any
 
 from . import config, prompts
 from .budget import estimate_tokens, fit_prompt
-from .ollama_client import MockClient, OllamaClient
+from .ollama_client import OllamaClient
 from .schemas import ADVICE
 
 #: 问答线程的相对目录（放在 run 目录下，与 verify/ patches/ 同级）
@@ -48,7 +48,8 @@ def read_thread(run_dir: str | Path, stage: str) -> list[dict]:
     """读该阶段的问答线程（按写入顺序）。
 
     文件不存在、某一行损坏都只是跳过 —— 线程是**留痕**，不该因为一行脏数据
-    让整个裁决环节打不开。
+    让整个裁决环节打不开。但跳过要**留痕**（见 ``_warn_bad_line``）：
+    以前是裸 ``continue``，写坏的行会被永久静默吞掉，事后无从排查。
     """
     path = thread_path(run_dir, stage)
     if not path.is_file():
@@ -58,17 +59,38 @@ def read_thread(run_dir: str | Path, stage: str) -> list[dict]:
     except OSError:
         return []
     out: list[dict] = []
-    for line in raw.splitlines():
+    for no, line in enumerate(raw.splitlines(), 1):
         line = line.strip()
         if not line:
             continue
         try:
             row = json.loads(line)
-        except ValueError:
+        except ValueError as exc:
+            _warn_bad_line(path, no, exc)
             continue
         if isinstance(row, dict):
             out.append(row)
     return out
+
+
+#: 每个线程文件最多报几次脏行。read_thread 会被操作页面**轮询**调用，
+#: 不去重的话一行坏数据会每轮询一次刷一屏；键是文件路径，数量与线程文件数同阶。
+_BAD_LINE_WARNED: dict[str, int] = {}
+_BAD_LINE_WARN_LIMIT = 5
+_BAD_LINE_WARN_CAP = 2000
+
+
+def _warn_bad_line(path: Path, lineno: int, exc: Exception) -> None:
+    """脏行告警（去重 + 有上限），既不静默也不刷屏。"""
+    key = str(path)
+    seen = _BAD_LINE_WARNED.get(key, 0)
+    if seen >= _BAD_LINE_WARN_LIMIT:
+        return
+    if len(_BAD_LINE_WARNED) >= _BAD_LINE_WARN_CAP:
+        _BAD_LINE_WARNED.clear()  # 防御无界增长；清空后最多再报一轮
+    _BAD_LINE_WARNED[key] = seen + 1
+    tail = f"（{path.name} 后续同类告警不再重复）" if seen + 1 >= _BAD_LINE_WARN_LIMIT else ""
+    print(f"[advice] {path} 第 {lineno} 行不是合法 JSON，已跳过：{exc}{tail}")
 
 
 def _append(run_dir: str | Path, stage: str, turn: dict) -> None:

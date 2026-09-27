@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -43,6 +44,7 @@ from . import local_config
 from . import prd as prd_mod
 from . import presence
 from . import prompts as prompts_mod
+from . import rules as rules_mod
 from . import runstore
 from . import verify as verify_mod
 from .config import RUNS_DIR
@@ -61,12 +63,36 @@ _JOBS_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------- 子进程
+def _count_pm_merges(artifact: Any, decisions: list[dict]) -> int:
+    """有几条裁决**真的落到了 PM 产物上**，只用于页面的「其中 N 条并回产物」提示。
+
+    - ``open_questions`` 按问题文本匹配；
+    - 两列未明确项（unknowns / clarifying_questions）按条目文本匹配。
+
+    不参与任何判定：强控闸门看的是产物**最终的**状态（见 ``orchestrator._pm_unresolved``）。
+    """
+    if not isinstance(artifact, dict):
+        return 0
+    refs = {
+        str(e.get("question") or "").strip()
+        for e in (artifact.get("open_questions") or [])
+        if isinstance(e, dict)
+    }
+    for field in prompts_mod.PM_VAGUE_FIELDS:
+        refs.update(prompts_mod.pm_vague_text(x) for x in (artifact.get(field) or []))
+    refs.discard("")
+    return sum(1 for d in decisions if str(d.get("ref") or "").strip() in refs)
+
+
 def _job(run_id: str) -> dict[str, Any] | None:
     with _JOBS_LOCK:
         job = _JOBS.get(run_id)
         if job and job["proc"].poll() is not None:
             job["exit_code"] = job["proc"].returncode
             job["running"] = False
+            # 退出原因只算一次：读日志有 IO 开销，而 _job 会被页面轮询反复调到。
+            if job.get("exit_reason") is None:
+                job["exit_reason"] = _exit_reason(job)
             return job
         return job
 
@@ -108,6 +134,11 @@ def _spawn(run_id: str, args: list[str], log_path: Path) -> dict[str, Any]:
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    # 子进程的 stdout 被重定向到 console.log（**不是终端**）⇒ Python 默认块缓冲，
+    # 攒满 8KB 才落盘一次。后果是页面日志视图整段滞后，而「入口总闸」(GA, 14B 几十秒
+    # 到几分钟) 期间一行都不写 ⇒ 用户看到的是一个 0 字节文件 + 一条空运行记录，
+    # 无从判断它到底在跑还是卡死（真机 20260926-154413）。逐行 flush 后这些都能实时看到。
+    env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("PIPELINE_RUNS_DIR", str(RUNS_DIR))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fh = log_path.open("a", encoding="utf-8")
@@ -115,7 +146,10 @@ def _spawn(run_id: str, args: list[str], log_path: Path) -> dict[str, Any]:
     proc = subprocess.Popen(  # noqa: S603
         args, cwd=str(ROOT), stdout=fh, stderr=subprocess.STDOUT, env=env, creationflags=creation
     )
-    job = {"proc": proc, "log": log_path, "started": time.time(), "argv": args, "running": True}
+    job = {
+        "proc": proc, "log": log_path, "started": time.time(), "argv": args, "running": True,
+        "exit_code": None, "exit_reason": None,
+    }
     with _JOBS_LOCK:
         _JOBS[run_id] = job
     return job
@@ -132,6 +166,29 @@ def shutdown_jobs(grace: float = 1.0) -> None:
         time.sleep(grace)
 
 
+_MODULE_RUN_RE = re.compile(r"^(job-.+)-M-\d+$")
+
+
+def _job_log_path(run_id: str, runs_dir: Path) -> Path | None:
+    """模块运行（``job-…-M-01``）所属作业的日志路径；不是模块运行就返回 None。
+
+    模块运行**不写自己的 console.log**：整组模块跑在一个子进程里，日志都落在发起运行的
+    那份日志/作业目录里。于是点进模块详情，「执行日志」永远是空的（显示成"该阶段暂无日志"），
+    看着很像卡死 —— 真机上就有人这么以为。这里给出回退目标。
+    """
+    match = _MODULE_RUN_RE.match(str(run_id or ""))
+    if not match:
+        return None
+    candidates = [
+        runs_dir / gateway.JOBS_DIRNAME / match.group(1) / runstore.LOG_NAME,
+        runs_dir / match.group(1) / runstore.LOG_NAME,
+    ]
+    for path in candidates:
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
 def _log_tail(path: Path, lines: int = 400) -> str:
     if not path.exists():
         return ""
@@ -142,7 +199,50 @@ def _log_tail(path: Path, lines: int = 400) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def _exit_reason(job: dict[str, Any]) -> str:
+    """子进程退出原因 —— 从日志尾部现摘，页面不必再自己去翻 console.log。
+
+    原先只留 ``exit_code``：页面显示「已退出（码 1）」，而真正的报错在
+    ``runs/<id>/console.log`` 的最后几行 —— 人得先找到那次运行、再翻到文件末尾。
+    而最常见的情形恰恰就是一行 Python 异常（未捕获的异常退出码就是 1），
+    把它直接摘出来，能省掉这一整趟。
+    """
+    code = job.get("exit_code")
+    log = job.get("log")
+    if code == 0:
+        return "正常结束（码 0）"
+    lines: list[str] = []
+    if log is not None:
+        lines = [s.strip() for s in _log_tail(Path(log), 30).splitlines() if s.strip()]
+    if not lines:
+        return f"异常退出（码 {code if code is not None else '未知'}），日志末尾没有内容"
+    # 末尾 3 行通常就是「异常类型 + 消息」；压成一行便于页面单行展示
+    hint = " | ".join(lines[-3:])
+    if len(hint) > 300:
+        hint = hint[:300] + "…"
+    return f"异常退出（码 {code}）：{hint}"
+
+
 # --------------------------------------------------------------------- HTTP
+#: 安全响应头。服务只监听 127.0.0.1（单用户本机工具），收益本来就有限，但成本是零：
+#:   · ``nosniff`` —— 挡住「浏览器把响应体按内容猜成别的类型」这条老路；
+#:   · CSP —— 页面是**完全自包含**的单文件：实测 0 个外部 script/link、无 eval/new Function、
+#:     无 Worker/blob、无内联事件处理器，只有 1 个内联 <script> 与若干 style 属性。
+#:     所以放开 ``'unsafe-inline'`` 就够，不需要任何外部源 —— 也就不会打破任何功能。
+#:     （改页面时若引入 CDN 或 eval，这里会立刻拦住它，这正是想要的效果。）
+#:   · Referrer-Policy —— 本地页面不该把地址漏给任何后续请求。
+_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    ),
+    ("Referrer-Policy", "no-referrer"),
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "pipeline-console"
     runs_dir: Path = RUNS_DIR
@@ -156,6 +256,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in _SECURITY_HEADERS:
+            self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -205,6 +307,14 @@ class Handler(BaseHTTPRequestHandler):
             if parts[1] == "report":
                 report = issues_mod.build_report(self.runs_dir)
                 return self._json(200, {"report": report, "markdown": issues_mod.report_markdown(report)})
+            if parts[1] == "rules":
+                # 规则库清单：它是「补丁能不能落盘」的判负来源，必须能被看到与审阅
+                # （以前 catalog() 写好了却没人调用 —— 哪些红线在管你只能翻 json）。
+                rules_mod.load(force=True)  # 每次请求重读：改了 rules.json 存盘即生效
+                return self._json(200, {
+                    "rules": rules_mod.catalog(),
+                    "notes": rules_mod.load_notes(),
+                })
             if parts[1] == "kinds":
                 return self._json(200, {
                     "kinds": [{"kind": k, "label": issues_mod.KIND_CN.get(k, k)} for k in issues_mod.KINDS]
@@ -305,6 +415,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._create_run()
             if parts[1:2] == ["jobs"] and len(parts) == 4 and parts[3] == "resume":
                 return self._resume_gateway_job(parts[2])
+            if parts[1:2] == ["jobs"] and len(parts) == 4 and parts[3] == "review":
+                return self._submit_job_review(parts[2])
             if parts[1:2] == ["runs"] and len(parts) == 4:
                 run_id = parts[2]
                 if not RUN_ID_RE.match(run_id):
@@ -372,6 +484,11 @@ class Handler(BaseHTTPRequestHandler):
             # 列表与详情必须给同一个判据 —— 只给详情算的话，列表里这一行会退化成
             # 原始英文 `running`，看着像还在跑。
             row["orphaned"] = bool(not live and str(row.get("status") or "") == "running")
+            # 退出原因（只对本服务起的孩子、且已退出时有值）：列表里一眼能看到
+            # 「为什么退出了」，不必先点进详情再翻日志末尾。
+            _j = _job(row["run_id"])
+            if _j and not _j.get("running") and _j.get("exit_reason"):
+                row["exit_reason"] = _j["exit_reason"]
             if mark:
                 # 注册表里没有、但进程还活着（服务端重启过）：页面据此说明真相，
                 # 否则会显示成「已中断」并亮出续跑按钮 —— 点下去就是第二个进程。
@@ -597,6 +714,9 @@ class Handler(BaseHTTPRequestHandler):
             (job.get("started") if job else None)
             or (mark or {}).get("started_at")
         )
+        # 退出原因（只对「本服务起的、且已退出」的孩子有值）：详情页直接显示，
+        # 省掉「找到 console.log 再翻到末尾」这一步。
+        detail["exit_reason"] = (job or {}).get("exit_reason") if not detail["running"] else None
         detail["busy_with"] = _any_running()
         detail["stages_order"] = ONLY_STAGES
         detail["current_cursor"] = (detail.get("state") or {}).get("cursor")
@@ -609,7 +729,22 @@ class Handler(BaseHTTPRequestHandler):
         detail["issue_kinds"] = [
             {"kind": kind, "label": issues_mod.KIND_CN.get(kind, kind)} for kind in issues_mod.KINDS
         ]
-        detail["log"] = _log_tail(run_dir / runstore.LOG_NAME, 200 if detail["running"] else 120)
+        lines = 200 if detail["running"] else 120
+        detail["log"] = _log_tail(run_dir / runstore.LOG_NAME, lines)
+        # 日志回退：模块运行没有自己的 console.log（整组跑在一个子进程里），
+        # 直接显示空文本会让人以为卡死。回退到所属作业的日志并标出来源。
+        detail["log_source"] = "run"
+        if not (detail["log"] or "").strip():
+            job_log = _job_log_path(run_id, self.runs_dir)
+            if job_log is not None:
+                text = _log_tail(job_log, lines)
+                if text.strip():
+                    detail["log"] = text
+                    detail["log_source"] = "job"
+                    detail["log_from"] = str(job_log)
+        # 入口总闸（GA）痕迹：GA 跑在流水线主循环**之前**，这段时间还没有 state.json。
+        # 页面上没有它就只剩「一条 0 字节日志的空运行」，无法区分"在判定"与"卡死"。
+        detail["ga"] = runstore.read_json_if_exists(run_dir / gateway.GA_ARTIFACT_NAME)
         # 项目类型优先取 state 里的真值（流水线实际加载的），.inbox 文件只作兜底：
         # CLI 直接跑的 run 没有 .inbox/*.ptype，只看文件会显示「未记录」，
         # 而 state 里明明记着实际用的是哪套提示词。
@@ -843,10 +978,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(409, f"已有运行在进行中（{busy}），请先等它结束")
 
         payload = self._body()
-        gates = payload.get("pause_after") or []
-        bad = [g for g in gates if g not in PAUSE_STAGES]
-        if bad:
-            return self._err(400, f"人工闸门含非法阶段 {bad}，只支持: {PAUSE_STAGES}")
+        # PM 统一人工环节的闸门：还在 pm 相位且**还有模块没确认完** ⇒ 直接拦住，
+        # 别去起子进程白跑（人这一步没做完，下游不该动）。细节由 gateway 再校一次。
+        data = gateway.read_job(self.runs_dir, job_id) or {}
+        if str(data.get("phase") or "pm") == "pm":
+            try:
+                blockers = gateway.job_pm_blockers(self.runs_dir, data)
+            except Exception:  # noqa: BLE001 - 视图/校验失败不该拦住续跑本身
+                blockers = {}
+            if blockers:
+                return self._err(409, gateway.job_pm_blockers_text(blockers))
 
         args = [
             sys.executable,
@@ -857,9 +998,65 @@ class Handler(BaseHTTPRequestHandler):
             "--out",
             str(self.runs_dir),
         ]
-        args += ["--pause-after", ",".join(str(g) for g in gates)] if gates else ["--no-pause"]
+        # 闸门：只有接口**显式给了** pause_after 才下传（给 [] 就是「跑到底」）；
+        # 完全没给就不带任何闸门参数 ⇒ 沿用作业落盘时的设置（此前无条件发 --no-pause，
+        # 等于每次续跑都静默清空人工闸门）。
+        if payload.get("pause_after") is not None:
+            gates = payload.get("pause_after") or []
+            bad = [g for g in gates if g not in PAUSE_STAGES]
+            if bad:
+                return self._err(400, f"人工闸门含非法阶段 {bad}，只支持: {PAUSE_STAGES}")
+            args += ["--pause-after", ",".join(str(g) for g in gates)] if gates else ["--no-pause"]
+        # 运行参数同理：显式给才覆盖。不给则由 gateway._run_options 从 job.json 还原 ——
+        # 这条链只带 job_id，落盘值是唯一能还原原配置的地方（新建项目/回流上限都靠它）。
+        if str(payload.get("project_type") or "") in ("new", "secondary"):
+            args += ["--project-type", str(payload["project_type"])]
+        if payload.get("repo"):
+            args += ["--repo", str(payload["repo"]).strip()]
+        if payload.get("review_every"):
+            args += ["--review-every", str(int(payload["review_every"]))]
+        if payload.get("max_rework") is not None and payload.get("max_rework") != "":
+            args += ["--max-rework", str(int(payload["max_rework"]))]
         _spawn(job_id, args, gateway.job_dir(self.runs_dir, job_id) / "console.log")
         self._json(200, {"ok": True, "job_id": job_id, "argv": args})
+
+    def _submit_job_review(self, job_id: str) -> None:
+        """作业**统一验收**：``POST /api/jobs/<job_id>/review``，body ``{verdict, notes}``。
+
+        这是全组跑完之后的**一次**人工验收（材料是所有模块产出的整合，见作业页卡片）：
+        approve = 整组交付完成；reject = 把意见分发到各模块的开发阶段重跑。
+        """
+        if not RUN_ID_RE.match(job_id):
+            return self._err(400, "非法 job_id")
+        if gateway.read_job(self.runs_dir, job_id) is None:
+            return self._err(404, f"找不到作业: {job_id}")
+        payload = self._body()
+        verdict = str(payload.get("verdict") or "").strip()
+        if verdict not in ("approve", "reject"):
+            return self._err(400, "verdict 只能是 approve / reject")
+        notes = str(payload.get("notes") or "").strip()
+        if verdict == "reject" and not notes:
+            return self._err(400, "打回必须写明问题（notes），否则各模块不知道要改什么")
+        try:
+            data = gateway.finish_job_review(
+                self.runs_dir,
+                job_id,
+                verdict=verdict,
+                notes=notes,
+                reviewer=str(payload.get("reviewer") or "console").strip(),
+            )
+        except gateway.GatewayError as exc:
+            return self._err(409, str(exc))
+        self._json(
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "phase": data.get("phase"),
+                "status": gateway.job_status(data),
+                "verdict": verdict,
+            },
+        )
 
     def _flow_view(self) -> dict:
         """流定义视图（``GET /api/flow``）：拓扑 + 一致性校验结果。纯离线只读。"""
@@ -1158,22 +1355,16 @@ class Handler(BaseHTTPRequestHandler):
         artifact = (runstore.latest_artifacts(run_dir) or {}).get("pm")
         merged = 0
         if isinstance(artifact, dict):
-            for item in cleaned:
-                for entry in artifact.get("open_questions") or []:
-                    if isinstance(entry, dict) and str(entry.get("question") or "") == item["ref"]:
-                        entry["final_decision"] = item["decision"]
-                        entry["confirmed"] = True
-                        merged += 1
-                        break
-            if merged:
-                facts = [
-                    f"{e.get('question')} → {e.get('final_decision')}"
-                    for e in (artifact.get("open_questions") or [])
-                    if isinstance(e, dict) and e.get("final_decision")
-                ]
-                if facts:
-                    artifact["confirmed_facts"] = facts
-                runstore.save_artifact(run_dir, "pm", artifact, note="pm-decisions")
+            # 并回产物走 `prompts.apply_pm_decisions`：它同时处理 open_questions（按问题文本）
+            # 与两列**未明确项**（按条目文本，裁掉即从列里移除并进 confirmed_facts）。
+            # 这里原先自己写了一遍只认 open_questions 的循环 —— 两处口径分头维护，
+            # 正是「裁决存在却还说没裁决」那类错配的温床。
+            # overwrite=True：人工刚做的决定是最终决定，必须覆盖产物里的旧值
+            # （读取路径不覆盖，那里以产物优先 —— 见 prompts.apply_pm_decisions）
+            merged_art = prompts_mod.apply_pm_decisions(artifact, cleaned, overwrite=True)
+            merged = _count_pm_merges(artifact, cleaned)
+            if isinstance(merged_art, dict) and merged:
+                runstore.save_artifact(run_dir, "pm", merged_art, note="pm-decisions")
         state = runstore.read_state(run_dir)
         if not state:
             return self._err(409, "该运行没有 state.json，裁决无法保存")
@@ -1288,10 +1479,8 @@ class Handler(BaseHTTPRequestHandler):
         for suffix in (".md", ".ptype"):
             extra = inbox / f"{run_id}{suffix}"
             if extra.exists():
-                try:
+                with contextlib.suppress(OSError):
                     extra.unlink()
-                except OSError:
-                    pass
         with _JOBS_LOCK:
             _JOBS.pop(run_id, None)
         return True, ""

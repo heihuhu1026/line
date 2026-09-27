@@ -13,8 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from .budget import estimate_tokens
-from .config import CHARS_PER_TOKEN
+from .budget import chars_for_tokens, estimate_tokens
 
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "__pycache__",
@@ -169,10 +168,10 @@ def _block_range(lines: list[str], anchor: int, max_chars: int) -> tuple[int, in
         line = lines[idx]
         if not line.strip():
             continue
-        if idx == anchor or _indent(line) < anchor_indent:
-            if _BLOCK_START_RE.match(line):
-                start = idx
-                break
+        if ((idx == anchor or _indent(line) < anchor_indent)
+                and _BLOCK_START_RE.match(line) is not None):
+            start = idx
+            break
     if start is None:
         return None
     name_match = re.search(r"(?:def|class|function|func|sub)\s+([A-Za-z_][A-Za-z0-9_]*)", lines[start])
@@ -374,9 +373,12 @@ def select_excerpts(
 
     excerpts: list[Excerpt] = []
     used = 0
-    per_file_chars = int(per_file_tokens * CHARS_PER_TOKEN)
     idents = _ident_terms(query)
     for score, rel, text in scored[:max_files]:
+        # 单文件字符上限按**该文件自身**的字符/token 比换算：代码约 3.6 字/token、
+        # 中文注释约 1.3，差近 3 倍。用固定 1.6 会把代码文件砍掉一半还多
+        # （详见 budget.chars_for_tokens）。
+        per_file_chars = chars_for_tokens(per_file_tokens, sample=text)
         snippet, truncated, note = _snippet_for(text, effective, per_file_chars, idents=idents, df=df)
         cost = estimate_tokens(snippet)
         if used + cost > token_budget:

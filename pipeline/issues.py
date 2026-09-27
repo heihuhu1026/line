@@ -80,6 +80,15 @@ KINDS: list[str] = [
     "human_edit",
     "human_rework",
     "human_directive",
+    # 工程红线（pipeline/rules.py 的机械判负）与它的两个"兄弟信号"：
+    # 判负了什么、被证伪了什么、还有什么是**没验的**。三者必须分开记 ——
+    # 只统计"出了什么问题"会把「没验的部分」彻底藏起来（真机上表现为 8 轮全绿却没人
+    # 发现入口丢了）。
+    "rule_violation",
+    "refuted_stale_fix",
+    "unverified_claim",
+    "stage_seq_conflict",
+    "rule_load_problem",
     "needs_human",
 ]
 
@@ -119,6 +128,11 @@ KIND_CN: dict[str, str] = {
     "human_edit": "人工修改产物",
     "human_rework": "人工打回重跑",
     "human_directive": "人工意见注入",
+    "rule_violation": "工程红线判负（规则库机械判定）",
+    "refuted_stale_fix": "旧阻断项被本轮机械证据证伪",
+    "unverified_claim": "未验证项（强制披露：没验的部分）",
+    "stage_seq_conflict": "同一 seq 多份产物（两代混存）",
+    "rule_load_problem": "规则库加载问题（规则可能没生效）",
     "needs_human": "回流触顶需人工裁决",
 }
 
@@ -137,6 +151,14 @@ class Issue:
     evidence: dict = field(default_factory=dict)
     occurrence: int = 1  # 同一问题在本次运行中第几次出现
     recurred: bool = False  # 出现过多次 = 上一轮的处理没解决
+    # ---- 误判复盘三栏 ----
+    # 只记「发生了什么」不足以让同类问题不再发生。真机上的高频坑（把假设当硬约束、
+    # 把自由文本当路径、评审照抄上一轮结论）**每一轮的标题都不同**，靠关键词匹配历史
+    # 根本认不出来；认得出的是它们**错判的形状**：当时误信了什么信号、正确的判据是什么、
+    # 为什么没想到。这三栏就是给"按形状匹配"用的。
+    misjudged_signal: str = ""      # 错判点：当时误信了哪个信号
+    correct_criterion: str = ""     # 正确判据：什么条件下它算不成立（可证伪）
+    blind_spot: str = ""            # 盲区：为什么当时没想到
 
     @property
     def key(self) -> str:
@@ -161,7 +183,7 @@ def _short(text: Any, limit: int = DETAIL_CHARS) -> str:
 
 
 def _severity_counts(issues: list[Issue]) -> dict[str, int]:
-    out = {key: 0 for key in ("info", "warn", "blocker")}
+    out = dict.fromkeys(("info", "warn", "blocker"), 0)
     for issue in issues:
         out[issue.severity] = out.get(issue.severity, 0) + 1
     return out
@@ -188,11 +210,15 @@ def summarize(issues: list[Issue]) -> dict:
 def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
     """从一次运行的 state（或 summary 兜底）推导问题列表；纯函数，可随时重算。"""
     state = state or {}
-    artifacts = state.get("artifacts") or {}
+    # 产物层：`state_of()` 给的是整份快照（产物在 artifacts 里），而编排器内部传进来的是
+    # 产物层本身。**两种形状都要能吃** —— 读错层的表现是"静默为空"，真机校准踩过
+    # （日志打了 5 条红线，账本里却是 0 条）。见 runstore.artifact_view。
+    artifacts = runstore.artifact_view(state)
     issues: list[Issue] = []
 
     def add(kind: str, stage: str, severity: str, source: str, title: Any, detail: Any = "",
-            attempt: int | None = None, **evidence: Any) -> None:
+            attempt: int | None = None, *, misjudged: str = "", criterion: str = "",
+            blind: str = "", **evidence: Any) -> None:
         issues.append(
             Issue(
                 kind=kind,
@@ -203,6 +229,9 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
                 detail=_short(detail),
                 attempt=attempt,
                 evidence={k: v for k, v in evidence.items() if v not in (None, "", [], {})},
+                misjudged_signal=misjudged,
+                correct_criterion=criterion,
+                blind_spot=blind,
             )
         )
 
@@ -523,6 +552,79 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
             declared_kind=declared,
         )
 
+    # 7) 工程红线与「没验到什么」（机械信号，全在 state 里，确定性地重算）
+    #
+    # 这一组是本模块最该有的东西：**机器证明了什么**与**机器没验什么**必须分开记。
+    # 每条都填了误判复盘三栏 —— 因为这几类问题的共同点就是"下一次还会犯"，
+    # 光记标题没用，得记下当时是**怎么判错的**。
+    for finding in artifacts.get("rule_findings") or []:
+        if not isinstance(finding, dict) or finding.get("note"):
+            continue
+        where = f"{finding.get('path') or '?'}:{finding.get('line') or '?'}"
+        add(
+            "rule_violation",
+            "dev",
+            "blocker" if finding.get("severity") == "blocker" else "warn",
+            "system",
+            f"{finding.get('title') or finding.get('rule')} @ {where}",
+            f"命中：{finding.get('excerpt') or '（见文件）'}；{finding.get('message') or ''}",
+            rule=finding.get("rule"),
+            source_doc=finding.get("source"),
+            misjudged="交付方自述（summary / self_checks 里的「应该没问题」）被当成验证",
+            criterion=str(finding.get("negative") or ""),
+            blind="规则可机械判定，但此前没有任何环节在落盘前查它",
+        )
+    for text in artifacts.get("refuted_blockers") or []:
+        # 这条是"好消息"，但必须记：它正是自指循环被打破的证据（否则下次还会有人
+        # 把上一轮的结论当锚点重新加回来）。
+        add(
+            "refuted_stale_fix",
+            "review",
+            "info",
+            "system",
+            _short(text, TITLE_CHARS),
+            "本轮机械证据（运行验证 / 补丁校验全绿）与它矛盾，已不再回灌下一轮评审",
+            misjudged="上一轮评审的结论（被当成锚点照抄）",
+            criterion="本轮 mechanical_blockers 为空且 verify 无问题项",
+            blind="上一轮 blockers 会被拼回 fixes 再喂给评审，形成自指循环（§23.2）",
+        )
+    for text in (artifacts.get("verify_report") or {}).get("unverified") or []:
+        add(
+            "unverified_claim",
+            "verify",
+            "warn",
+            "system",
+            _short(text, TITLE_CHARS),
+            "本轮**没有验证到**这一项（verdict=pass 只说明跑过的都过了）",
+            misjudged='verdict=pass 被读成"该验的都验了"',
+            criterion="只有被实际执行的断言型命令才算验证；没有命令 = 没有证据",
+            blind="未验证项此前从不显式列出，于是默认视为已验",
+        )
+    for text in artifacts.get("duplicate_stage_seqs") or []:
+        add(
+            "stage_seq_conflict",
+            "verify",
+            "warn",
+            "system",
+            f"同一 seq 多份产物：{text}",
+            "两代产物混存：阶段列表与检查点时间线会重复且乱序，看「最新产物」容易读错",
+            misjudged='按"最新产物"判断当前状态',
+            criterion="同一 seq 只能有一份产物（旧代必须在 superseded/）",
+            blind="同一 run_id 复跑时旧产物不归档（真机 job-…-M-01）",
+        )
+    for text in artifacts.get("rule_load_notes") or []:
+        add(
+            "rule_load_problem",
+            "dev",
+            "info",
+            "system",
+            _short(text, TITLE_CHARS),
+            "规则库有问题：这条规则可能没生效（不判负，但要人工看一眼）",
+            misjudged="规则库「能加载」被当成「规则都生效了」",
+            criterion="加载问题清单为空，才算规则全部生效",
+            blind="规则文件是数据，写错不会报错，只会静默少一条检查",
+        )
+
     # 6) 触顶
     if state.get("needs_human"):
         add("needs_human", "review", "blocker", "system",
@@ -684,7 +786,7 @@ def build_report(runs_dir: Path, limit_runs: int = 200) -> dict:
     runs_dir = Path(runs_dir)
     run_rows: list[dict] = []
     kind_totals: dict[str, int] = {}
-    severity_totals = {key: 0 for key in ("info", "warn", "blocker")}
+    severity_totals = dict.fromkeys(("info", "warn", "blocker"), 0)
     stage_stats: dict[str, dict] = {}
     fingerprint_rows: dict[str, dict] = {}
 
@@ -765,7 +867,86 @@ def build_report(runs_dir: Path, limit_runs: int = 200) -> dict:
         "by_fingerprint": fingerprint_rows,
         "runs": run_rows,
         "current_fingerprint": pipeline_fingerprint(),
+        # 「高频坑 → 建议升规则」的量化触发（见 escalation_candidates）。
+        # 单独扫一遍而不塞进上面的循环：汇总逻辑已经很密，多一次只读扫描的钱
+        # 远比把状态机搅进去划算（这是给人看的报告，不是热路径）。
+        "escalation": escalation_candidates(runs_dir, limit_runs=limit_runs),
     }
+
+
+#: 这些 kind 不该出现在「升规则」建议里：
+#:   · 已经机械化了的（rule_violation / unverified_claim / stage_seq_conflict）—— 它们就是规则的产物；
+#:   · 环境/性能类（慢、显存、吞吐退化）—— 规则解决不了，要动的是环境；
+#:   · 人工动作与触顶（human_* / needs_human）—— 它们是流程事件，不是缺陷。
+_NON_ESCALATABLE = frozenset({
+    "rule_violation", "unverified_claim", "stage_seq_conflict", "rule_load_problem",
+    "slow_call", "gpu_partial_offload", "prefill_degraded",
+    "human_gate", "human_edit", "human_rework", "human_directive", "needs_human",
+})
+
+
+def escalation_candidates(
+    runs_dir: Path, *, min_occurrences: int = 8, min_runs: int = 3, limit_runs: int = 200
+) -> list[dict]:
+    """**反复出现的问题 → 建议升为规则/契约**的候选（只建议，不自动改）。
+
+    为什么需要它：真机上反复踩的坑（把假设当硬约束、把自由文本当路径、评审照抄上一轮
+    结论）**每一轮的标题都不一样**，于是无论按关键词还是按 kind 都"看起来不严重"，
+    永远升不成机制，只能一轮轮手工发现、手工修。触发条件必须量化，否则"觉得挺常见"
+    永远说服不了自己动手 —— 这里的口径沿用 dev-expert 的 `recurrence_promote.py`：
+    出现次数 ≥ N **且** 跨 ≥ M 次运行（同一次运行里刷 20 条不算复发）。
+
+    输出里带上该 kind 的 `correct_criterion` 样例：升级一条规则最难的就是写出
+    "什么条件下它算不成立"，而这类问题在采集时已经填过（见 collect_issues 的三栏）。
+    """
+    runs_dir = Path(runs_dir)
+    if not runs_dir.is_dir():
+        return []
+    occurrences: dict[str, int] = {}
+    per_run: dict[str, set[str]] = {}
+    samples: dict[str, dict[str, str]] = {}
+    runs_seen = 0
+    dirs = sorted(
+        [d for d in runs_dir.iterdir() if d.is_dir() and not d.name.startswith((".", "_"))]
+    )[-limit_runs:]
+    for run_dir in dirs:
+        state, source = state_of(run_dir)
+        if source == "none":
+            continue
+        runs_seen += 1
+        for issue in collect_issues(state, run_dir.name):
+            if issue.kind in _NON_ESCALATABLE:
+                continue
+            occurrences[issue.kind] = occurrences.get(issue.kind, 0) + 1
+            per_run.setdefault(issue.kind, set()).add(run_dir.name)
+            if issue.kind not in samples and (issue.correct_criterion or issue.misjudged_signal):
+                samples[issue.kind] = {
+                    "title": issue.title,
+                    "misjudged_signal": issue.misjudged_signal,
+                    "correct_criterion": issue.correct_criterion,
+                    "blind_spot": issue.blind_spot,
+                }
+    out: list[dict] = []
+    for kind, count in occurrences.items():
+        runs = len(per_run.get(kind) or ())
+        if count < min_occurrences or runs < min_runs:
+            continue
+        out.append(
+            {
+                "kind": kind,
+                "label": KIND_CN.get(kind, kind),
+                "occurrences": count,
+                "runs": runs,
+                "suggestion": (
+                    f"已出现 {count} 次、跨 {runs} 次运行 —— 建议升为机制："
+                    "能机械判定的写进 pipeline/rules.json（带 evidence + negative），"
+                    "只能靠判断的写进对应的阶段提示词与评审清单。"
+                ),
+                "sample": samples.get(kind) or {},
+            }
+        )
+    out.sort(key=lambda row: (-row["occurrences"], -row["runs"], row["kind"]))
+    return out
 
 
 def report_markdown(report: dict) -> str:
@@ -813,6 +994,34 @@ def report_markdown(report: dict) -> str:
             f"| {row['run_id']} | {row['verdict']} | {row['attempts']} | {row['issue_summary']['total']} | "
             f"{row['issue_summary']['blockers']} | `{row['fingerprint']}` |"
         )
+    # 高频坑 → 建议升规则：这份报告是**给人看**的入口，建议只放在 JSON 里等于没提。
+    escalation = report.get("escalation") or []
+    if escalation:
+        lines += [
+            "",
+            "## 反复出现、建议升为机制的问题",
+            "",
+            "> 判据：出现次数 ≥ 8 **且** 跨 ≥ 3 次运行（同一次运行里刷 20 条不算复发）。",
+            "> 能机械判定的写进 `pipeline/rules.json`（必须带 evidence + negative），",
+            "> 只能靠判断的写进对应阶段的提示词与评审清单。",
+            "",
+            "| 问题类型 | 次数 | 跨运行 | 建议 |",
+            "|---|---|---|---|",
+        ]
+        for row in escalation:
+            lines.append(
+                f"| {row['label']}（`{row['kind']}`） | {row['occurrences']} | {row['runs']} | "
+                f"{row['suggestion']} |"
+            )
+        sample = next((r["sample"] for r in escalation if r.get("sample")), {})
+        if sample:
+            lines += [
+                "",
+                f"> 升级一条规则最难的是写出「什么条件下它算不成立」——记录里已经有一份样例：",
+                f"> 错判点：{sample.get('misjudged_signal') or '-'}；"
+                f"正确判据：{sample.get('correct_criterion') or '-'}；"
+                f"盲区：{sample.get('blind_spot') or '-'}",
+            ]
     lines += ["", "> 交给模型做元优化：`python tools\\meta_optimize.py`（只产出建议书，不自动改代码）", ""]
     return "\n".join(lines) + "\n"
 

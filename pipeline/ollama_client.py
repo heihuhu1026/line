@@ -1,6 +1,7 @@
 """Ollama 客户端：结构化输出（format=schema）+ 契约校验重试 + 严格单驻留调度。
 
 - chat_json：服务端用 JSON Schema 强约束输出，客户端再校验一次；失败则带错误反馈重试。
+  输出撞 ``num_predict`` 被**截断**时单独识别并抬高上限重试 —— 见 chat_json 内的注释。
 - ensure_exclusive：任何一次调用前，把非目标模型从显存卸载（10GB 卡的硬约束，决策 3）。
 - MockClient：不触碰真实模型，按 schema 合成占位产物，用于跑通编排与回流逻辑。
 """
@@ -23,6 +24,15 @@ class OllamaError(RuntimeError):
 
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
+#: ollama 在「撞到 num_predict 上限、输出被切断」时把 done_reason 置为该值。
+#: 与之相对的是 "stop"（模型自己写完了）。这个区别很关键：截断是**确定性失败**，
+#: 同 prompt 同上限重试必然在同一处再断，而「模型写错 JSON」重试才有意义。
+_DONE_REASON_LENGTH = "length"
+
+#: 抬高输出上限时给 num_ctx 留的余量（token）。prompt 已占掉一部分，上限只能取剩下的再减它 ——
+#: 不留余量的话请求会顶到 ctx，ollama 会按 ctx 静默截断 prompt，症状比截断输出更难查。
+_CTX_SAFETY_MARGIN = 256
 
 
 def _parse_json(content: str) -> Any:
@@ -67,7 +77,6 @@ class OllamaClient:
         loaded = self.ps()
         names = [m.get("name", "") for m in loaded]
         others = [n for n in names if n and not n.startswith(tag)]
-        t0 = time.time()
         for name in others:
             self.unload(name)
         already = any(n.startswith(tag) for n in names)
@@ -86,11 +95,19 @@ class OllamaClient:
         user: str,
         schema: dict,
         num_predict: int | None = None,
-        attempts: int = 2,
+        # 3 次而不是 2 次：真机 run snake-detailed（2026-09-26）里 test 阶段**两次**都写出
+        # 畸形 JSON（`Unterminated string starting at char 475`），直接抛错把整个运行干掉 ——
+        # 而续跑后第 2 次就成功了，说明单次成功率大概只有五成上下。
+        # 两次尝试下「整轮跑崩」的概率约 25%，三次降到约 12%。
+        # 代价只有在真失败时才付（多一次 ~60s 的调用），而崩一次的代价是丢掉整轮
+        # 十几分钟的算力 + 全部中间态。这笔账明显划算。
+        attempts: int = 3,
     ) -> tuple[Any, dict]:
         base_user = user
         last_errors: list[str] = []
         failed: list[dict] = []  # 未通过契约的那些原始输出也要留档（诊断提示词问题时最关键）
+        # 本次实际使用的输出上限。撞到它被截断时会**调高**再试 —— 同上限重试是确定性白费。
+        limit = num_predict or spec.num_predict
         for attempt in range(1, attempts + 1):
             prompt = base_user
             if attempt > 1:
@@ -111,7 +128,7 @@ class OllamaClient:
                 "options": {
                     "num_ctx": spec.num_ctx,
                     "temperature": spec.temperature,
-                    "num_predict": num_predict or spec.num_predict,
+                    "num_predict": limit,
                 },
             }
             if spec.think is not None:
@@ -124,6 +141,11 @@ class OllamaClient:
             message = resp.get("message", {}) or {}
             content = message.get("content", "") or ""
             thinking = message.get("thinking", "") or ""
+            # 「为什么停了」：stop = 模型自己写完了 / length = 撞 num_predict 被切断。
+            # 以前完全没看这个字段 —— 截断与「模型写坏 JSON」在日志里长得一模一样，
+            # 排查方向会直接跑偏（真机 2026-09-26 就踩了）。
+            done_reason = str(resp.get("done_reason") or "")
+            prompt_tokens = int(resp.get("prompt_eval_count") or 0)
 
             meta = {
                 "tag": spec.tag,
@@ -133,13 +155,41 @@ class OllamaClient:
                 "attempt": attempt,
                 "wall_s": round(wall, 2),
                 "load_s": round(resp.get("load_duration", 0) / 1e9, 2),
-                "prompt_tokens": resp.get("prompt_eval_count", 0),
+                "prompt_tokens": prompt_tokens,
                 "output_tokens": resp.get("eval_count", 0),
                 "prompt_s": round(resp.get("prompt_eval_duration", 0) / 1e9, 2),
                 "eval_s": round(resp.get("eval_duration", 0) / 1e9, 2),
                 "thinking_chars": len(thinking),
                 "prompt_est_tokens": estimate_tokens(prompt),
+                "done_reason": done_reason,
+                "num_predict": limit,
             }
+
+            if done_reason == _DONE_REASON_LENGTH:
+                # ---- 输出被截断：确定性失败，必须换条件重试 ----
+                # 真机教训（2026-09-26 run snake-detailed）：test 阶段的 7B 输出被砍在字符串中间，
+                # 两次尝试都报「Unterminated string starting at ...」—— 同一 prompt、同一上限
+                # 必然在同一处再断，于是两次重试全废，**整个运行直接崩掉、连产物都没留下**。
+                # 所以这里不能当普通契约失败处理，要抬高上限再试。
+                detail = (
+                    f"输出被截断：撞 num_predict={limit} 上限，JSON 在中间被切断"
+                    "（解析必然失败，不是模型写错了内容）"
+                )
+                meta["schema_errors"] = [detail]
+                failed.append({"attempt": attempt, "errors": [detail], "raw": content[-3000:]})
+                last_errors = [detail]
+                room = spec.num_ctx - prompt_tokens - _CTX_SAFETY_MARGIN
+                raised = min(max(limit * 2, limit + 2048), room)
+                if raised <= limit:
+                    raise OllamaError(
+                        f"{spec.tag} 输出被截断，且没有上下文余量可抬高上限："
+                        f"prompt 已占 {prompt_tokens} tok / num_ctx={spec.num_ctx} / "
+                        f"输出上限 {limit} tok（可用余量仅 {room} tok）。"
+                        "该阶段的产物对当前 num_ctx 来说太长了 —— 请调大该阶段的 num_ctx，"
+                        "或让产物更短（拆分任务、减少条目）。"
+                    )
+                limit = raised
+                continue
 
             try:
                 data = _parse_json(content)
@@ -160,7 +210,15 @@ class OllamaClient:
             last_errors = errors
             failed.append({"attempt": attempt, "errors": errors, "raw": content[:4000]})
 
-        raise OllamaError(f"{spec.tag} 连续 {attempts} 次未通过契约校验: {last_errors}")
+        # 报错时把**最后一次的原始输出**也带出来。以前只留 error 文本，
+        # 「模型到底写成了什么样、是截断还是畸形」只能靠猜 —— 真机 2026-09-26 崩在
+        # test 阶段时就卡在这上面：日志只有一句「Unterminated string starting at char 475」，
+        # 既看不到原文，也分不清是撞上限还是模型真写坏了。
+        tail = str((failed[-1].get("raw") if failed else "") or "")[-700:]
+        raise OllamaError(
+            f"{spec.tag} 连续 {attempts} 次未通过契约校验: {last_errors}"
+            + (f"\n最后一次原始输出尾部：\n{tail}" if tail else "")
+        )
 
 
 class MockClient:
@@ -323,6 +381,9 @@ class MockClient:
             "thinking_chars": 0,
             "prompt_est_tokens": estimate_tokens(user),
             "schema_errors": [],
+            # 与真机埋点保持同列：mock 不会截断，所以恒为 stop / 满额上限
+            "done_reason": "stop",
+            "num_predict": spec.num_predict,
             "mock": True,
             "_raw_text": json.dumps(data, ensure_ascii=False),
             "_raw_thinking": "",

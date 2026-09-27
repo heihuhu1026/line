@@ -330,6 +330,22 @@ def plan_commands(
     if dev_run and len(specs) < max_commands:
         specs.append({"command": dev_run, "source": "dev-run", "display": "开发声明的入口命令"})
 
+    # 兜底探测 —— **必须排在「测试阶段声明的命令」之前**。
+    #
+    # 命令槽位是有限的（max_commands），把「跑交付物入口」和模型随手写的窄命令放进同一个
+    # 池子里抢槽位，模型一多写两条就把入口挤掉了。真机 2026-09-26（run snake-detailed）
+    # 第 2、3 轮正是如此：test 阶段把第 1 轮的 `python main.py` 换成了 3 条
+    # `python -c "import game_logic; game_logic.GameLogic().move('Right')"`，
+    # 语法 + 导入 + 那 3 条 = 5，**入口探测一次机会都没有** → 于是
+    # runnability_problems 只能报「没有任何命令真正执行交付物」→ rework → 再来一轮还是
+    # 被挤掉 → 三轮不收敛，最后 needs_human、什么都不交付。
+    #
+    # 「产物到底能不能跑起来」是这套验证里最重要的一条证据，它必须优先于模型随手写的命令。
+    if len(specs) < max_commands:
+        probe = _entry_probe(work)
+        if probe:
+            specs.append(probe)
+
     declared = [
         str(c.get("command") or "").strip()
         for c in (test_report or {}).get("automated_commands") or []
@@ -339,20 +355,6 @@ def plan_commands(
         if len(specs) >= max_commands:
             break
         specs.append({"command": command, "source": "planned", "display": "测试阶段声明的命令"})
-
-    if len(specs) < max_commands:
-        # 兜底探测：只挑「一看就知道怎么跑」的入口，宁缺毋滥
-        has_tests = any(
-            p.name.startswith("test_") and p.suffix == ".py"
-            for p in work.rglob("*.py")
-            if "__pycache__" not in p.parts
-        ) or (work / "tests").is_dir()
-        if has_tests:
-            specs.append(
-                {"command": f"{_python_bin()} -m pytest -q", "source": "probe", "display": "探测到测试目录"}
-            )
-        elif (work / "main.py").exists():
-            specs.append({"command": f"{_python_bin()} main.py", "source": "probe", "display": "探测到 main.py"})
     # 去重：开发声明的入口命令与测试阶段声明的命令常常是同一条，别跑两遍白等一轮
     seen: set[str] = set()
     deduped: list[dict] = []
@@ -413,6 +415,61 @@ _STATIC_SUFFIX = ".py"
 #: 「一看就知道能当入口」的文件名（没有 __main__ 时退而求其次认这些）。
 #: 公开给编排器复用：判定「方案有没有规划入口」以及演示面板挑入口都要它。
 ENTRY_NAMES = ("main.py", "__main__.py", "run.py", "app.py", "cli.py")
+
+
+def _entry_probe(work: Path) -> dict[str, Any] | None:
+    """「一看就知道怎么跑」的入口探测，宁缺毋滥。
+
+    **优先约定入口脚本、其次才是 pytest**：前者真正执行了应用，是「产物能不能跑」的直接
+    证据；pytest 的输出只证明测试跑过（而且沙箱里未必装了 pytest，会落进 unavailable）。
+    真机 run 20260926 的教训是入口探测被槽位挤掉，所以这里的优先级也要顺过来。
+    """
+    for name in ENTRY_NAMES:
+        if (work / name).is_file():
+            return {"command": f"{_python_bin()} {name}", "source": "probe", "display": f"探测到 {name}"}
+    has_tests = any(
+        p.name.startswith(("test_", "_test.py")) and p.suffix == ".py"
+        for p in work.rglob("*.py")
+        if "__pycache__" not in p.parts
+    ) or (work / "tests").is_dir()
+    if has_tests:
+        return {"command": f"{_python_bin()} -m pytest -q", "source": "probe", "display": "探测到测试目录"}
+    return None
+
+
+#: 常驻类交付物（游戏主循环 / 桌面窗口）的验证超时。
+#:
+#: 这类程序**跑满超时是正常的** —— 下面 ``long_running`` 的判定就是把它当作
+#: 「能跑起来」的正面证据（真机 run 20260925-110258 的贪吃蛇 `python main.py` 跑满
+#: 180s 被强杀；若算失败，任何常驻形态的交付物都永远过不了 verify）。
+#: 既然结论与「跑 180s」还是「跑 20s」无关，让它跑满就是纯浪费：真机 run snake-impfix
+#: 第 1 轮里 `python main.py` 两条各卡满 180s，一轮白扔约 6 分钟。
+#: 20s 足够证明「进程起来了、没立刻崩」，判定口径一字不变。
+RESIDENT_ENTRY_TIMEOUT = 20
+
+#: 用到这些模块 ⇒ 产物是桌面/游戏形态，启动后不会自己退出
+_RESIDENT_MODULES = frozenset(
+    {"pygame", "tkinter", "pyglet", "arcade", "curses", "PyQt5", "PySide6", "wx"}
+)
+#: 主循环的常见写法（补上「没直接写模块名」的情况，比如经由封装间接调用）
+_RESIDENT_MARKERS = ("mainloop()", "app.exec", "clock.tick", "display.flip", "exec_()")
+
+
+def is_resident_entry(work: Path, rel: str) -> bool:
+    """这个入口脚本是不是「启动后一直运行」的常驻程序（游戏主循环 / 桌面窗口）。
+
+    **只在能确定时才返回 True**（宁漏不错）：漏判只是多花一点时间（退回完整超时），
+    误判会把一个本该正常退出的 CLI 当成常驻 —— 于是用短超时把它判成「一直在跑」，
+    把一个真的失败掩盖成通过。
+    """
+    path = work / str(rel or "")
+    if not path.is_file() or path.suffix.lower() != ".py":
+        return False
+    src = path.read_text(encoding="utf-8", errors="replace")
+    for module in _RESIDENT_MODULES:
+        if re.search(rf"^\s*(?:import|from)\s+{re.escape(module)}\b", src, re.M):
+            return True
+    return any(marker in src for marker in _RESIDENT_MARKERS)
 
 
 def _bound_names(tree: ast.Module) -> set[str]:
@@ -509,6 +566,572 @@ def runs_entry(work: Path, written: list[str], command: str) -> bool:
     if rel and rel in entry_targets(work, written):
         return True
     return any(name in text for name in entry_targets(work, written))
+
+
+def _sig_args(args: ast.arguments, *, drop_self: bool) -> str:
+    """把函数签名渲染成 ``(a, b=1, *args, **kw)`` 形式（只留形状，不留注解细节）。"""
+    parts: list[str] = []
+    pos = [*args.posonlyargs, *args.args]
+    defaults: list[ast.expr | None] = [None] * (len(pos) - len(args.defaults)) + list(args.defaults)
+    for i, (arg, dflt) in enumerate(zip(pos, defaults, strict=True)):
+        if drop_self and i == 0 and arg.arg in ("self", "cls"):
+            continue
+        parts.append(arg.arg + (f"={ast.unparse(dflt)}" if dflt is not None else ""))
+    if args.vararg:
+        parts.append("*" + args.vararg.arg)
+    elif args.kwonlyargs:
+        parts.append("*")
+    for arg, dflt in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        parts.append(arg.arg + (f"={ast.unparse(dflt)}" if dflt is not None else ""))
+    if args.kwarg:
+        parts.append("**" + args.kwarg.arg)
+    return "(" + ", ".join(parts) + ")"
+
+
+# --------------------------------------------------------------------- 命令质量核对
+# 测试阶段声明的 `automated_commands` 是**模型写出来的文本**，从没被执行过就流到 verify。
+# 下面这套是**静态**核对（零执行、零副作用），回答一个问题：这条命令**自己跑得起来吗**？
+# 判它干什么：命令写错 ⇒ verify 拿不到可运行证据 ⇒ 评审把失败误读成"实现缺陷" ⇒
+# 让开发去改**本来正确**的实现（真机 20260927-073518 实测）。命令只有测试阶段能改。
+
+#: 从 `python -c "<code>"` 里抠代码正文。**刻意保守**：只认单行的双/单引号参数，
+#: 匹配不到就返回空串（宁可不判，也不要因为解析偏差误伤一条合法命令）。
+_C_PAYLOAD_RE = re.compile(r"""(?:^|\s)-c\s+("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')""")
+
+
+def c_payload(command: str) -> str:
+    """取 `python -c "<code>"` 里的代码正文（不是这种形式返回空串）。"""
+    m = _C_PAYLOAD_RE.search(str(command or ""))
+    if not m:
+        return ""
+    # 只还原转义引号；**不能**用 unicode_escape —— 那会把中文弄成乱码。
+    return m.group(1)[1:-1].replace('\\"', '"').replace("\\'", "'")
+
+
+def sig_arity(args_text: str) -> tuple[int, bool] | None:
+    """从 ``(a, b=1)`` 这样的签名正文算「必需参数个数」与「是否接受可变参数」。
+
+    借 ``ast`` 解析而不是按逗号切分 —— 默认值里可能自带逗号 / 元组，切分必错。
+    解析失败返回 None（调用方据此跳过，不做判断）。
+    """
+    try:
+        fn = ast.parse(f"def _f({args_text}):\n    pass").body[0]
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(fn, ast.FunctionDef):
+        return None
+    a = fn.args
+    positional = [*a.posonlyargs, *a.args]
+    required = len(positional) - len(a.defaults)
+    required += sum(1 for d in a.kw_defaults if d is None)  # 无默认值的关键字参数也是必需的
+    return (max(required, 0), bool(a.vararg or a.kwarg))
+
+
+def digest_arities(digest: Any) -> dict[str, tuple[int, bool]]:
+    """从接口摘要（``api_digest`` 的产物）抽「符号名 → (必需参数个数, 是否可变参数)」。
+
+    摘要每项形如 ``class SnakeGame`` / ``    def __init__(width, height)`` / ``def main()``
+    （类方法已由 :func:`api_digest` 去掉 ``self``）。**缩进 0** 的是模块级函数，带缩进的是
+    类的方法 —— 只把 ``__init__`` 的必需参数记到**类名**上（没有 ``__init__`` 即 0 个必需
+    参数，与 Python 默认构造一致）。
+    """
+    out: dict[str, tuple[int, bool]] = {}
+    if not isinstance(digest, dict):
+        return out
+    for members in digest.values():
+        if not isinstance(members, list):
+            continue
+        current = ""
+        for raw in members:
+            text = str(raw or "")
+            stripped = text.strip()
+            if stripped.startswith("class "):
+                current = stripped[len("class "):].split("(")[0].strip()
+                out.setdefault(current, (0, False))
+                continue
+            m = re.match(r"def\s+(\w+)\s*\((.*)\)\s*$", stripped)
+            if not m:
+                continue
+            name, args_text = m.group(1), m.group(2)
+            arity = sig_arity(args_text)
+            if arity is None:
+                continue
+            if text.startswith(" ") and current:
+                if name == "__init__":  # 构造函数：把必需参数记到类名上
+                    out[current] = arity
+            else:  # 模块级函数
+                out.setdefault(name, arity)
+    return out
+
+
+def _callee(func: ast.expr) -> str:
+    """调用表达式里的被调名：``Cls(...)`` → ``Cls``；``m.Cls(...)`` → ``Cls``。"""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _payload_calls(command: str) -> list[ast.Call] | None:
+    """命令里那段 `-c` 代码里的所有调用；不是 `-c` 形式 / 解析失败返回 None。"""
+    payload = c_payload(command)
+    if not payload:
+        return None
+    try:
+        tree = ast.parse(payload)
+    except (SyntaxError, ValueError):
+        return None
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+
+def _passes_none_literal_call(call: ast.Call) -> bool:
+    """这个调用有没有把裸 ``None`` 当实参传进来（**位置实参与关键字实参都算**）。
+
+    关键字形式必须一并认：真机 20260927-100009 的命令写的是 `snake.Snake(canvas=None)` ——
+    只查位置实参会漏掉它，于是这条「命令自身不可执行」被算成实现缺陷。
+    """
+    return any(
+        isinstance(a, ast.Constant) and a.value is None
+        for a in (*call.args, *(k.value for k in call.keywords))
+    )
+
+
+def passes_none_literal(command: str) -> bool:
+    """命令里有没有把**裸 ``None``** 当实参传给某个调用（拿它顶替必需对象）。"""
+    calls = _payload_calls(command)
+    if not calls:
+        return False
+    return any(_passes_none_literal_call(call) for call in calls)
+
+
+def command_param_problems(commands: Any, digest: Any) -> list[str]:
+    """测试声明的命令**自身能不能执行**？—— 用接口摘要做静态核对。
+
+    真机 20260927-073518：新建项目下仓库为空（测试阶段看不到任何源码片段），实现信息只有
+    几百 token 的摘要，于是 7B 按类名猜出 `SnakeGame()` 这类**无参构造**，而 `__init__`
+    需要参数 —— verify 里必然 `TypeError`，拿不到可运行证据，评审再把它误判成"实现缺参数"。
+    补上摘要后它改成了 `SnakeGame(None)`：个数对了，但拿 `None` 顶替 Tk 对象，运行时照样
+    `AttributeError`。两种形态都是**命令缺陷**，都在这里拦。
+
+    只做两档、都极确定（宁可漏，不可误伤）：
+      ① 实参个数少于接口声明的必需形参个数；
+      ② 给调用传了**裸 `None`**（顶替必需对象，运行时必炸）。
+    名字未知、含 `*args`/`**kwargs`/`**kw`、非 `-c` 形式（如 `python main.py`）的一律不判。
+    """
+    table = digest_arities(digest)
+    if not table:
+        return []
+    out: list[str] = []
+    for c in commands or []:
+        if not isinstance(c, dict):
+            continue
+        cmd = str(c.get("command") or "")
+        payload = c_payload(cmd)
+        if not payload:
+            continue
+        try:
+            tree = ast.parse(payload)
+        except SyntaxError as exc:
+            out.append(f"`{cmd}`：命令里的 Python 片段有语法错误（{exc.msg}），无法执行。")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _callee(node.func)
+            spec = table.get(name) if name else None
+            if not spec:
+                continue
+            required, varargs = spec
+            if any(isinstance(a, ast.Starred) for a in node.args) or any(
+                k.arg is None for k in node.keywords
+            ):
+                continue
+            provided = len(node.args) + len([k for k in node.keywords if k.arg])
+            if provided < required:
+                out.append(
+                    f"`{cmd}`：`{name}` 至少需要 {required} 个参数，命令里只传了 {provided} 个"
+                    " —— 命令自身无法执行，请按【本轮已产出文件的接口】把参数补齐。"
+                )
+                continue
+            if _passes_none_literal_call(node):
+                out.append(
+                    f"`{cmd}`：`{name}` 被传了 `None` 顶替必需对象 —— 参数个数虽够，运行时会因"
+                    " `'NoneType' object has no attribute ...` 失败（命令自身无法执行）。"
+                    "请改为断言**不需要显示器/网络等外部环境**的纯逻辑（别直接实例化 GUI 对象）。"
+                )
+    return out
+
+
+def _declared_symbols(text: str) -> dict[str, list[str]]:
+    """一个文件里**对外可用**的符号 → 形参名列表（模块级 def/class + 类的方法）。
+
+    与 `api_digest` 同源（都是 ast），但那个是给模型看的**描述**，这份是给机械断言用的
+    **事实**：键是符号名（`foo` / `Class.method`），值是除 `self`、`cls` 之外的形参名。
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return {}
+    out: dict[str, list[str]] = {}
+
+    def _params(node: ast.AST) -> list[str]:
+        args = getattr(node, "args", None)
+        if args is None:
+            return []
+        names = [a.arg for a in getattr(args, "args", [])]
+        return [n for n in names if n not in ("self", "cls")]
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[node.name] = _params(node)
+        elif isinstance(node, ast.ClassDef):
+            out[node.name] = []
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out[f"{node.name}.{sub.name}"] = _params(sub)
+                    out.setdefault(sub.name, _params(sub))
+    return out
+
+
+def _interface_of(text: str) -> tuple[str, list[str]]:
+    """从方案里写的 `add(amount: float, note: str) -> None` 取出 (名字, 形参数)。
+
+    按括号深度切分，避免默认值 `f(x, y=(1, 2))` 里的逗号被当成参数分隔符。
+    """
+    s = str(text or "").strip()
+    if "(" not in s:
+        return s, []
+    name = s[: s.index("(")].strip()
+    inner = s[s.index("(") + 1: s.rindex(")")] if ")" in s else s[s.index("(") + 1:]
+    depth, cur, parts = 0, "", []
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return name, [p.strip() for p in parts if p.strip()]
+
+
+def skeleton_conformance(work: str | Path, written: list[str], skeleton: Any) -> dict[str, Any]:
+    """**冻结接口基准 vs 实际产物**：基准声明的对外符号，产物里到底有没有。
+
+    为什么单做一份（而不是只靠 :func:`contract_check`）：那个核的是方案里
+    ``contracts.exposes`` / ``contracts.uses`` / ``interface`` —— 那两项契约**只提示不强制**，
+    真机上通常为空 ⇒ 跨文件契约校验长期形同虚设。冻结骨架一出，基准就**非空且权威**。
+
+    只把「**声明了却完全不存在**」（``missing``）算硬缺陷：无歧义 —— 任何按基准调用的
+    文件都会 `ImportError` / `AttributeError`。签名差异（``mismatch``）只**记录**不判负：
+    调用方可能已被同步改过，属于可讨论的偏差（开发应在 ``deviations`` 里说明）。
+    """
+    out: dict[str, Any] = {"missing": [], "mismatch": [], "by_file": {}, "checked": 0}
+    if not isinstance(skeleton, dict) or not skeleton:
+        return out
+    root = Path(work)
+    # 遍历**并集**而不是只看产物：只遍历产物会漏掉最高价值的一档 ——
+    # 「基准冻结了接口，产物里根本没有这个文件」（那正是"文件凭空消失"）。
+    paths = {str(p).replace("\\", "/") for p in (written or [])}
+    paths.update(str(p).replace("\\", "/") for p in skeleton)
+    for rel in sorted(paths):
+        declared = skeleton.get(rel)
+        if not isinstance(declared, list) or not declared:
+            continue
+        path = root / rel
+        if not path.is_file():
+            out["missing"].append(f"{rel}：方案冻结了接口，产物里却没有这个文件")
+            out["by_file"].setdefault(rel, []).append("文件缺失")
+            continue
+        try:
+            actual = _declared_symbols(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        names = set(actual)
+        cls = ""
+        for line in declared:
+            text = str(line)
+            if text.startswith("class "):
+                cls = text[len("class "):].split("(")[0].strip()
+                if not cls:
+                    continue
+                out["checked"] += 1
+                if cls not in names and not any(k.startswith(cls + ".") for k in names):
+                    out["missing"].append(f"{rel}：基准声明了类 `{cls}`，产物里没有")
+                    out["by_file"].setdefault(rel, []).append(cls)
+                continue
+            m = re.match(r"\s{4}def\s+(\w+)\s*\((.*)\)\s*$", text)
+            if m and cls:  # 类的方法：只记签名差异
+                key = f"{cls}.{m.group(1)}"
+                params = actual.get(key)
+                if params is None:
+                    continue
+                declared_arity = sig_arity(m.group(2))
+                out["checked"] += 1
+                if declared_arity and declared_arity[0] != len(params):
+                    out["mismatch"].append(
+                        f"{rel}：`{key}` 基准声明 {declared_arity[0]} 个参数，产物里是 {len(params)} 个"
+                    )
+                continue
+            m = re.match(r"def\s+(\w+)\s*\((.*)\)\s*$", text)
+            if m:  # 模块级函数
+                out["checked"] += 1
+                if m.group(1) not in names:
+                    out["missing"].append(f"{rel}：基准声明了函数 `{m.group(1)}`，产物里没有")
+                    out["by_file"].setdefault(rel, []).append(m.group(1))
+    return out
+
+
+def contract_check(work: str | Path, written: list[str], plan: Any) -> dict:
+    """**跨文件契约比对**（聚合验证的核心，静态、不依赖 repo / LSP / 运行）。
+
+    方案里的 `contracts.exposes` 说"我提供什么"、`contracts.uses` 说"我用谁的什么"、
+    `interface` 说"签名长什么样"。这些**从来只被写、没被核过** —— 于是跨文件接口只能
+    等真跑才暴露：真机 run snake-v2 的 `ui.py` 读并不存在的 `game_logic.score`，
+    `AttributeError` 一直拖到 verify 跑入口才炸（整整一轮之后）。
+
+    这里把它变成**毫秒级静态断言**，且每条都能按文件归因到具体 task ⇒ 只重做那一张图。
+
+    刻意**不查** `symbols`（那是"本 task 要定义什么"）：它由 dev 阶段的施工图自检覆盖，
+    这里重复判只会让同一问题在两处各报一次、互相干扰归因。
+    """
+    out: dict[str, Any] = {"problems": [], "checked": 0, "by_file": {}, "unresolved": []}
+    tasks = [t for t in ((plan or {}).get("tasks") or []) if isinstance(t, dict)]
+    if not tasks:
+        return out
+    root = Path(work)
+    actual: dict[str, dict[str, list[str]]] = {}
+    for rel in [str(w) for w in written or []]:
+        path = root / rel
+        if not path.is_file() or not rel.endswith(".py"):
+            continue
+        try:
+            actual[str(rel).replace("\\", "/")] = _declared_symbols(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError:
+            continue
+    if not actual:
+        # 一个文件都没落盘 ⇒ 不是"契约对不上"，是更前置的问题，别在这里重复判
+        out["unresolved"].append("沙箱里没有可解析的 Python 文件，契约比对无法进行")
+        return out
+
+    def _norm(p: Any) -> str:
+        return str(p or "").replace("\\", "/")
+
+    def _find(symbol: str, preferred: list[str]) -> tuple[str | None, list[str] | None]:
+        """优先在声明的文件里找；找不到再全局找（宽松，但不静默放过）。"""
+        leaf = symbol.rsplit(".", 1)[-1]
+        for cand in preferred:
+            table = actual.get(_norm(cand)) or {}
+            for key in (symbol, symbol.rsplit(".", 1)[-1], leaf):
+                if key in table:
+                    return _norm(cand), table[key]
+        for path, table in actual.items():
+            for key in (symbol, leaf):
+                if key in table:
+                    return path, table[key]
+        return None, None
+
+    for task in tasks:
+        tid = str(task.get("id") or "?")
+        files = [_norm(f) for f in (task.get("target_files") or []) if f]
+        contracts = task.get("contracts") if isinstance(task.get("contracts"), dict) else {}
+        # ① 声明提供、实际没定义
+        for sym in [str(s) for s in (contracts.get("exposes") or []) if str(s).strip()]:
+            out["checked"] += 1
+            where, _ = _find(sym, files)
+            if where is None:
+                msg = f"{tid} 声明要提供 `{sym}`，但产物里找不到它的定义"
+                out["problems"].append(msg)
+                out["by_file"].setdefault(files[0] if files else "?", []).append(msg)
+        # ② 声明要用、目标侧没有（snake-v2 那一类）
+        for sym in [str(s) for s in (contracts.get("uses") or []) if str(s).strip()]:
+            out["checked"] += 1
+            where, _ = _find(sym, [])
+            if where is None:
+                msg = f"{tid} 声明要用 `{sym}`，但产物里没有这个符号（跨文件接口对不上）"
+                out["problems"].append(msg)
+                out["by_file"].setdefault(files[0] if files else "?", []).append(msg)
+        # ③ 签名与声明不符
+        name, params = _interface_of(task.get("interface") or "")
+        if name and params:
+            out["checked"] += 1
+            where, actual_params = _find(name, files)
+            if where is not None and actual_params is not None and len(actual_params) != len(params):
+                msg = (
+                    f"{tid} 的 `{name}` 签名与方案不符：方案声明 {len(params)} 个参数"
+                    f"（{task.get('interface')}），实际 {len(actual_params)} 个（{where}）"
+                )
+                out["problems"].append(msg)
+                out["by_file"].setdefault(where, []).append(msg)
+    if not out["checked"]:
+        # **没得比**必须说清楚：真机 run 20260927-002903 里 5 张施工图的
+        # interface/contracts 全是空的，比对返回 0 条问题 —— 那不是"接口都对得上"，
+        # 是**根本没有可比的声明**。沉默通过比报错更危险。
+        out["unresolved"].append(
+            f"{len(tasks)} 张施工图都没有声明 interface / contracts ⇒ 跨文件契约无从比对"
+        )
+    return out
+
+
+def _instance_attrs(node: ast.ClassDef) -> list[str]:
+    """类里 ``self.x = ...`` / ``self.x: T = ...`` 形式的实例属性（去重、保序）。
+
+    这一项是关键：属性不存在（``'GameLogic' object has no attribute 'score'``）
+    是 ast 层最难自查、而运行必炸的一类 —— 真机 run snake-v2 就是它。
+    """
+    seen: list[str] = []
+    for sub in ast.walk(node):
+        target: ast.expr | None = None
+        if isinstance(sub, ast.Assign) and len(sub.targets) == 1:
+            target = sub.targets[0]
+        elif isinstance(sub, ast.AnnAssign):
+            target = sub.target
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in ("self", "cls")
+            and target.attr not in seen
+        ):
+            seen.append(target.attr)
+    return seen
+
+
+def api_digest(
+    work: Path, written: list[str], *, max_files: int = 40, max_members: int = 28
+) -> dict[str, list[str]]:
+    """把本轮产出文件里**对外可用的接口**摘成短清单：``{相对路径: [成员签名, ...]}``。
+
+    为什么需要它：新建项目的**第一次 dev** 既没有检索池（``pool=0``）也没有沙箱
+    （``verify/work`` 还不存在），是在一片空白里一次写出全部文件的 —— 于是
+    「**同一次生成内部前后不一致**」成了最难自查的缺陷。真机 run snake-v2：
+    ``ui.py`` 读 ``self.game_logic.score``，而 ``game_logic.py`` 里没有这个属性，
+    ``AttributeError`` 一直到 verify 真跑入口才暴露（那是整整一轮之后）。
+
+    而重问时喂回去的 ``current_code`` 是**本轮开始之前**的正文，不是刚产出的那一版 ——
+    模型拿到的是「旧代码 + 新问题」，对不上号。这份摘要给的正是
+    「**你刚刚写出来的接口到底长什么样**」，且只占几十行预算。
+
+    刻意只收「别人会引用的东西」：模块级 def/class 的签名 + 类的实例属性（见
+    :func:`_instance_attrs`）。实现细节不进摘要 —— 摘要是给模型当准绳用的，不是 code review。
+    """
+    out: dict[str, list[str]] = {}
+    for rel in [str(w) for w in written][:max_files]:
+        if not rel.endswith(_STATIC_SUFFIX):
+            continue
+        path = work / rel
+        if not path.is_file():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, OSError, ValueError):
+            continue
+        members: list[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                members.append(f"def {node.name}{_sig_args(node.args, drop_self=False)}")
+            elif isinstance(node, ast.ClassDef):
+                bases = ", ".join(ast.unparse(b) for b in node.bases)
+                members.append(f"class {node.name}" + (f"({bases})" if bases else ""))
+                attrs = _instance_attrs(node)
+                if attrs:
+                    members.append("    实例属性: " + ", ".join(attrs))
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        members.append(f"    def {sub.name}{_sig_args(sub.args, drop_self=True)}")
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id.isupper():
+                        members.append(f"{tgt.id} = {ast.unparse(node.value)[:60]}")
+        if members:
+            out[rel] = members[:max_members]
+    return out
+
+
+def skeleton_digest(skeleton: Any) -> dict[str, list[str]]:
+    """把「方案·接口骨架」产物转成与 :func:`api_digest` **同形**的摘要。
+
+    同形是刻意的：这样一份基准可以直接被现成的三处消费方复用 ——
+      · ``prompts.api_digest_block``（钉进提示词当准绳）；
+      · :func:`digest_arities`（测试命令的参数个数核对）；
+      · :func:`contract_check`（跨文件契约校验的基准）。
+    不需要第二套表示，也就不会出现「两处表示不一致」。
+
+    产出与 ``api_digest`` 逐行对齐：``class X`` / ``    实例属性: a, b`` / ``    def m(p)`` /
+    ``def f(p)`` —— 这样 :func:`digest_arities` 的缩进语义（0 = 模块级、带缩进 = 类方法）
+    对两者完全一致。
+
+    **类方法要去掉开头的 ``self``/``cls``**：``api_digest`` 是从 AST 取的、天然不含 self，
+    而骨架是模型写的、常把 ``self`` 写进来；不去掉会让参数个数核对多算一个，把合法命令
+    误判成「参数不足」。
+    """
+    out: dict[str, list[str]] = {}
+    if not isinstance(skeleton, dict):
+        return out
+
+    def _strip_self(params: str) -> str:
+        text = str(params or "").strip()
+        m = re.match(r"\s*(self|cls)\s*(?:,|$)", text)
+        if not m:
+            return text
+        return text[m.end():].strip()
+
+    for item in skeleton.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").replace("\\", "/").strip()
+        if not path:
+            continue
+        lines: list[str] = []
+        for cls in item.get("classes") or []:
+            if not isinstance(cls, dict) or not str(cls.get("name") or "").strip():
+                continue
+            name = str(cls["name"]).strip()
+            bases = str(cls.get("bases") or "").strip()
+            lines.append(f"class {name}" + (f"({bases})" if bases else ""))
+            attrs = [str(a).strip() for a in (cls.get("attributes") or []) if str(a or "").strip()]
+            if attrs:
+                lines.append("    实例属性: " + ", ".join(attrs))
+            for m in cls.get("methods") or []:
+                if isinstance(m, dict) and str(m.get("name") or "").strip():
+                    params = _strip_self(str(m.get("params") or ""))
+                    lines.append(f"    def {str(m['name']).strip()}({params})")
+        for fn in item.get("functions") or []:
+            if isinstance(fn, dict) and str(fn.get("name") or "").strip():
+                lines.append(f"def {str(fn['name']).strip()}({str(fn.get('params') or '').strip()})")
+        for c in item.get("constants") or []:
+            if str(c or "").strip():
+                lines.append(str(c).strip())
+        if lines:
+            out[path] = lines
+    return out
+
+
+def test_modules(work: Path, written: list[str]) -> list[str]:
+    """本轮产出里**测试模块**的模块名（``python -m unittest`` 能直接吃的形式）。
+
+    只认两种命名约定：``test_*.py`` 与 ``*_test.py``。
+    **刻意不认** ``tests/`` 目录下的任意文件名 —— 那些未必是用例，乱跑会得到
+    一堆与产物无关的失败，把真正要修的东西淹掉。
+    """
+    out: list[str] = []
+    for rel in written:
+        name = Path(str(rel)).name
+        if not name.endswith(_STATIC_SUFFIX):
+            continue
+        stem = name[: -len(_STATIC_SUFFIX)]
+        if not (stem.startswith("test_") or stem.endswith("_test")):
+            continue
+        module = _module_name(work, str(rel))
+        if module and module not in out:
+            out.append(module)
+    return out
 
 
 def demo_command(work: Path, written: list[str]) -> str | None:
@@ -636,7 +1259,11 @@ def audit_impact(work: Path, written: list[str], impl: dict | None = None) -> di
         lines = source.splitlines()
         is_new = rel in written_set
 
-        def _record(node: ast.AST, kind: str, hit: str) -> None:
+        # 把本轮变量显式绑成默认参数：_record 只在本轮内被同步调用（下面紧接着就用），
+        # 但「闭包捕获循环变量」本身是缺陷模式 —— 绑定后既消除隐患，也避免以后有人
+        # 把 _record 存起来延后调用时踩到晚绑定。
+        def _record(node: ast.AST, kind: str, hit: str,
+                    lines: list[str] = lines, rel: str = rel, is_new: bool = is_new) -> None:
             lineno = getattr(node, "lineno", 0) or 0
             snippet = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
             callers.append({
@@ -879,6 +1506,192 @@ def _as_text(value: Any) -> str:
 
 
 # --------------------------------------------------------------------- 对外入口
+#: 覆盖率门槛。**只在能从真实输出里摘到数字时才判**（摘不到就老实归入"未验证"）——
+#: 非 Python 项目、没装覆盖率工具的项目，硬套一个门槛只会得到假阴性。
+COVERAGE_MIN_PCT = 80.0
+#: 断言型命令的识别口径（与 orchestrator._audit_test 同源，两处别漂移）
+_ASSERT_HINTS = ("assert", "unittest", "pytest", "doctest")
+#: 负向对照最多重跑几条断言（每条都是秒级命令；上限是为了别把一轮 verify 拖长）
+NEGATIVE_CONTROL_MAX = 2
+_COVERAGE_PATTERNS = (
+    re.compile(r"(?im)^TOTAL\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)%"),          # pytest-cov / coverage
+    re.compile(r"(?i)all files[^\n]*?\|\s*(\d+(?:\.\d+)?)"),            # jest --coverage / nyc
+    re.compile(r"(?i)\bcoverage[:=]?\s*(\d+(?:\.\d+)?)\s*%"),           # 通用 "coverage: 87%"
+    re.compile(r"(?i)total coverage[^\n]*?(\d+(?:\.\d+)?)"),            # go test -cover
+)
+
+
+def coverage_fact(commands: list[dict]) -> dict[str, Any]:
+    """从**命令的真实输出**里摘覆盖率数字。摘不到就说摘不到 —— 绝不给估算值。
+
+    为什么要单独做：覆盖率是"测试够不够"的唯一量化口径，但它**必须来自实测**。
+    本项目不接入覆盖率工具（技术栈无关）：有数字就判门槛，没数字就进"未验证项"清单
+    由人工判断能否接受。两种都诚实，唯独"估一个数"不行。
+    """
+    for cmd in commands or []:
+        text = f"{cmd.get('stdout_tail') or ''}\n{cmd.get('stderr_tail') or ''}"
+        for pattern in _COVERAGE_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                pct = float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= pct <= 100.0:
+                return {"percent": pct, "command": str(cmd.get("command") or ""),
+                        "matched": match.group(0).strip()[:80]}
+    return {"percent": None, "command": "", "matched": ""}
+
+
+def coverage_below_threshold(
+    coverage: dict[str, Any] | None, minimum: float = COVERAGE_MIN_PCT
+) -> str:
+    """覆盖率低于门槛时给出一句可读判断；不达标才返回文本，否则返回 ""。
+
+    处置口径：**提示级、不判负**。覆盖率低的可修面在"补用例"（测试阶段），
+    而阻断级返工会把这件事压到开发头上（它改不动测试），正是 §21 修掉的
+    「改不动却一直返工」。把它摆给评审与人工，由人决定补还是接受。
+
+    单独抽成函数是为了**能离线断言**：真机上要出现"有覆盖率数字且低于门槛"这一支，
+    得同时满足"测试阶段声明了覆盖率命令 + 本环境装了该工具 + 跑出来真的低于 80%"，
+    三件事凑齐很难 —— 抽出来就能用合成数据把这一支钉死。
+    """
+    pct = (coverage or {}).get("percent")
+    if pct is None:
+        return ""
+    try:
+        value = float(pct)
+    except (TypeError, ValueError):
+        return ""
+    if value >= float(minimum):
+        return ""
+    return (
+        f"覆盖率 {value:g}% 低于门槛 {float(minimum):g}%"
+        f"（实测，来自 `{(coverage or {}).get('command')}`）—— 用例覆盖面偏窄，"
+        "请判断是补用例还是接受为已知缺口"
+    )
+
+
+def negative_control(
+    work: Path,
+    repo: str | Path | None,
+    written: list[str],
+    commands: list[dict],
+    *,
+    timeout: int,
+    allowed_bins: frozenset[str],
+    deny_patterns: tuple[str, ...],
+    mock: bool = False,
+) -> dict[str, Any]:
+    """**负向对照**（Red→Green→Red 的可做版）：把补丁撤掉之后，那些断言还过得去吗？
+
+    为什么要它：`跑通 ≠ 正确`。一条断言如果在**没有本次改动**的代码上也能通过，那它对
+    这次交付**没有任何判别力** —— 它证明的是既有行为，不是新行为。真机上"测试全绿、
+    功能没实现"就是这么漏过去的。
+
+    做法（刻意便宜）：不重建沙箱，只把本次**写入的文件**按来源还原（新增的删掉、
+    修改的用仓库原文覆盖），再重跑**断言型**命令。断言型命令都是秒级的
+    `python -c "assert …"`，不碰常驻/图形入口，所以不会引入分钟级开销。
+
+    处置是**提示级**、且附给评审：有些断言本来就该在改动前后都成立（不变量、既有契约的
+    回归保护），把它判成阻断会让开发去改一条本来就正确的断言 —— 那又是一轮无谓返工。
+
+    任何一步出错都**静默跳过**：这是附加检查，绝不能因为它自己出问题而影响交付判定。
+    """
+    if mock or not written:
+        return {"checked": 0, "no_power": [], "skipped": "mock 运行 / 没有写入文件"}
+    targets = [
+        c for c in (commands or [])
+        if str(c.get("status")) == "ok"
+        and any(h in str(c.get("command") or "").lower() for h in _ASSERT_HINTS)
+    ]
+    if not targets:
+        return {"checked": 0, "no_power": [], "skipped": "本轮没有通过的断言型命令"}
+    repo_path = Path(repo) if repo else None
+    backups: list[tuple[Path, bytes | None]] = []
+    no_power: list[str] = []
+    checked = 0
+    try:
+        for rel in list(written)[:80]:
+            dest = work / rel
+            if not dest.exists():
+                continue
+            backups.append((dest, dest.read_bytes()))
+            src = (repo_path / rel) if repo_path else None
+            if src is not None and src.is_file():
+                dest.write_bytes(src.read_bytes())
+            else:
+                dest.unlink(missing_ok=True)
+        for spec in targets[:NEGATIVE_CONTROL_MAX]:
+            checked += 1
+            row = run_command(
+                spec, cwd=work, timeout=min(int(timeout), 60),
+                allowed_bins=allowed_bins, deny_patterns=deny_patterns, mock=False,
+            )
+            if row.get("status") == "ok":
+                no_power.append(str(spec.get("command")))
+    except Exception as exc:  # noqa: BLE001 - 附加检查，坏了也不能影响判定
+        return {"checked": checked, "no_power": no_power,
+                "skipped": f"负向对照未完成：{type(exc).__name__}: {exc}"}
+    finally:
+        for dest, data in backups:
+            try:
+                if data is None:
+                    dest.unlink(missing_ok=True)
+                else:
+                    dest.write_bytes(data)
+            except OSError:
+                pass
+    return {"checked": checked, "no_power": no_power, "skipped": ""}
+
+
+#: 与断言型命令无关的通用未验证项。**刻意固定列出来**：覆盖率/性能/并发这类东西，
+#: 一条「未接入」就代表「没验」，写成必列项才不会随着报告变"干净"而被忘掉。
+GENERIC_UNVERIFIED = (
+    "性能与并发副作用未测量",
+)
+
+
+def unverified_claims(
+    work: Path,
+    written: list[str],
+    executed: list[dict],
+    test_report: dict | None,
+    coverage: dict[str, Any] | None = None,
+) -> list[str]:
+    """**显式列出本轮「没有验证到」的事项**（交付前强制披露）。
+
+    为什么必须单列：流水线最容易出的错不是"报错"，而是**没验的部分被当成验过了** ——
+    报告一片安静，人工以为都过了。真机上的对应现象：8 轮全部"通过"，却没人发现入口丢了、
+    方向控制消失。一句"已验证"背后到底验了什么、没验什么，必须能被机器列出来，
+    否则「该不该放行」只能靠感觉。
+
+    口径：只列**事实**（没有断言命令 / 找不到测试文件 / 未接入覆盖率），不写评价。
+    """
+    out: list[str] = []
+    if not executed:
+        out.append("没有任何命令被实际执行：交付物「能不能跑」没有被验证")
+    elif all(str(c.get("status")) in ("skipped", "unavailable") for c in executed):
+        out.append("所有命令都未真正执行（被安全约定跳过或程序不存在）：没有任何实测证据")
+    if not any("assert" in str(s.get("command") or "") for s in executed):
+        out.append("没有断言型命令：退出码 0 只能说明「启动了」，不能说明「行为正确」")
+    if not test_modules(work, written):
+        out.append("沙箱里找不到可识别的测试文件：回归能力未被验证")
+    if not (test_report or {}).get("automated_commands"):
+        out.append("测试阶段没有声明 automated_commands：测试方案可能只是文字描述")
+    # 覆盖率：**有实测数字就不算"未验证"**（门槛判定在 verify 里单独做）；
+    # 没数字才是"未验证" —— 这两件事必须分开，否则要么撒谎（假装达标），
+    # 要么把已经量化的东西又说成"没验"。
+    if (coverage or {}).get("percent") is None:
+        out.append(
+            "覆盖率未测量：本轮输出里没有可解析的覆盖率数字（未接入覆盖率工具的项目属正常），"
+            "因此不给数字，也不假装达标"
+        )
+    out.extend(GENERIC_UNVERIFIED)
+    return out
+
+
 def verify(
     run_dir: Path,
     repo: str | Path | None,
@@ -904,6 +1717,8 @@ def verify(
         "commands": [],
         "problems": [],
         "notes": [],
+        # 未验证项（强制披露）：见 unverified_claims
+        "unverified": [],
     }
     if not enabled:
         report["notes"].append("运行验证已关闭（PIPELINE_VERIFY=0）")
@@ -966,11 +1781,18 @@ def verify(
         report["summary"] = "没有可执行的验证命令，无法确认能否运行"
         return report
     for spec in specs:
+        # 常驻类入口（游戏/桌面窗口）跑满完整超时是白等：它的「跑满」本来就被
+        # 判成「能跑起来」（见 RESIDENT_ENTRY_TIMEOUT 的注释）。给它一个短超时，
+        # 结论不变，一轮省下好几分钟。
+        cmd_timeout = timeout
+        _script = _python_script_arg(str(spec.get("command") or ""))
+        if _script and is_resident_entry(work, _script):
+            cmd_timeout = min(timeout, RESIDENT_ENTRY_TIMEOUT)
         report["commands"].append(
             run_command(
                 spec,
                 cwd=work,
-                timeout=timeout,
+                timeout=cmd_timeout,
                 allowed_bins=allowed_bins,
                 deny_patterns=deny_patterns,
                 mock=mock,
@@ -993,8 +1815,11 @@ def verify(
     static_problems += [f"产出文件无法解析（会掩盖其它问题）：{item}" for item in interfaces["unparsable"]]
     # 「用了别处的东西却没 import」：静态就能查出来，且不会像执行类检查那样被语法错短路
     static_problems += [f"引用未导入：{item}" for item in interfaces["undefined_names"]]
-    # 「产物到底跑起来过没有」：只有 rc=0 但零输出/无入口 ⇒ 视为没有可运行的证据
-    static_problems += runnability_problems(work, list(mat["written"]), list(report["commands"]))
+    # 「产物到底跑起来过没有」：只有 rc=0 但零输出/无入口 ⇒ 视为没有可运行的证据。
+    # **单独留一份**：它既可能是产物真有问题，也可能只是**测试命令质量差**（命令写错 ⇒
+    # 一条都没真跑起来）。归因要靠"有没有真正的产物失败"来定，见下方的 test_defects / impl_fail。
+    runnability = runnability_problems(work, list(mat["written"]), list(report["commands"]))
+    static_problems += runnability
     report["problems"].extend(static_problems)
     # 入口脚本的「空跑」只记 note，**不判 fail**：
     #   · 它多半是**测试命令的质量问题**（测试模型顺手写 `python <库模块>.py`），
@@ -1008,6 +1833,28 @@ def verify(
         c for c in report["commands"]
         if c["status"] in ("ok", "fail", "timeout", "error", "unavailable")
     ]
+    # 覆盖率（只在能从真实输出摘到数字时判门槛）与**负向对照**。
+    # 负向对照放在这里而不是更早：它会把沙箱里"本次写入的文件"还原成原文，
+    # 而上面的静态检查（接口/影响面/可运行性/入口探测）都要看**打完补丁**的沙箱。
+    coverage = coverage_fact(executed)
+    report["coverage"] = coverage
+    note = coverage_below_threshold(coverage)
+    if note:
+        report["notes"].append(note)
+    control = negative_control(
+        work, repo, list(mat["written"]), executed,
+        timeout=timeout, allowed_bins=allowed_bins, deny_patterns=deny_patterns, mock=mock,
+    )
+    report["negative_control"] = control
+    if control.get("no_power"):
+        # 这是"跑通≠正确"的机械证据：撤掉改动后断言还过，说明它没在验证本次交付。
+        report["notes"].append(
+            "负向对照：以下断言在**撤掉本次改动后依然通过** ⇒ 对这次交付没有判别力"
+            "（要么断言写的是既有行为，要么根本没有真正覆盖改动）："
+            + "；".join(f"`{c}`" for c in control["no_power"])
+        )
+    elif control.get("skipped"):
+        report["notes"].append(f"负向对照未执行：{control['skipped']}")
     # 常驻程序（游戏主循环 / 服务）跑满超时是**正常现象**，不是失败：它已经启动并持续运行，
     # 这比「退出码 0」更能证明产物能跑。真机 run 20260925-110258 的贪吃蛇 `python main.py`
     # 跑满 180s 被强杀 —— 若把它当失败，任何常驻形态的交付物都永远过不了 verify。
@@ -1030,10 +1877,65 @@ def verify(
             "以下命令因**本环境没有对应程序**而无法执行（命令质量问题，不计入交付物成败）："
             + "；".join(f"`{c['command']}`" for c in unavailable)
         )
+    # 「命令自己写错了」同样不算交付物失败 —— 与 unavailable 同理：命令是测试阶段
+    # 产出的，开发改不动它。真机 20260927-050907：`snake.Snake()`、`game.Game()`
+    # 没传 `__init__` 要求的参数；更早的 20260927-033201 里 `snake.Snake(canvas, ...)`
+    # 的 `canvas` 根本没定义。这类命令**必然**失败，计入判负就等于让开发为一件它
+    # 无权修改的东西反复返工，一轮都收敛不了。
+    def _miswritten(cmd: dict) -> bool:
+        if str(cmd.get("source") or "") != "planned":
+            return False  # 只豁免测试阶段声明的命令；产物自己的错误照常判负
+        if str(cmd.get("status") or "") not in ("fail", "error"):
+            return False
+        err = f"{cmd.get('stderr_tail') or ''}\n{cmd.get('stdout_tail') or ''}"
+        if "required positional argument" in err:
+            return True
+        # 拿裸 `None` 顶替必需对象：`'NoneType' object has no attribute ...`。
+        # **必须**确认命令里真的写了裸 None —— 否则可能是实现自己把属性留成了 None，
+        # 那就该判实现（不能一律放过）。
+        if "NoneType' object has no attribute" in err and passes_none_literal(str(cmd.get("command") or "")):
+            return True
+        m = re.search(r"NameError: name '([^']+)' is not defined", err)
+        if m and m.group(1) not in {Path(p).stem for p in mat["written"]}:
+            return True
+        return False
+
+    miswritten = [c for c in executed if _miswritten(c)]
+    if miswritten:
+        mis_ids = {id(c) for c in miswritten}
+        report["notes"].append(
+            "以下命令**自身不可执行**（构造参数不足或引用了未定义的名字）—— 属**测试层缺陷**"
+            "（命令是测试阶段产出的，开发无权修改），不计入交付物成败，也不得据此要求修改实现签名；"
+            "应由测试阶段修正命令："
+            + "；".join(f"`{c['command']}`" for c in miswritten)
+        )
+    else:
+        mis_ids: set[int] = set()
+
     failed = [
         c for c in executed
-        if c["status"] not in ("ok", "unavailable") and c not in long_running
+        if c["status"] not in ("ok", "unavailable") and c not in long_running and id(c) not in mis_ids
     ]
+
+    # ------------------------------------------------------------------ 归因：谁的错？
+    # 交付物**自身**的问题（接口不一致 / 无法解析 / 引用未导入 / 命令真的失败 / 补丁没套上）
+    # 才算「实现层失败」。剩下的「拿不到可运行证据」如果是被**测试命令写错**拖累的，
+    # 就是测试层缺陷 —— 判负依然诚实（确实没验证），但**不能**把责任推给实现。
+    impl_static = [p for p in static_problems if p not in runnability]
+    impl_fail = bool(failed or blocking or impl_static)
+    test_defects: list[str] = [
+        f"测试命令自身不可执行（参数不足 / 引用了未定义的名字）：`{c['command']}`"
+        for c in miswritten
+    ]
+    if not impl_fail and runnability:
+        test_defects += [f"没有取得可运行证据（测试命令质量问题）：{p}" for p in runnability]
+    report["impl_fail"] = impl_fail
+    report["test_defects"] = test_defects
+    if test_defects and not impl_fail:
+        report["notes"].append(
+            "本轮运行验证的失败**全部归因于测试层**（命令自身不可执行 / 无可用运行证据），"
+            "实现侧没有任何机械证据表明有问题 —— 请修测试命令，不要改实现签名。"
+        )
     # blocking（补丁没全套上）必须参与判定：否则「部分套用 + 剩余代码能跑通」
     # 会落到下面的 elif 分支判成 pass，把残缺的交付物放过去。
     if failed or static_problems or blocking:
@@ -1059,5 +1961,10 @@ def verify(
         + (f"，失败 {len(failed)} 条" if failed else "")
         + (f"，静态检查发现 {len(static_problems)} 项问题" if static_problems else "")
         + (f"，物化阶段 {len(blocking)} 项阻断问题" if blocking else "")
+    )
+    # 未验证项与 verdict 平级输出：verdict=pass 说的是「跑过的都过了」，
+    # **不等于**「该验的都验了」。两者必须分开呈现，否则 pass 会被读成"全都验过了"。
+    report["unverified"] = unverified_claims(
+        work, list(mat["written"]), executed, test_report, coverage
     )
     return report

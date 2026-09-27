@@ -41,12 +41,68 @@ TRACE_NAME = "traces.jsonl"
 ENV_NAME = "env.json"
 ISSUES_NAME = "issues.json"
 SUPERSEDED_DIR = "superseded"
+# 「页面发起的那次运行」被入口总闸拆成作业时写下的指针（gateway.link_run）。
+# 名字定义在这里、由 gateway 引用：列表要据此区分「拆分为作业」与「启动即失败」，
+# 两处各写一遍字符串迟早会漂移。
+GATEWAY_LINK_NAME = "gateway.json"
 
 # 全流程阶段顺序 + 阶段->state.artifacts 键。两者都是 pipeline/flow.py 的转发，
 # 真源只有一份 —— 以前这里和 config.FULL_STAGE_ORDER / orchestrator.ONLY_STAGES 各写一份，
 # 新增阶段时漏改就会「运行启动即死」（真机教训 20260924-134458）。
 FLOW_ORDER = list(flow.FLOW_ORDER)
 STAGE_STATE_KEY = dict(flow.STAGE_STATE_KEY)
+
+
+# --------------------------------------------------------------------- 调用埋点格式
+#: ``llm-calls.jsonl`` 的固定列。**每条记录都带齐这些列**（不适用时为 null），
+#: 外加 ``kind`` 判别它是哪种记录：
+#:   ``llm``    —— 一次模型调用（大多数）
+#:   ``verify`` —— 机械验证节点的执行结论
+#:   ``gate``   —— 人工闸门的占位记录（不调模型）
+#:
+#: 为什么必须显式固定：以前写的是 ``{"stage": stage, **meta}``，列集由 meta 的**构造点**
+#: 隐式决定。真机数据里 47 条记录中 41 条是模型调用形状、6 条是验证形状 ——
+#: 想按列聚合（「各阶段平均 prefill tps」）就得先猜每条属于哪种，而某处漏写一个键
+#: 谁也不会发现，等要聚合时那段时期已经无法回填。现在列一定在，聚合可以无条件取。
+CALL_FIELDS: tuple[str, ...] = (
+    # 身份与判别
+    "kind", "at", "stage", "note", "mock",
+    # 模型与本次调度
+    "tag", "role", "attempt", "num_ctx", "think", "prompt_version",
+    "switched", "resident_before",
+    # 停止原因（stop / length）与本次输出上限 —— 截断排查靠这两个字段
+    "num_predict", "done_reason",
+    # token 与截断
+    "prompt_tokens", "prompt_est_tokens", "output_tokens",
+    "truncated", "prompt_over_ctx_ratio", "prompt_over_budget",
+    # 耗时与吞吐（秒 / token 每秒）
+    "wall_s", "total_s", "load_s", "prompt_s", "eval_s",
+    "prefill_tps", "gen_tps", "thinking_chars",
+    # 显存
+    "vram_gb", "model_gb", "vram_ratio",
+    # 人工与契约
+    "human_feedback_used", "schema_errors",
+    # 机械验证专有
+    "verdict", "commands", "failures",
+    # 闸门占位专有
+    "gate",
+)
+
+
+def normalize_call_record(payload: dict) -> dict:
+    """把一条埋点规整成固定列：按 ``CALL_FIELDS`` 的顺序输出，缺列补 ``None``。
+
+    声明之外的字段**原样保留**（不丢信息，只是排在固定列之后）；
+    历史记录没有 ``kind`` 时按「有 verdict 就是 verify」推断，便于读旧产物。
+    """
+    record = dict(payload)
+    if not record.get("kind"):
+        record["kind"] = "verify" if "verdict" in record else "llm"
+    ordered: dict[str, Any] = {key: record.get(key) for key in CALL_FIELDS}
+    for key, value in record.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -78,7 +134,7 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def _read_json(path: Path) -> Any:
-    for attempt in range(3):
+    for _attempt in range(3):
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -263,6 +319,46 @@ def stage_snapshots(run_dir: Path, include_superseded: bool = False) -> list[dic
     return rows
 
 
+def artifact_view(state: dict | None) -> dict[str, Any]:
+    """取「产物层」。**两种形状都要能吃** —— 这是本项目最容易静默出错的一处。
+
+    事实：``read_state()`` 返回的是**整份快照**（顶层有 status / cursor / attempt / rounds /
+    calls…），而各阶段产物在 ``artifacts`` 里；但 ``orchestrator`` 内部的 ``self.state``
+    **本身就是产物层**（它被放进快照的 artifacts 键）。于是同一个键名
+    （`rule_findings` / `verify_report` / `scope` / `test_report`…）在两处**不在同一层**。
+
+    读错层的后果是**静默为空**：红线、未验证项、覆盖率、就绪度全查不到，页面一片干净，
+    看起来像"没问题"——真机校准 `20260926-205505` 就是这么抓到自己的：日志里明明
+    打了「[红线] 阻断 0 条 / 提示 5 条」，消费方却拿到 0 条。
+
+    所以消费方一律走这个入口，别自己 `.get()` 猜层。
+    """
+    if not isinstance(state, dict):
+        return {}
+    art = state.get("artifacts")
+    return art if isinstance(art, dict) else state
+
+
+def duplicate_stage_seqs(run_dir: Path) -> list[str]:
+    """同一个 seq 出现多份产物 —— 即「两代产物混存」的机械证据。
+
+    真机 job-20260926-154657-M-01：被中断后以同一个 run_id 重跑，旧代码不归档，
+    于是 `seq=3` 同时有上一代的 `architect_plan` 与这一代的 `architect_assess`，
+    `seq=4` 同时有 `dev` 与 `architect_plan`。后果不只是"看着乱"：
+    阶段列表与检查点时间线重复且乱序，人工看「最新产物」极易读成错的一代。
+    作业侧已在重跑前归档（`gateway._archive_previous_run`），这里是**兜底探测** ——
+    普通运行（非作业）用同一 run_id 复跑时没有那道归档，必须能被报出来。
+    """
+    by_seq: dict[int, list[str]] = {}
+    for row in stage_snapshots(Path(run_dir)):
+        by_seq.setdefault(int(row["seq"]), []).append(str(row["file"]))
+    return [
+        f"seq {seq}：{'、'.join(sorted(files))}"
+        for seq, files in sorted(by_seq.items())
+        if len(files) > 1
+    ]
+
+
 def latest_artifacts(run_dir: Path) -> dict[str, Any]:
     """每个阶段取最后一次快照的 artifact（人工编辑过的文件即最后一份，天然生效）。"""
     out: dict[str, Any] = {}
@@ -405,10 +501,15 @@ def list_runs(runs_dir: Path) -> list[dict]:
             # runs/ 下的无关目录也列进来）。
             if not (entry / LOG_NAME).exists() and not (entry / REQ_NAME).exists():
                 continue
+            # 例外：被入口总闸拆成作业的运行**本来就不会**有 state.json —— 产物落在
+            # runs/_jobs/<job_id>/ 下，这个目录只剩日志与指针。把它标成「启动失败」是
+            # 彻底的误报（真机 20260926-154413 明明在跑，列表却说它失败），故单列一档。
+            link = _read_json(entry / GATEWAY_LINK_NAME) or {}
             rows.append(
                 {
                     "run_id": entry.name,
-                    "status": "failed",
+                    "status": "job" if link.get("job_id") else "failed",
+                    "job_id": link.get("job_id"),
                     "verdict": None,
                     "needs_human": False,
                     "cursor": None,
@@ -454,9 +555,20 @@ def run_detail(run_dir: Path) -> dict:
     run_dir = Path(run_dir)
     state = read_state(run_dir) or {}
     summary = read_summary(run_dir) or {}
-    # 审计类产物在 state.artifacts 里（与各阶段产物同层），页面按顶层取用会取不到，这里摊平
+    # 审计类产物在 state.artifacts 里（与各阶段产物同层），页面按顶层取用会取不到，这里摊平。
+    # ⚠ 这份 `state` 视图是**白名单**（见下面 return 里的键列表）—— 也就是说：**新加的产物层键
+    # 必须在这里登记**，否则"流水线写了、日志也打了、页面却一片干净"。
+    # 真机校准 20260926-205505 就是这么抓到的：日志 `[红线] 阻断 0 条 / 提示 5 条`，
+    # 页面与账本全是 0。消费侧另有 `artifact_view`（给 gateway/issues 这类直接吃快照的地方）。
     artifacts = state.get("artifacts") or {}
-    for key in ("implementation_audit", "patch_audit"):
+    for key in (
+        "implementation_audit", "patch_audit",
+        # verify_report 在真实快照里通常是顶层键，但补丁产物形态不一时也可能只在 artifacts
+        # 里（合成/旧数据）—— 摊平一次是无害的幂等操作
+        "verify_report",
+        # 本轮新增的机械信号：红线 / 被证伪项 / 两代混存 / 规则库加载问题
+        "rule_findings", "refuted_blockers", "duplicate_stage_seqs", "rule_load_notes",
+    ):
         if key not in state and artifacts.get(key):
             state[key] = artifacts[key]
     snaps = stage_snapshots(run_dir)
@@ -493,6 +605,12 @@ def run_detail(run_dir: Path) -> dict:
                 "implementation_audit",
                 "patch_audit",
                 "verify_report",
+                # ⚠ 这份视图是**白名单**：上面摊平过的键必须在这里登记，否则等于白摊
+                # （页面会"一片干净"，而日志/账本里明明有 —— 真机校准踩过）。
+                "rule_findings",
+                "refuted_blockers",
+                "duplicate_stage_seqs",
+                "rule_load_notes",
                 "grounding_warnings",
                 "elapsed_s",
                 "model_switches",

@@ -321,6 +321,12 @@
       <div class="note">调小会让该阶段看到的代码片段被裁剪，可能直接导致补丁偏浅，改动请注意。</div>
       <div id="cfg-budgets"></div>
 
+      <h3>工程红线规则库</h3>
+      <div class="note">补丁**落盘前**拦截 + 评审机械证据的来源。每条规则都写明「凭什么判负」与
+        「什么反例能推翻它」；阻断级会强制打回开发，提示级只作证据。规则是数据文件
+        <code>pipeline/rules.json</code> —— 加规则不用改代码，改完存盘即生效（下个进程）。</div>
+      <div id="cfg-rules"><div class="note">加载中…</div></div>
+
       <div class="row" style="margin-top:12px">
         <button class="primary" id="cfg-save">保存</button>
         <button id="cfg-reset">全部还原默认</button>
@@ -819,6 +825,9 @@ function statusBadge(run){
   if(run.orphaned) return badge("异常中断","bad");
   if(st === "paused") return badge("已暂停","warn");
   if(st === "done") return badge("已结束","ok");
+  // 被入口总闸拆成作业：这个目录**永远不会有** state.json（产物在 runs/_jobs/<job_id>/），
+  // 不能和「启动即失败」混为一谈 —— 真机 20260926-154413 就被列表说成失败，它当时跑得好好的。
+  if(st === "job") return badge("拆分为作业","acc");
   // 启动即失败（没有 state.json，目录里只有 console.log）
   if(st === "failed") return badge("启动失败","bad");
   return badge(st || "未知");
@@ -852,6 +861,11 @@ function lastLogLine(log){
   if(!log) return "";
   const lines = log.split("\n").map(s => s.trim()).filter(Boolean);
   return lines.length ? lines[lines.length-1].slice(0,160) : "";
+}
+// 退出原因压成短标记（完整内容放 title）：列表行宽度有限，而这段可能长达 300 字
+function shortReason(s){
+  s = String(s||"");
+  return s.length>42 ? s.slice(0,42)+"…" : s;
 }
 function elapsedSec(d){
   if(d && d.started_at) return Math.max(0, Math.round(Date.now()/1000 - d.started_at));
@@ -1061,6 +1075,11 @@ function renderProgress(d){
   if(phase === "running"){
     const ll = lastLogLine(d.log);
     if(ll) detail.push(`日志：${ll}`);
+  } else if(d.exit_reason){
+    // 后端已从 console.log 末尾摘出退出原因（最常见就是一行 Python 异常）。
+    // 放在这里而不是进度摘要行：这段可能较长，摘要行会被撑爆；
+    // textContent 赋值也不涉及转义问题。
+    detail.push(`退出原因：${d.exit_reason}`);
   }
   $("d-prog-detail").textContent = detail.join("　|　");
 }
@@ -1092,6 +1111,7 @@ async function loadRuns(){
         ${r.running&&r.cursor?badge("执行中 "+(STAGE_CN[r.cursor]||r.cursor),"acc"):(r.cursor?badge("next "+(STAGE_CN[r.cursor]||r.cursor)):"")}
         ${r.attempts?badge("迭代 "+r.attempts):""}
         ${r.presence?badge("外部进程 pid="+esc(String(r.presence.pid||"?")),"warn"):""}
+        ${r.exit_reason?`<span class="b bad" title="${esc(r.exit_reason)}">${esc(shortReason(r.exit_reason))}</span>`:""}
         ${r.reviewed_rounds?badge("评审 "+r.reviewed_rounds):""}
         ${r.wall_s?badge(r.wall_s+"s"):""}
         ${r.issues && r.issues.total?badge("问题 " + r.issues.total, r.issues.blockers?"bad":""):""}
@@ -1211,6 +1231,13 @@ function startPolling(){
 
 function renderDetail(){
   const d = S.detail, st = d.state || {}, sm = d.summary || {};
+  // **产物层**：`state.json` 是整份快照（顶层是 status/cursor/attempt/…，阶段产物在
+  // `artifacts` 里），而 `rule_findings` / `verify_report` / `refuted_blockers` 这些
+  // 只在产物层。读错层的表现是**静默为空** —— 页面一片干净，看着像没问题
+  // （真机校准 20260926-205505 就是这么发现的：日志打了 5 条红线，页面/账本全是 0）。
+  // 这里把两层并起来：产物层的键优先生效，快照原有键照旧可用。
+  const art = Object.assign({}, st,
+    (st.artifacts && typeof st.artifacts === "object") ? st.artifacts : {});
   const phase = runPhase(d);
   const running = phase === "running";
   // 可续跑 / 编辑产物 / 改闸门 的相位。
@@ -1237,7 +1264,10 @@ function renderDetail(){
   $("btn-resume").title = editable
     ? (phase === "aborted" ? "从中断处接着跑（进程已不在，续跑会重新拉起）" : "")
     : (running ? "运行中，不可续跑（可点「中断」）"
-      : (d.has_state ? "该运行已结束，无法续跑" : "该运行没有 state.json，无法续跑"));
+      : (d.has_state ? "该运行已结束，无法续跑"
+        : (d.gateway
+          ? "该运行已拆分为作业 " + d.gateway.job_id + "，请到作业里续跑/打回"
+          : "该运行没有 state.json，无法续跑")));
 
   // 录入控件随状态控制
   $("feedback").disabled = !editable;
@@ -1277,7 +1307,8 @@ function renderDetail(){
         : (phase === "aborted"
           ? "异常中断（进程已不在）：可点「继续执行」从中断处接着跑"
           : "已暂停：可续跑 / 编辑产物 / 打回"))
-      : (d.has_state ? "已结束：不可续跑，仅供查看" : "无 state.json：仅供查看"));
+      : (d.has_state ? "已结束：不可续跑，仅供查看"
+        : (d.gateway ? "已拆分为作业：产物在作业目录（点上方「查看作业」）" : "无 state.json：仅供查看")));
   // 回流上限输入：仅可操作相位可改；只读时把当前值放进 placeholder 供对照
   const maxInput = $("dg-max");
   if(maxInput){
@@ -1288,10 +1319,57 @@ function renderDetail(){
   renderProgress(d);
 
   const warn = (st.grounding_warnings || []).map(w => `${w.stage}: ${(w.paths||[]).join(", ")}`);
+  // 缺 state.json 有三种完全不同的成因，文案必须分开 —— 混为一谈会把人引到错的方向：
+  //   · 刚启动、正处在入口总闸（GA 规模判定）：进程活着，只是还没走到主循环（state 由它首次落盘）；
+  //   · 已被入口总闸拆成作业：这个目录**永远不会**有 state.json（产物在 runs/_jobs/<job_id>/），
+  //     正解由 renderGatewayLink 给出，这里不能再叠一句「不能续跑」；
+  //   · 真·启动即失败（子进程非 0 退出）：这时说「只能查看」才对，日志卡也会自动展开。
+  let noStateNote = "";
+  if(!d.has_state && !d.gateway){
+    // GA 的「正在判定」痕迹（runs/<id>/ga.json）：它比"进程还活着"更具体 ——
+    // 能说出是从什么时候开始的、按什么规模预判的。没有它就只剩一句"还没落盘"。
+    const ga = d.ga || {};
+    const gaWhen = ga.started_at ? `（开始于 ${esc(ga.started_at)}）` : "";
+    const gaStats = ga.stats && ga.stats.files
+      ? `按 ${ga.stats.files} 个文件 / ${ga.stats.lines || 0} 行代码预判为疑似大型`
+      : "";
+    noStateNote = running
+      ? (ga.status === "running"
+        ? `<div class="note">正在<b>入口总闸（GA 规模判定）</b>中 ${gaWhen} —— ${gaStats || "在判定要不要拆模块"}；`
+          + `它跑在流水线主循环**之前**，所以还没有 state.json（14B 一次几十秒到几分钟），页面稍后自动刷新。</div>`
+        : `<div class="note">已启动：正在<b>入口总闸</b>（规模判定）阶段 —— 它在流水线主循环之前，`
+          + `所以还没有 state.json（14B 判定一次几十秒到几分钟），页面稍后自动刷新。</div>`)
+      : (ga.scale
+        ? `<div class="warnbox">该运行没有 state.json：入口总闸已判定 scale=${esc(ga.scale)}，`
+          + `但主循环没有落盘 —— 多半是启动即失败（子进程非 0 退出），日志已展开。</div>`
+        : `<div class="warnbox">该运行没有 state.json（可能是 --only 运行，或启动即失败），只能查看，不能续跑。</div>`);
+  }
+  // 工程红线 / 未验证项 / 被证伪的旧阻断项 / 记录卫生：这四类是**机制算出来的结论**，
+  // 藏进产物文件里等于没做（人工只看顶部就下判断）。放在最顶部的提示区。
+  const findings = (art.rule_findings || []).filter(f => !f.note);
+  const blk = findings.filter(f => f.severity === "blocker");
+  const wrn = findings.filter(f => f.severity !== "blocker");
+  const ruleLines = arr => arr.slice(0,5).map(f =>
+    `· [${f.severity === "blocker" ? "阻断" : "提示"}] ${esc(f.title || f.rule)} @ ${esc(f.path)}:${f.line || "?"}`
+    + (f.excerpt ? ` — <code>${esc(f.excerpt)}</code>` : "")
+    + (f.negative ? `<div class="note">反例判据：${esc(f.negative)}</div>` : "")).join("<br>");
+  const unverified = (art.verify_report || {}).unverified || [];
+  const refuted = art.refuted_blockers || [];
+  const dupSeq = art.duplicate_stage_seqs || [];
+  const ruleNotes = art.rule_load_notes || [];
   $("d-msg").innerHTML =
-    (!d.has_state ? `<div class="warnbox">该运行没有 state.json（可能是 --only 运行），只能查看，不能续跑。</div>` : "") +
+    noStateNote +
     (d.superseded ? `<div class="note">已作废旧快照 ${d.superseded} 个（superseded/）。</div>` : "") +
     (warn.length ? `<div class="warnbox">未接地路径：${esc(warn.join("；"))}</div>` : "") +
+    (blk.length ? `<div class="warnbox"><b>工程红线：${blk.length} 条阻断</b>（机制判定，评审不得判 pass）<br>${ruleLines(blk)}</div>` : "") +
+    (wrn.length ? `<div class="note"><b>工程红线：${wrn.length} 条提示</b><br>${ruleLines(wrn)}</div>` : "") +
+    (unverified.length ? `<div class="note"><b>未验证项 ${unverified.length} 条</b>（pass ≠ 该验的都验了）：`
+      + unverified.slice(0,5).map(u => "· " + esc(u)).join("<br>")
+      + (unverified.length > 5 ? `…另有 ${unverified.length - 5} 条` : "") + `</div>` : "") +
+    (refuted.length ? `<div class="note">已被本轮机械证据证伪、不再回灌的旧阻断项 ${refuted.length} 条：`
+      + refuted.slice(0,3).map(t => "· " + esc(t)).join("<br>") + `</div>` : "") +
+    (dupSeq.length ? `<div class="warnbox">同一 seq 存在多份产物（两代混存，看「最新产物」易读错）：${esc(dupSeq.join("；"))}</div>` : "") +
+    (ruleNotes.length ? `<div class="note">规则库加载问题（对应检查可能没生效）：${esc(ruleNotes.join("；"))}</div>` : "") +
     (Object.keys(st.human_feedback||{}).length
       ? `<div class="note">已注入人工意见：${esc(JSON.stringify(st.human_feedback))}</div>` : "");
 
@@ -1343,7 +1421,7 @@ function renderDetail(){
 
   $("d-handoff-card").hidden = !d.handoff;
   if(!skipIfSame($("d-handoff"), sigOf(d.handoff || ""))) $("d-handoff").innerHTML = mdToHtml(d.handoff || "");
-  renderLog(d.log || "");
+  renderLog(d.log || "", d.log_source, d.log_from);
 
   // 启动即失败的运行（没有 state.json）：自动展开日志 —— 否则人工只看到「无 state.json，
   // 只能查看」，却不知道为什么失败，而原因就写在 console.log 的头几行。
@@ -1412,14 +1490,23 @@ const KIND_LABEL = {
   review_residual_risk: "评审残留风险", test_gap: "测试未覆盖",
   pm_unknown: "需求未决", arch_uncertainty: "架构不确定",
   human_gate: "人工闸门", human_edit: "人工改产物", human_rework: "人工打回",
-  human_directive: "人工意见", needs_human: "触顶需人工裁决"
+  human_directive: "人工意见", needs_human: "触顶需人工裁决",
+  rule_violation: "工程红线判负", refuted_stale_fix: "旧阻断项被证伪",
+  unverified_claim: "未验证项", stage_seq_conflict: "两代产物混存",
+  rule_load_problem: "规则库加载问题"
 };
 
 // 运行日志：按行着色 + 可选「只看警告/错误」；已在底部时自动跟随，
 // 否则保持用户当前位置。用签名判断内容是否变化，避免每 2.5s 重渲冲掉选中文本。
-function renderLog(text){
+function renderLog(text, source, from){
   const box = $("d-log");
-  const sig = sigOf([text, $("log-only-issues").checked]);
+  // 来源要显式说出来：模块运行（job-…-M-01）**没有自己的日志**，整组跑在一个子进程里，
+  // 它显示的是所属作业的日志。不标注的话，人会以为"这模块的日志怎么全是别的模块的"。
+  const head = source === "job"
+    ? `<span class="note">该模块没有自己的 console.log（整组模块跑在一个子进程里）；`
+      + `以下是所属**作业**的日志${from ? `（${esc(from)}）` : ""}。</span>\n`
+    : "";
+  const sig = sigOf([text, $("log-only-issues").checked, source || ""]);
   if(box.dataset.sig === sig) return;
   const first = box.dataset.sig == null;
   const stick = $("log-follow").checked
@@ -1432,7 +1519,7 @@ function renderLog(text){
       + `命令行直接运行的日志只在终端里。</span>`;
     return;
   }
-  box.innerHTML = highlightLog(text, $("log-only-issues").checked);
+  box.innerHTML = head + highlightLog(text, $("log-only-issues").checked);
   if(stick) box.scrollTop = box.scrollHeight;
 }
 
@@ -1625,6 +1712,31 @@ function renderConfig(){
   renderCfgPrompts();
   renderCfgRuntime();
   renderCfgBudgets();
+  renderCfgRules();
+}
+
+// 规则库清单：`rules.catalog()` 以前是个**没人调用**的函数 ——
+// 也就是说"有哪些红线在管你"只能翻 json。摆到配置页，规则才可被别人审阅与讨论。
+async function renderCfgRules(){
+  const box = $("cfg-rules");
+  try{
+    const d = await api("/api/rules");
+    const rows = d.rules || [];
+    const notes = d.notes || [];
+    const blockers = rows.filter(r => r.severity === "blocker").length;
+    box.innerHTML =
+      (notes.length ? `<div class="warnbox">规则库加载问题（这些规则可能没生效）：${esc(notes.join("；"))}</div>` : "")
+      + `<div class="note">共 ${rows.length} 条：阻断 ${blockers} / 提示 ${rows.length - blockers}；`
+      + `其中条件触发（只在对应技术栈生效）${rows.filter(r => r.layer === "B").length} 条。</div>`
+      + rows.map(r => `<div class="row" style="gap:8px;margin:3px 0;align-items:center">
+          <code>${esc(r.id)}</code>${badge(r.severity === "blocker" ? "阻断" : "提示",
+            r.severity === "blocker" ? "bad" : "warn")}
+          <span>${esc(r.title)}</span><span class="grow"></span>
+          <span class="note">${r.layer === "B" ? "条件触发" : "总是检查"}</span>
+        </div>
+        <div class="note" style="margin:0 0 6px 0">反例判据：${esc(r.negative || "（缺，不可判负）")}`
+        + (r.source ? ` · 出处：${esc(r.source)}` : "") + `</div>`).join("");
+  }catch(e){ box.textContent = "加载失败: " + netHint(e); }
 }
 
 // Ollama 返回的 name 常带 ":latest" 后缀，而配置里写的是裸 tag —— 二者等价。
@@ -1970,7 +2082,7 @@ function markSameTopic(rows){
   }
 }
 
-function intakeRow(kind, ref, head, preset, value, noFill, lock, ask){
+function intakeRow(kind, ref, head, preset, value, noFill, lock, ask, placeholder){
   // 「问模型」＝把这一条设为裁决参谋的焦点（风险 / 收益 / 可逆性），可反复问。
   // 已走过阶段的只读记录也保留它 —— 「当时为什么这么定」同样值得问。
   const askBtn = ask
@@ -1995,7 +2107,7 @@ function intakeRow(kind, ref, head, preset, value, noFill, lock, ask){
     <div>${head}</div>
     <div class="row" style="margin-top:6px">
       <input type="text" data-ikind="${kind}" data-ref="${esc(ref)}" style="flex:1"
-        placeholder="${noFill ? "补强没给具体取值，请直接写裁决…（留空则不落盘）" : "填写裁决…（留空则不落盘）"}"
+        placeholder="${esc(placeholder || (noFill ? "补强没给具体取值，请直接写裁决…（留空则不落盘）" : "填写裁决…（留空则不落盘）"))}"
         value="${esc(value)}">
       ${fill}${askBtn}
     </div></div>`;
@@ -2275,6 +2387,17 @@ function renderPmQuestions(){
   const art = snap && snap.artifact;
   const card = $("d-pmq-card");
   const qs = (art && art.open_questions) || [];
+  // 「未明确项」：PM 自己标了"这里没弄清楚"、**没给建议值**的条目（unknowns /
+  // clarifying_questions）。它们与 open_questions 同属"还不是陈述" —— 强控要求人工
+  // 逐条给出结论，裁决后从这两列移除并进 confirmed_facts（见 prompts.apply_pm_decisions）。
+  const vague = [];
+  ["unknowns", "clarifying_questions"].forEach(k => {
+    ((art && art[k]) || []).forEach(x => {
+      const ref = String((x && (x.item || x.question || x.text)) || x || "").trim();
+      if(ref) vague.push({field: k, ref});
+    });
+  });
+  const total = qs.length + vague.length;
   const st = d.state || {};
   // 同补强卡片：只有运行停在 PM 闸门上时才可裁决；已走过就展示历史记录（只读）。
   const active = !!(S.editable && st.paused_after === "pm");
@@ -2285,9 +2408,9 @@ function renderPmQuestions(){
     syncAdvicePanel("pm", "d-pmq-advice");
     return;
   }
-  card.hidden = !qs.length;
+  card.hidden = !total;
   $("d-pmq-out").textContent = "";
-  if(!qs.length){
+  if(!total){
     $("d-pmq-body").innerHTML = "";
     $("d-pmq-mode").textContent = "";
     $("d-pmq-hint").textContent = "";
@@ -2310,17 +2433,20 @@ function renderPmQuestions(){
   };
   (art.confirmed_facts || []).forEach(addFact);
   qs.forEach(q => { const v = decidedOf(q); if(v) addFact(`${q.question}：${v}`); });
+  const vagueDecided = v => String(saved[v.ref] || "").trim();
+  vague.forEach(v => { const d2 = vagueDecided(v); if(d2) addFact(`${v.ref}：${d2}`); });
   if(facts.length){
     parts.push(`<h3 style="margin:4px 0 2px">已确认结论（${facts.length}，将作为确定结论给到下游）</h3>
       <div>${facts.map(f => badge(esc(f), "ok")).join(" ")}</div>`);
   }
 
-  const decidedCount = qs.filter(q => decidedOf(q)).length;
+  const decidedCount = qs.filter(q => decidedOf(q)).length + vague.filter(v => vagueDecided(v)).length;
   $("d-pmq-mode").textContent = active ? "待你裁决" : "已完成 · 历史记录（只读）";
   $("d-pmq-hint").innerHTML = active
     ? `PM 给出的是<b>建议 / 默认取值</b>。逐条裁决后，裁决值会并回 PM 产物（<code>NN-pm.json</code>），
-       下游拿到的就是<b>确定结论</b>，不会再把这些问一遍。留空不落盘。`
-    : `该阶段已走过，下面是<b>当时的裁决记录（只读）</b>：共 ${qs.length} 项、${decidedCount} 项有人工裁决。
+       下游拿到的就是<b>确定结论</b>，不会再把这些问一遍。留空不落盘。<br>
+       未裁决 / 未明确项<b>一条不剩</b>之后才能继续往下走（强控：往下流的必须是陈述）。`
+    : `该阶段已走过，下面是<b>当时的裁决记录（只读）</b>：共 ${total} 项、${decidedCount} 项有人工裁决。
        需要改动请用左侧「打回重跑本阶段」从 PM 重来。`;
 
   qs.forEach(q => {
@@ -2336,6 +2462,16 @@ function renderPmQuestions(){
                 : (active ? "" : `<div class="note">当时没有给出裁决。</div>`)}`;
     parts.push(intakeRow("pm_question", ref, head,
       String(q.assumed_answer || ""), decided, false, !active, ref));
+  });
+  vague.forEach(v => {
+    const decided = vagueDecided(v);
+    const head = `<b>${esc(v.ref)}</b> ${badge("未明确项 · " + v.field)}
+      ${decided ? badge("已裁决", "ok") : (active ? "" : badge("未裁决", "warn"))}
+      <div class="note">PM 只标出「这里没弄清楚」，<b>没有给建议值</b> —— 请直接写一句确定结论。</div>
+      ${decided ? `<div class="note">裁决：<b>${esc(decided)}</b></div>`
+                : (active ? "" : `<div class="note">当时没有给出裁决。</div>`)}`;
+    parts.push(intakeRow("pm_vague", v.ref, head, "", decided, true, !active, v.ref,
+      "写明确定结论…（填了就从「未明确项」里移除，成为下游唯一的说法；留空则不落盘）"));
   });
   $("btn-pmq-save").hidden = !active;
   $("d-pmq-body").innerHTML = parts.join("");
@@ -3318,7 +3454,10 @@ const JS = {jobs:[], cur:null, detail:null};
 function jobStatusBadge(st){
   const map = {done:["已完成","ok"], running:["进行中","acc"], paused:["已暂停","warn"],
                blocked:["有阻断","bad"], partial:["部分完成","warn"], pending:["待执行",""],
-               empty:["无模块",""], failed:["失败","bad"]};
+               empty:["无模块",""], failed:["失败","bad"],
+               // 作业的两个**待人工**相位（作业的人工环节只有这两处）
+               awaiting_pm:["待你确认 PM","warn"], awaiting_review:["待统一验收","warn"],
+               pm_paused:["PM 待确认","warn"], skipped:["已跳过",""]};
   const item = map[st] || [st || "未知", ""];
   return badge(item[0], item[1]);
 }
@@ -3364,13 +3503,111 @@ async function openJob(jobId){
   } catch(e){ toast("打开作业失败: " + netHint(e), "bad"); }
 }
 
+// 交付就绪度（4 门 × 0–2 分，机制算出来的）：回答的是「能不能收」，
+// 与「跑完了没有」是两件事。未验证项必须一起露出来 —— 人工最有价值的判断依据
+// 不是"哪里绿了"，而是"哪里根本没验"（只给 verdict=pass 会把它读成"该验的都验了"）。
+function readinessBlock(rd){
+  if(!rd) return "";
+  const cls = rd.score >= rd.max ? "ok" : (rd.score >= rd.max - 1 ? "warn" : "bad");
+  const gates = (rd.gates || []).map(g =>
+    `<div class="row" style="gap:8px;margin:2px 0">
+      <code>${esc(g.label)}</code>${badge(g.score + "/2", g.score === 2 ? "ok" : (g.score === 1 ? "warn" : "bad"))}
+      <span class="note grow">${(g.evidence || []).slice(0,2).map(esc).join("；")}</span>
+    </div>`).join("");
+  const un = (rd.unverified || []).slice(0, 6);
+  const rest = (rd.unverified || []).length - un.length;
+  return `<div style="border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin:6px 0">
+    <div>交付就绪度 ${badge(rd.score + "/" + rd.max, cls)}
+      <span class="note">${esc(rd.decision || "")}</span></div>
+    <div style="margin:4px 0">${gates}</div>
+    ${un.length ? `<div class="note">未验证项 ${(rd.unverified||[]).length} 条（pass ≠ 该验的都验了）：
+      <div>${un.map(u => "· " + esc(u)).join("<br>")}</div>${rest > 0 ? `…另有 ${rest} 条` : ""}</div>` : ""}
+  </div>`;
+}
+
+// 作业相位 + **两处人工环节**：PM 统一确认一次 → 全部模块跑完统一验收一次。
+// 分模块各停一次是没有意义的：人要处理的是"全部模块的待确认项"与"整组交付物"。
+function renderJobPhase(d){
+  const phase = d.phase || "pm";
+  const blockers = d.pm_blockers || {};
+  const ids = Object.keys(blockers);
+  const rev = d.human_review || null;
+  const pmRows = (d.modules || []).map(m => {
+    const n = (blockers[m.module_id] || []).length;
+    return `<div class="row" style="align-items:center;gap:8px;margin:3px 0">
+      <code>${esc(m.module_id)}</code><span>${esc(m.module_name || "")}</span>
+      ${jobStatusBadge(m.status)}
+      ${n ? badge("待确认 " + n + " 项", "warn") : badge("已确认", "ok")}
+      <span class="grow"></span>
+      ${m.run_id ? `<button data-pm-open="${esc(m.run_id)}">打开并确认</button>`
+                 : `<span class="note">（还没跑 PM）</span>`}
+    </div>`;
+  }).join("");
+  let html = `<div class="note">当前相位：<b>${esc(d.phase_cn || phase)}</b>
+    　·　人工环节只有两处：<b>PM 统一确认一次</b> → 全部模块跑完再<b>统一验收一次</b></div>`;
+  if(phase === "pm"){
+    const total = ids.reduce((acc, k) => acc + blockers[k].length, 0);
+    html += ids.length
+      ? `<div class="warnbox">还有 ${ids.length} 个模块的 PM 待确认项没解决（共 ${total} 项）：
+          逐条裁决，或把「未明确项」写成确定结论；<b>全部确认完</b>才能进下游 ——
+          点每个模块的「打开并确认」去处理，然后点右上「确认完毕 → 进入下游」。</div>`
+      : `<div class="note">全部模块的 PM 已确认，可以点右上「确认完毕 → 进入下游」开始串行跑下游。</div>`;
+    html += `<div style="margin:6px 0">${pmRows}</div>`;
+  } else if(rev && !rev.verdict){
+    html += `<div style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:8px 0">
+      <div><b>统一验收</b>（材料是全部模块产出的整合，只审这一次）</div>
+      <div class="note">${esc(rev._instruction || "")}</div>
+      ${readinessBlock(rev.readiness)}
+      ${rev.evidence_md ? `<details style="margin:6px 0"><summary>交付证据表（验收标准 ↔ 用例 ↔ 执行 ↔ 红线）</summary>
+        <div class="md">${mdToHtml(rev.evidence_md)}</div></details>` : ""}
+      <div style="margin:6px 0">${(rev.modules || []).map(m =>
+        `<div class="row" style="gap:8px;margin:2px 0"><code>${esc(m.module_id)}</code>
+          ${jobStatusBadge(m.status)}${verdictBadge(m.verdict)}</div>`).join("")}</div>
+      <textarea id="j-rev-notes" placeholder="打回时必填：写明整体问题（会分发到各模块的开发阶段）"></textarea>
+      <div class="row" style="margin-top:6px">
+        <button class="primary" id="j-rev-approve">通过并交付</button>
+        <button class="danger" id="j-rev-reject">打回全部模块</button>
+        <span class="grow"></span><span class="note" id="j-rev-out"></span>
+      </div></div>`;
+  } else if(rev && rev.verdict){
+    html += `<div class="note">统一验收：<b>${esc(rev.verdict)}</b>
+      ${rev.reviewer ? "（" + esc(rev.reviewer) + "）" : ""}
+      ${rev.notes ? " · " + esc(rev.notes) : ""}</div>`;
+  }
+  $("j-msg").innerHTML = html;
+  $("j-msg").querySelectorAll("[data-pm-open]").forEach(b => b.onclick = () => openRun(b.dataset.pmOpen));
+  const ap = $("j-rev-approve");
+  const rj = $("j-rev-reject");
+  if(ap) ap.onclick = () => submitJobReview("approve");
+  if(rj) rj.onclick = () => submitJobReview("reject");
+}
+
+async function submitJobReview(verdict){
+  const notes = (($("j-rev-notes") || {}).value || "").trim();
+  if(verdict === "reject" && !notes){ $("j-rev-out").textContent = "打回必须写明问题"; return; }
+  $("j-rev-out").textContent = "提交中…";
+  try{
+    await api(`/api/jobs/${encodeURIComponent(JS.cur)}/review`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({verdict, notes}),
+    });
+    toast(verdict === "approve" ? "已通过：整组交付完成" : "已打回：各模块将重跑开发阶段", "ok");
+    await openJob(JS.cur);
+  }catch(e){ $("j-rev-out").textContent = "提交失败：" + netHint(e); }
+}
+
 function renderJob(d){
   $("j-id").textContent = d.job_id || "";
   $("j-badges").innerHTML = jobStatusBadge(d.status) +
     badge((d.modules||[]).length + " 模块") + (d.mode ? badge("gw:" + d.mode) : "");
   $("j-dir").textContent = "作业目录：" + (d.dir || "");
-  $("j-msg").textContent = "";
-  $("j-resume").disabled = d.status === "running" || d.status === "done";
+  renderJobPhase(d);
+  // 「续跑作业」按钮随相位改语义：PM 相位＝确认完毕进入下游；下游相位＝继续跑；
+  // 统一验收相位由验收卡片负责，这里置灰
+  const phase = d.phase || "pm";
+  $("j-resume").disabled = d.status === "running" || d.status === "done" || phase === "review";
+  $("j-resume").textContent = phase === "pm" ? "确认完毕 → 进入下游"
+    : (phase === "deliver" ? "继续跑下游" : "续跑作业");
 
   $("j-scale").innerHTML = [
     ["规模判定", "large"],
@@ -3465,12 +3702,23 @@ async function resumeJob(){
 function renderGatewayLink(d){
   const box = $("d-msg");
   const g = d && d.gateway;
-  if(!g){ if(box.dataset.gw) { box.textContent = ""; box.dataset.gw = ""; } return; }
-  box.dataset.gw = g.job_id;
-  box.innerHTML = `<div class="note" style="margin:6px 0">本次需求被<b>入口总闸</b>判定为 large
+  // **只清自己那一条**：`d-msg` 是多个来源共用的提示区（未接地路径 / 工程红线 / 未验证项…），
+  // 以前这里在"上一个开的是作业运行、这个不是"时执行 `box.textContent = ""`，把**别人写的
+  // 内容一起擦掉** —— 真机校准就是这么发现"红线在日志里、页面上却没了"的
+  // （先在 UI 冒烟里开过一个作业运行，再打开带红线的运行 ⇒ 顶部一片空白）。
+  let note = box.querySelector("#d-gw-note");
+  if(!g){ if(note) note.remove(); return; }
+  if(!note){
+    note = document.createElement("div");
+    note.id = "d-gw-note";
+    note.style.margin = "6px 0";
+    box.appendChild(note);
+  }
+  note.className = "note";
+  note.innerHTML = `本次需求被<b>入口总闸</b>判定为 large
     （${esc((g.reasons||[]).join("；") || "人工强制")}），已拆分为作业
     <code>${esc(g.job_id)}</code>（${g.modules ?? "?"} 个模块，状态 ${esc(g.status || "-")}）
-    <button id="d-gw-jump" style="margin-left:6px">查看作业</button></div>`;
+    <button id="d-gw-jump" style="margin-left:6px">查看作业</button>`;
   const btn = $("d-gw-jump");
   if(btn) btn.onclick = () => openJob(g.job_id);
 }

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import queue
@@ -31,7 +32,9 @@ if not os.environ.get("PIPELINE_LOCAL_CONFIG"):
         Path(tempfile.gettempdir()) / "pipeline_smoke_no_local_config.json"
     )
 
-from pipeline import advice, issues, prompts, retrieval, runstore  # noqa: E402
+from pipeline import (  # noqa: E402
+    advice, budget, config, flow, issues, prompts, retrieval, runstore, schemas, verify,
+)
 from pipeline.ollama_client import MockClient, OllamaClient  # noqa: E402
 from pipeline.orchestrator import Orchestrator  # noqa: E402
 
@@ -239,6 +242,26 @@ def approve_human_review(orch: "Orchestrator", run_dir: Path) -> object:
     return orch.resume(run_dir)
 
 
+def clear_pm_vague(runs_dir: Path, row: dict) -> int:
+    """模拟人工解决某模块的 PM 闸门：清空两列未明确项（＝把它们写成确定结论）。
+
+    强控语义下这是**必须由人**做的一步；作业层的统一确认判据（gateway.job_pm_blockers）
+    与模块内的闸门共用同一份实现，这里做完它就该放行。
+    """
+    run_dir = Path(str(row.get("run_dir") or ""))
+    if not run_dir.exists():
+        return 0
+    art = dict((runstore.latest_artifacts(run_dir) or {}).get("pm") or {})
+    cleared = sum(len(art.get(f) or []) for f in ("unknowns", "clarifying_questions"))
+    for field in ("unknowns", "clarifying_questions"):
+        art[field] = []
+    for q in art.get("open_questions") or []:
+        if isinstance(q, dict) and not str(q.get("final_decision") or "").strip():
+            q["final_decision"] = str(q.get("assumed_answer") or "（人工按建议执行）")
+    runstore.save_artifact(run_dir, "pm", art, note="smoke-pm-confirm")
+    return cleared
+
+
 def settle(orch: "Orchestrator", result: object) -> object:
     """反复通过人工审核闸门（自动 approve），直到不再停在 human_review。"""
     while getattr(result, "paused", False) and getattr(result, "paused_after", None) == "human_review":
@@ -290,7 +313,6 @@ def main() -> int:
         print("\n== gate-pause-and-resume")
         orch = make(root, "gate", pause_after=["pm", "architect_plan"])
         result = orch.run(REQ)
-        gate_run_dir = result.run_dir  # 后面 issue-report 会把 run 目录平铺到 _flat/，这里先记住
         check(result.paused and result.paused_after == "pm", "PM 后暂停", f"paused={result.paused}/{result.paused_after}")
         check(result.summary["cursor"] == "retrieve", "暂停后游标指向下一步", result.summary["cursor"])
         check(len(result.summary["calls"]) == 2, "暂停时调用了 2 次模型（intake + pm）")
@@ -597,17 +619,37 @@ def main() -> int:
             "测试命令里的编造路径同样能抓到",
         )
 
-        print("\n== pm-open-questions-gate（PM 未决项闸门）")
-        # 闸门判定本身：有未决项才停，没有就不该浪费人机交互
+        print("\n== pm-open-questions-gate（PM 未决项强控）")
+        # 判据：产物里还有「不是陈述」的条目 —— 未裁决的 open_questions，或两列未明确项
         gate_orch = make(root, "pm-gate-check", pause_on_open_questions=True)
         gate_orch.state = {"scope": {"open_questions": []}}
         check(not gate_orch._should_pause("pm"), "无未决项时不触发 PM 闸门")
         gate_orch.state = {"scope": {"open_questions": [{"question": "要不要支持暂停？"}]}}
-        check(gate_orch._should_pause("pm"), "有未决项时触发 PM 闸门")
+        check(gate_orch._should_pause("pm"), "有未裁决项时触发 PM 闸门")
+        gate_orch.state = {"scope": {"open_questions": [
+            {"question": "要不要支持暂停？", "final_decision": "支持"}]}}
+        check(not gate_orch._should_pause("pm"), "已裁决的未决项不再触发（否则裁决完也出不去）")
+        gate_orch.state = {"scope": {"unknowns": ["某个没弄清楚的点"]}}
+        check(gate_orch._should_pause("pm"), "未明确项（unknowns）同样触发闸门")
+        gate_orch.state = {"scope": {"clarifying_questions": ["要不要支持暂停？"]}}
+        check(gate_orch._should_pause("pm"), "未明确项（clarifying_questions）同样触发闸门")
+        gate_orch.state = {"scope": {"unknowns": [], "clarifying_questions": []}}
+        check(not gate_orch._should_pause("pm"), "未明确项被人工清空后才放行")
         gate_orch.state = {"scope": {"open_questions": []}}
         gate_orch.pause_after = {"pm"}
         check(gate_orch._should_pause("pm"), "显式 pause_after 仍无条件生效")
-        # 端到端：真跑一次，应停在 pm
+        # 不可关闭：不再暴露给环境变量 / 页面配置 / config.local.json
+        from pipeline import config as config_mod
+
+        check(
+            "pause_on_open_questions" not in config_mod.RUNTIME_FLAGS
+            and "pause_on_open_questions" not in (config_mod.CODE_DEFAULTS.get("runtime") or {}),
+            "该闸门不再暴露为可配置开关（强控）",
+            f"{sorted(config_mod.RUNTIME_FLAGS)}",
+        )
+
+        # 端到端 + **强控复核**：cursor 在闸门判定前就已越过 pm（_step 先推进游标、闸门后判），
+        # 所以必须靠 resume 时的重新判定来挡住"什么都不裁决、直接点继续"。
         gate_run = make(root, "pm-gate-run", pause_on_open_questions=True)
         gate_result = gate_run.run(REQ)
         check(
@@ -616,8 +658,48 @@ def main() -> int:
             f"paused={gate_result.paused} after={gate_result.paused_after}",
         )
         gate_state = json.loads((gate_result.run_dir / "state.json").read_text(encoding="utf-8"))
-        gate_qs = ((gate_state.get("artifacts") or {}).get("scope") or {}).get("open_questions") or []
-        check(bool(gate_qs), "停在 pm 时确实产出了未决项", f"{len(gate_qs)} 条")
+        gate_scope = (gate_state.get("artifacts") or {}).get("scope") or {}
+        check(
+            bool(gate_scope.get("open_questions")) or bool(gate_scope.get("unknowns")),
+            "停在 pm 时确实产出了未成为陈述的条目",
+            f"open_questions={len(gate_scope.get('open_questions') or [])} "
+            f"unknowns={len(gate_scope.get('unknowns') or [])}",
+        )
+        again = gate_run.resume(gate_result.run_dir)
+        check(
+            bool(getattr(again, "paused", False)) and again.paused_after == "pm",
+            "什么都不裁决就续跑：原地再停一次，不放行",
+            f"paused={again.paused} after={again.paused_after}",
+        )
+
+        def _write_pm(run_dir, *, decided_second: bool, clear_vague: bool) -> None:
+            """按需改写 PM 产物：模拟人工「只裁一条 / 全裁 + 清空未明确项」。"""
+            art = dict((runstore.latest_artifacts(run_dir) or {}).get("pm") or {})
+            art["open_questions"] = [
+                {"question": "问题甲", "recommendation": "建议甲", "assumed_answer": "甲",
+                 "severity": "low", "why_it_matters": "x", "final_decision": "甲结论"},
+                {"question": "问题乙", "recommendation": "建议乙", "assumed_answer": "乙",
+                 "severity": "high", "why_it_matters": "y",
+                 **({"final_decision": "乙结论"} if decided_second else {})},
+            ]
+            art["unknowns"] = [] if clear_vague else ["还没弄清的点"]
+            art["clarifying_questions"] = []
+            runstore.save_artifact(run_dir, "pm", art, note="smoke-pm-decide")
+
+        _write_pm(gate_result.run_dir, decided_second=False, clear_vague=False)
+        partial = gate_run.resume(gate_result.run_dir)
+        check(
+            bool(getattr(partial, "paused", False)) and partial.paused_after == "pm",
+            "只裁决一部分（还有未裁决 + 未明确项）：仍不放行",
+            f"paused={partial.paused} after={partial.paused_after}",
+        )
+        _write_pm(gate_result.run_dir, decided_second=True, clear_vague=True)
+        released = settle(gate_run, gate_run.resume(gate_result.run_dir))
+        check(
+            not getattr(released, "paused", False),
+            "全部裁决并清空未明确项后才放行（一路跑到交付闸门之后）",
+            f"paused={released.paused} after={released.paused_after}",
+        )
 
         print("\n== new-project（0 存量代码）")
         # 新建项目应换用 SYSTEM_NEW 那套提示词，并跳过 architect_assess。
@@ -933,7 +1015,7 @@ def main() -> int:
         from pipeline.orchestrator import ONLY_STAGES
 
         want = [s for s in ONLY_STAGES if s != "human_review"]
-        check(cli_mod.ALL_STAGES == want, "CLI 阶段白名单与 ONLY_STAGES 同步（防漏改）", str(cli_mod.ALL_STAGES))
+        check(want == cli_mod.ALL_STAGES, "CLI 阶段白名单与 ONLY_STAGES 同步（防漏改）", str(cli_mod.ALL_STAGES))
         check("intake" in cli_mod.ALL_STAGES, "CLI 接受 --pause-after intake")
         # 人工裁决：必须注入 PM（PM 不进 _human_facts，靠 parts_pm 显式带），并传导所有下游阶段
         # 裁决并回补强产物：条目带 final_decision 后，PM 拿到的是「已裁决终稿」
@@ -1651,6 +1733,48 @@ def main() -> int:
             "不确定项不参与规模升级（信息不足 ≠ 规模大）",
         )
 
+        # 粒度机械校验（B）：超过上限 / 职责重叠都要在**判 large 之前**拦下来，
+        # 否则就会出现"一个贪吃蛇拆 8 个模块"（真机 20260926-170359）
+        from pipeline import config as _ga_cfg
+
+        many = _ga(8)
+        many_problems = gw.ga_granularity_problems(many)
+        check(
+            many_problems and "超过粒度上限" in many_problems[0],
+            f"模块数超过上限 {_ga_cfg.GA_MAX_MODULES} 判过度拆分",
+            str(many_problems)[:110],
+        )
+        check(gw.ga_granularity_problems(_ga(2)) == [], "正常规模的两模块拆分不误报",
+              str(gw.ga_granularity_problems(_ga(2))))
+        dup_scope = _ga(2)
+        dup_scope["modules"][0]["scope_in"] = ["订单查询", "导出成表格"]
+        dup_scope["modules"][1]["scope_in"] = ["订单查询", "导出成表格"]
+        check(
+            any("重叠" in p for p in gw.ga_granularity_problems(dup_scope)),
+            "两个模块职责完全重叠 ⇒ 不是两个交付边界",
+            str(gw.ga_granularity_problems(dup_scope))[:110],
+        )
+
+        # 规模预判（A）：新建项目里「需求写得详细」不算规模证据 ——
+        # 详细描述一个小成品会让"枚举条目 + 字数"两条弱信号同时命中，白调一次 GA。
+        detailed_small = "# 贪吃蛇\n" + "\n".join(
+            f"{i}. 第 {i} 条功能点说明，写得很细" for i in range(1, 9)
+        ) + "\n" + "细节描述" * 120
+        check(
+            gw.prejudge(detailed_small, {}, "new")[0] is False,
+            "新建项目：需求详细但不涉及多子系统 → 不调 GA",
+            str(gw.prejudge(detailed_small, {}, "new")),
+        )
+        check(
+            gw.prejudge("做一个前后端分离的系统：前端页面 + 后端 API 服务 + 数据库迁移", {}, "new")[0]
+            is True,
+            "新建项目：需求明确要求多个可独立交付的子系统 → 才调 GA",
+        )
+        check(
+            gw.prejudge(detailed_small, {}, "secondary")[0] is True,
+            "二次开发沿用旧判据（存量场景下需求详细仍是信号）",
+        )
+
         # 语义自检：JSON Schema 表达不了的部分（唯一性 / 覆盖 / 拓扑序 / 悬空引用）
         check(gw.check_self_consistency(_ga(2)) == [], "自洽产物无问题")
         dup = _ga(2)
@@ -1799,6 +1923,103 @@ def main() -> int:
         mod_audit = gw.audit_module_run(fake_run, forbidden=["core/a.py"], owned=["web"], others=["core"])
         check(mod_audit["forbidden_touched"] == ["core/a.py"], "子运行方案踩禁区被审计出", str(mod_audit))
 
+        # 禁区规则只认「它真是一条路径」：自由文本规则按 stem 折叠会把**整个文件**变成禁区。
+        # 真机 job-20260926-154657 的 M-01（模块名就叫 game_logic，交付物就是 game_logic.py）
+        # 因此被同时要求「实现 game_logic.py 里的这些类」与「不得改 game_logic.py」，
+        # 开发只能声明"改了禁改路径故不实现"，反复返工到触顶。
+        check(
+            Orchestrator._path_rule_stem("game_logic.py中tkinter导入") == ""
+            and Orchestrator._path_rule_stem("main.py窗口创建逻辑") == ""
+            and Orchestrator._path_rule_stem("含空格的 规则") == "",
+            "含描述文字/空格的非路径规则不作机械判负",
+            str(Orchestrator._path_rule_stem("game_logic.py中tkinter导入")),
+        )
+        check(
+            Orchestrator._path_rule_stem("src/core/db.py") == "src/core/db"
+            and Orchestrator._path_rule_stem("core/db/*.py") == "core/db/*",
+            "真路径/glob 规则照常归一（判负能力没被削弱）",
+            str(Orchestrator._path_rule_stem("src/core/db.py")),
+        )
+        rule_orch = make(root, "rule-audit")
+        rule_orch.state = {
+            "plan": {"changes": [{"path": "game_logic.py"}], "tasks": []},
+            "assessment": {"forbidden_paths": ["game_logic.py中tkinter导入"]},
+        }
+        rule_audit = rule_orch._audit_plan()
+        check(
+            rule_audit["forbidden_touched"] == [] and rule_audit["forbidden_ignored"],
+            "评估把「假设」写成禁区时不再误判方案踩禁区（并记下未参与判负的条目）",
+            f"touched={rule_audit.get('forbidden_touched')} ignored={rule_audit.get('forbidden_ignored')}",
+        )
+        rule_orch.state["assessment"]["forbidden_paths"] = ["game_logic.py"]
+        rule_audit2 = rule_orch._audit_plan()
+        check(
+            rule_audit2["forbidden_touched"] == ["game_logic.py"] and not rule_audit2["forbidden_ignored"],
+            "真·路径禁区照样拦得住（不是把禁改路径判负整个关掉）",
+            str(rule_audit2.get("forbidden_touched")),
+        )
+        check(
+            gw.audit_paths(["core/a.py"], forbidden=["core/a.py中某个函数"], owned=[], others=[])[
+                "forbidden_touched"
+            ]
+            == [],
+            "作业级越界审计同一口径：自由文本禁区规则不判负",
+        )
+
+        # 作业落盘运行参数 + 续跑还原（显式传入 > 作业落盘 > 代码默认）
+        opts_route = gw.dispatch(big_req, repo=str(grepo), runs_dir=jobs_dir, mode="always",
+                                 client=MockClient(), project_type="new",
+                                 review_every=3, max_rework=5, pause_after=["pm"])
+        opts_job = gw.read_job(jobs_dir, opts_route.job_id)
+        check(
+            opts_job["project_type"] == "new" and opts_job["review_every"] == 3
+            and opts_job["max_rework"] == 5 and opts_job["pause_after"] == ["pm"],
+            "作业落盘运行参数（续跑只带 job_id，没存就只能退回代码默认——真机踩过）",
+            str({k: opts_job.get(k) for k in ("project_type", "review_every", "max_rework", "pause_after")}),
+        )
+        merged = gw._run_options(opts_job)
+        check(
+            merged["project_type"] == "new" and merged["review_every"] == 3
+            and merged["max_rework"] == 5 and merged["pause_after"] == ["pm"],
+            "续跑默认沿用作业落盘值（新建项目不会被当二次开发重跑）",
+            str(merged),
+        )
+        merged2 = gw._run_options(opts_job, project_type="secondary", max_rework=9)
+        check(
+            merged2["project_type"] == "secondary" and merged2["max_rework"] == 9
+            and merged2["review_every"] == 3,
+            "显式传入优先，没传的那项仍沿用落盘值",
+            str(merged2),
+        )
+        check(
+            gw._run_options(opts_job, pause_after=[])["pause_after"] == [],
+            "空列表（--no-pause）是显式清空闸门，不能被当成「没传」",
+            str(gw._run_options(opts_job, pause_after=[])["pause_after"]),
+        )
+        legacy_opts = gw._run_options({"repo": None})
+        check(
+            legacy_opts["project_type"] == "secondary" and legacy_opts["pause_after"] == []
+            and isinstance(legacy_opts["review_every"], int),
+            "旧作业没有这些字段时退回代码默认（向后兼容）",
+            str(legacy_opts),
+        )
+
+        # 重跑模块前归档上一代快照：否则两代产物混在同一目录，seq 会重号、阶段列表乱序
+        stale = jobs_dir / "archive-me"
+        stale.mkdir(parents=True, exist_ok=True)
+        runstore.write_json(stale / "01-intake.json", {"seq": 1, "stage": "intake", "artifact": {"ok": 1}})
+        runstore.write_json(stale / "05-dev.json", {"seq": 5, "stage": "dev", "artifact": {"ok": 2}})
+        archive_log: list[str] = []
+        moved = gw._archive_previous_run(stale, archive_log.append, "archive-me")
+        left = sorted(p.name for p in stale.glob("*.json"))
+        archived = sorted(p.name for p in (stale / "superseded").glob("*.json"))
+        check(
+            moved == 2 and left == [] and archived == ["01-intake.json", "05-dev.json"]
+            and bool(archive_log),
+            "模块重跑前把上一代阶段快照归档到 superseded/（两代不再混存、seq 不重号）",
+            f"moved={moved} left={left} archived={archived}",
+        )
+
         # blocked 的传播语义：依赖它的跳过，不相关的继续（不阻断整组，也绝不带病开工）
         chain = {
             "modules": [
@@ -1814,7 +2035,74 @@ def main() -> int:
             str([m["status"] for m in chain["modules"]]),
         )
 
-        # 端到端：mock 跑完整个两模块作业（关掉交付闸门，冒烟不等人）
+        # skipped 是**派生状态**、不是终态：模块失败后下游被跳过，等失败原因修好再续跑时
+        # 必须能重新评估；blocked 才是终态（审计不通过，绝不能带病开工）。
+        # 真机 job-20260926-154657：M-01 撞上模型输出截断 → 其余全 skipped →
+        # 续跑再也捡不起来，只能手工复位状态。
+        def _mk_job(jid: str, first_status: str) -> str:
+            jbase = gw.job_dir(jobs_dir, jid)
+            (jbase / "modules").mkdir(parents=True, exist_ok=True)
+            (jbase / "modules" / "01-M-01.md").write_text("需求：模块一", encoding="utf-8")
+            (jbase / "modules" / "02-M-02.md").write_text("需求：模块二", encoding="utf-8")
+            gw.write_job(jobs_dir, {
+                "version": 1,
+                "job_id": jid,
+                "modules": [
+                    {"module_id": "M-01", "status": first_status, "depends_on": [],
+                     "owned_dirs": [], "other_dirs": [], "issues": []},
+                    {"module_id": "M-02", "status": "skipped", "depends_on": ["M-01"],
+                     "owned_dirs": [], "other_dirs": [],
+                     "issues": ["前置模块未完成：['M-01']"]},
+                ],
+                "execution_order": ["M-01", "M-02"],
+                "repo": None,
+                "forbidden": [],
+                "project_type": "secondary",
+                "review_every": 1,
+                "max_rework": 2,
+                "pause_after": [],
+            })
+            return jid
+
+        saved_gate2 = orchestrator_mod.HUMAN_REVIEW_GATE
+        orchestrator_mod.HUMAN_REVIEW_GATE = False
+        try:
+            # 先按新机制的**PM 前置阶段**把两个 fixture 作业的模块跑出 PM（各停一次），
+            # 再按需要造出"M-02 曾被跳过" / "M-01 blocked"的起点，验证 deliver 阶段的重评估
+            for jid, first_status in (("job-resume-skip", "done"), ("job-resume-blocked", "blocked")):
+                gw.run_job(_mk_job(jid, "pending"), runs_dir=jobs_dir,
+                           client=MockClient(), pause_on_open_questions=False)
+                jdata = gw.read_job(jobs_dir, jid)
+                for row in jdata["modules"]:
+                    clear_pm_vague(jobs_dir, row)
+                for row in jdata["modules"]:
+                    if row["module_id"] == "M-01":
+                        row["status"] = first_status
+                    else:
+                        row["status"] = "skipped"
+                        row["issues"] = ["前置模块未完成：['M-01']"]
+                gw.write_job(jobs_dir, jdata)
+            resumed = gw.run_job("job-resume-skip", runs_dir=jobs_dir, client=MockClient(),
+                                 phase="deliver", pause_on_open_questions=False)
+            held = gw.run_job("job-resume-blocked", runs_dir=jobs_dir, client=MockClient(),
+                              phase="deliver", pause_on_open_questions=False)
+        finally:
+            orchestrator_mod.HUMAN_REVIEW_GATE = saved_gate2
+        resumed_by = {m["module_id"]: m for m in resumed["modules"]}
+        check(
+            resumed_by["M-02"]["status"] == "done"
+            and resumed_by["M-02"]["issues"].count("前置模块未完成：['M-01']") == 1,
+            "被跳过的模块在下游阶段真的重新跑了（一次失败不再把整组永久冻住），说明也不重复堆叠",
+            f"{ {k: v['status'] for k, v in resumed_by.items()} } run_id={resumed_by['M-02'].get('run_id')}",
+        )
+        held_by = {m["module_id"]: m for m in held["modules"]}
+        check(
+            held_by["M-01"]["status"] == "blocked" and held_by["M-02"]["status"] == "skipped",
+            "blocked 仍是终态：下游阶段不会带病开工（被跳过的模块不推进）",
+            f"{ {k: v['status'] for k, v in held_by.items()} }",
+        )
+
+        # 端到端：三阶段作业 —— PM 前置 → 人工统一确认 → 下游串行 → 整合后统一验收
         saved_gate = orchestrator_mod.HUMAN_REVIEW_GATE
         orchestrator_mod.HUMAN_REVIEW_GATE = False
         try:
@@ -1823,11 +2111,49 @@ def main() -> int:
                                     client=e2e_client)
             e2e = gw.run_job(e2e_route.job_id, runs_dir=jobs_dir, client=e2e_client, repo=str(grepo),
                              pause_on_open_questions=False, review_every=1)
-            check(gw.job_status(e2e) == "done", "两模块作业全部跑完", gw.job_status(e2e))
+            check(
+                gw.job_status(e2e) == "awaiting_pm",
+                "阶段一：作业先跑 PM 前置，状态=待人工统一确认",
+                gw.job_status(e2e),
+            )
+            check(
+                all(m["status"] == "pm_paused" and m.get("run_dir") for m in e2e["modules"]),
+                "阶段一：每个模块都产出了 PM 并停在 pm（产物流水线只走到 pm）",
+                str([m["status"] for m in e2e["modules"]]),
+            )
+            blockers = gw.job_pm_blockers(jobs_dir, e2e)
+            check(bool(blockers), "PM 待确认项被**聚合**出来（统一人工环节的判据）", str(blockers)[:120])
+            try:
+                gw.resume_job(e2e_route.job_id, runs_dir=jobs_dir, client=e2e_client,
+                              logger=lambda *_: None)
+                check(False, "人工没确认完不许进下游", "竟然放行了")
+            except gw.GatewayError as exc:
+                check(
+                    "PM 待确认项" in str(exc),
+                    "阶段二：人工没确认完不许进下游（明确报错、不白跑）",
+                    str(exc)[:100],
+                )
+            # 模拟人工：逐模块把未明确项写成确定结论（强控要求的那一步）
+            for row in (gw.read_job(jobs_dir, e2e_route.job_id) or {}).get("modules") or []:
+                clear_pm_vague(jobs_dir, row)
+            check(
+                gw.job_pm_blockers(jobs_dir, gw.read_job(jobs_dir, e2e_route.job_id)) == {},
+                "人工确认完全部模块后，判据为空",
+            )
+            e2e = gw.resume_job(e2e_route.job_id, runs_dir=jobs_dir, client=e2e_client,
+                                logger=lambda *_: None)
             check(
                 all(m["status"] == "done" for m in e2e["modules"]),
-                "每个模块都独立走完了原有流水线（角色逻辑零改动）",
+                "阶段二：确认完毕后各模块从下游串行跑完",
                 str([m["status"] for m in e2e["modules"]]),
+            )
+            check(
+                all(
+                    "human_review" not in (runstore.latest_artifacts(jobs_dir / m["run_id"]) or {})
+                    for m in e2e["modules"]
+                ),
+                "模块级人工审核**延后**（不再每个模块各停一次）",
+                str([sorted((runstore.latest_artifacts(jobs_dir / m["run_id"]) or {})) for m in e2e["modules"]]),
             )
             check(
                 all(m["run_id"] and (jobs_dir / m["run_id"] / "state.json").exists() for m in e2e["modules"]),
@@ -1840,13 +2166,35 @@ def main() -> int:
                 "作业目录不进运行列表（_ 前缀约定）",
                 str([r["run_id"] for r in runstore.list_runs(jobs_dir)]),
             )
-            e2e_report = (gw.job_dir(jobs_dir, e2e_route.job_id) / "report.md").read_text(encoding="utf-8")
-            check("集成校验点" in e2e_report, "集成校验点进人读报告（不新增评审节点）")
-            check("模块与执行情况" in e2e_report, "报告含模块执行情况")
+            check(e2e.get("phase") == "review", "阶段三：全部跑完 → 进入统一验收相位", str(e2e.get("phase")))
             view = gw.job_view(jobs_dir, e2e_route.job_id)
             check(
                 len(view["module_requirements"]) == 2 and bool(view["report"]),
                 "页面视图含子需求全文与报告",
+            )
+            check(
+                bool(view["human_review"]) and not (view["human_review"] or {}).get("verdict"),
+                "阶段三：作业页出现**统一验收**卡片（材料为全组产出，待人工提交）",
+                str(view["human_review"])[:120],
+            )
+            e2e_report = (gw.job_dir(jobs_dir, e2e_route.job_id) / "report.md").read_text(encoding="utf-8")
+            check("集成校验点" in e2e_report, "集成校验点进人读报告（不新增评审节点）")
+            check("模块与执行情况" in e2e_report, "报告含模块执行情况")
+            rejected = gw.finish_job_review(
+                jobs_dir, e2e_route.job_id, verdict="reject", notes="整组返工：导出要流式"
+            )
+            rej_rows = {m["module_id"]: m for m in rejected["modules"]}
+            check(
+                rejected.get("phase") == "deliver"
+                and all(r.get("rework_from") == "dev" for r in rej_rows.values()),
+                "统一验收打回：意见分发到各模块开发阶段，相位回到下游",
+                f"phase={rejected.get('phase')} from={[r.get('rework_from') for r in rej_rows.values()]}",
+            )
+            done = gw.finish_job_review(jobs_dir, e2e_route.job_id, verdict="approve", notes="整体通过")
+            check(
+                done.get("phase") == "done" and gw.job_status(done) == "done",
+                "统一验收通过 → 整组交付完成",
+                f"phase={done.get('phase')} status={gw.job_status(done)}",
             )
             check(gw.job_view(jobs_dir, "nosuchjob") is None, "未知作业返回 None（页面据此 404）")
         finally:
@@ -1899,7 +2247,7 @@ def main() -> int:
             str(review3.get("architect_fixes")),
         )
         check(
-            any("问运维" == r["issue"] for r in review3["residual_risks"]),
+            any(r["issue"] == "问运维" for r in review3["residual_risks"]),
             "needs_external 仍进 residual_risks（不触发返工）",
             str(review3["residual_risks"])[:100],
         )
@@ -2425,11 +2773,13 @@ def main() -> int:
         # ③a-3 漏测阻断 + 申诉通道（mock 下 _test_blockers 被跳过，故直接调它验证）
         from pipeline.orchestrator import Orchestrator as _Orch
 
-        class _TbShim:
-            _test_blockers = _Orch._test_blockers
-            # _test_blockers 会回落到 _audit_test 重算（state 里没缓存时）
-            _audit_test = _Orch._audit_test
-            _VAGUE_EXPECTED = _Orch._VAGUE_EXPECTED
+        class _TbShim(_Orch):
+            """只替换 state/client 的编排器外壳。
+
+            **刻意继承而不是逐个复制方法**：`_test_blockers` 会回落到 `_audit_test` 重算，
+            而这个链条上每加一个辅助方法（例如后来的 `_entry_command_gap`）都得记得同步
+            复制过来，否则就是 `AttributeError` —— 实测已经踩过一次。继承之后不用再管。
+            """
 
             def __init__(self, state, client=None):
                 self.state = state
@@ -2442,7 +2792,8 @@ def main() -> int:
         tb_cases = {"cases": [
             {"id": "NEW-01", "type": "new", "target": "a.py::Snake",
              "steps": ["构造"], "expected": "返回长度为 3 的列表"},
-        ], "automated_commands": [], "coverage_gaps": [], "uncertainties": []}
+        ], "automated_commands": [{"command": "python -m unittest a_test"}],
+            "coverage_gaps": [], "uncertainties": []}
 
         def _tb(report, **kw):
             return _TbShim({"implementation": tb_impl, "test_report": report}, **kw)._test_blockers()
@@ -2461,8 +2812,18 @@ def main() -> int:
         }]
         check(
             _tb(appealed) == [],
-            "在 coverage_gaps 里交代过原因即豁免（唯一申诉出口）",
+            "在 coverage_gaps 里交代过原因即豁免（符号覆盖那条的申诉出口）",
             str(_tb(appealed))[:140],
+        )
+        # 但「一条可执行命令都没有」**不留申诉出口** —— 任何技术栈都能声明一条跑测试的
+        # 命令，不存在「确实无法声明」的合法情形；此时 verify 除自带检查外无物可跑。
+        no_cmd = json.loads(json.dumps(tb_cases))
+        no_cmd["automated_commands"] = []
+        no_cmd["coverage_gaps"] = appealed["coverage_gaps"]  # 连申诉也救不了
+        check(
+            any("automated_commands 是空的" in b for b in _tb(no_cmd)),
+            "automated_commands 为空 → 判阻断（此时 verify 无物可跑）",
+            str(_tb(no_cmd))[:140],
         )
         # 申诉要针对**具体符号**才生效
         wrong_appeal = json.loads(json.dumps(tb_cases))
@@ -2843,11 +3204,8 @@ def main() -> int:
         # 而补丁是符号级 —— 5 个里只有 1 个对得上。
         from pipeline.orchestrator import Orchestrator as _Orch
 
-        class _AuditShim:
-            """只带 _audit_test 所需状态，避免构造完整 Orchestrator。"""
-
-            _VAGUE_EXPECTED = _Orch._VAGUE_EXPECTED
-            _audit_test = _Orch._audit_test
+        class _AuditShim(_Orch):
+            """只带 _audit_test 所需状态（继承而非复制方法，理由见 _TbShim）。"""
 
             def __init__(self, state):
                 self.state = state
@@ -2892,7 +3250,7 @@ def main() -> int:
             f"missing={a_ok['missing_symbols']}",
         )
         check(
-            not a_ok["missing_types"] and not a_bad["missing_types"] is None,
+            not a_ok["missing_types"] and a_bad["missing_types"] is not None,
             "三类齐全的用例不报 missing_types（与符号覆盖是两回事）",
             str(a_ok["missing_types"]),
         )
@@ -2908,8 +3266,8 @@ def main() -> int:
         sem_run = sem_root / "run"
         sem_run.mkdir(parents=True, exist_ok=True)
 
-        class _SemShim:
-            _semantic_problems = _Orch._semantic_problems
+        class _SemShim(_Orch):
+            """只带 _semantic_problems 所需状态（继承而非复制方法，理由见 _TbShim）。"""
 
             def __init__(self, repo, run_dir):
                 self.repo = repo
@@ -3154,7 +3512,7 @@ def main() -> int:
                 data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
                 if spec.role.startswith("开发"):
                     self.dev_calls += 1
-                    if "上一版被判为不合法" in user:
+                    if prompts.REPAIR_HEADING in user:
                         self.repair_prompts += 1
                         body = "class Renderer:\n    def x(self):\n        return 1\n"
                     else:
@@ -3255,6 +3613,784 @@ def main() -> int:
                 {"edits": [{"path": "a.py", "change_type": "add", "target_symbol": "A",
                             "patch": "import keyboard\n\nclass A:\n    pass\n"}]}
             )),
+        )
+
+        # ---------------------------------------------------------------- token 估算
+        # 真机 41 条样本对照 ollama 实回的 prompt_eval_count：
+        # 旧实现 len(text)/1.6 **平均高估 40.9%**（全是高估，近半预算被浪费）；
+        # 现实现按字符类别加权，平均绝对误差 1.7%。系数由 tools/calibrate_tokens.py 拟合。
+        check(budget.estimate_tokens("") == 0, "空文本估算为 0")
+        _ascii = budget.estimate_tokens("a" * 1000)
+        _cjk = budget.estimate_tokens("中" * 1000)
+        check(250 <= _ascii <= 320, f"纯 ASCII 1000 字 ≈0.28 tok/字（实际 {_ascii}）")
+        check(700 <= _cjk <= 820, f"纯中文 1000 字 ≈0.76 tok/字（实际 {_cjk}）")
+        _code = "def f(x):\n    return x + 1\n" * 40
+        _old = int(len(_code) / 1.6) + 1
+        check(
+            budget.estimate_tokens(_code) < _old * 0.6,
+            f"ASCII 代码不再被按 1.6 字符/token 高估（旧 {_old} vs 新 {budget.estimate_tokens(_code)}）",
+        )
+        # 截断必须真的落在预算内（marker 自身占几个 token，留 20 的余量）
+        _long = "中" * 500 + "code" * 500
+        for _mt in (50, 200, 800):
+            check(
+                budget.estimate_tokens(budget.truncate_text(_long, _mt)) <= _mt + 20,
+                f"truncate_text(max_tokens={_mt}) 结果仍在预算内",
+                str(budget.estimate_tokens(budget.truncate_text(_long, _mt))),
+            )
+        check(
+            budget.chars_for_tokens(1000, sample="def f(): pass\n" * 20)
+            > budget.chars_for_tokens(1000, sample="中文注释" * 100),
+            "chars_for_tokens 按文本自身构成换算（代码换算出的字符数多于中文）",
+        )
+        check(
+            budget.chars_for_tokens(1000) == 1600,
+            "chars_for_tokens 无样本时退回保守常数",
+            str(budget.chars_for_tokens(1000)),
+        )
+
+        # ---------------------------------------------------------------- 环境变量容错
+        # 裸 int(os.getenv(...)) 的后果：PIPELINE_TIMEOUT=180s 这种自然误输入会让 config
+        # 在**导入时**抛 ValueError，表现为「整条流水线起不来」。
+        check(config._env_int("PIPELINE_SMOKE_MISSING", 7) == 7, "未设置时用默认值")
+        os.environ["PIPELINE_SMOKE_X"] = "180s"
+        check(config._env_int("PIPELINE_SMOKE_X", 1800) == 1800, "非法整数降级为默认值（不再导入即崩）")
+        os.environ["PIPELINE_SMOKE_X"] = "0"
+        check(config._env_int("PIPELINE_SMOKE_X", 2, minimum=1) == 1, "低于下限时抬到下限")
+        os.environ["PIPELINE_SMOKE_X"] = "abc"
+        check(config._env_float("PIPELINE_SMOKE_X", 0.28) == 0.28, "非法浮点降级为默认值")
+        os.environ["PIPELINE_SMOKE_X"] = "12.5"
+        check(config._env_float("PIPELINE_SMOKE_X", 0.28) == 12.5, "合法浮点正常取值")
+        # 旧写法 not in ("0","false","False") 把 "off"/"No"/"FALSE" 都当成**真**，
+        # 于是「想关掉闸门却关不掉」而且是静默的。
+        for _false in ("0", "false", "False", "FALSE", "off", "no", "disabled"):
+            os.environ["PIPELINE_SMOKE_X"] = _false
+            check(
+                config._env_bool("PIPELINE_SMOKE_X", True) is False,
+                f"开关写法 {_false!r} 能真正关掉",
+            )
+        os.environ["PIPELINE_SMOKE_X"] = "1"
+        check(config._env_bool("PIPELINE_SMOKE_X", False) is True, "开关写法 '1' 为真")
+        os.environ["PIPELINE_SMOKE_X"] = "  yes  "
+        check(config._env_bool("PIPELINE_SMOKE_X", False) is True, "其余写法按真处理（含空白）")
+        del os.environ["PIPELINE_SMOKE_X"]
+
+        # ---------------------------------------------------------------- 契约封闭 + 字符串约束
+        _closed = {"type": "object", "properties": {"a": {"type": "string"}},
+                   "additionalProperties": False}
+        check(schemas.validate({"a": "x"}, _closed) == [], "封闭契约：合规数据通过")
+        check(
+            any("额外字段" in e for e in schemas.validate({"a": "x", "b": 1}, _closed)),
+            "封闭契约：schema 未声明的字段被判违约",
+            str(schemas.validate({"a": "x", "b": 1}, _closed)),
+        )
+        _outer = {"type": "object", "properties": {"inner": _closed}, "additionalProperties": False}
+        check(
+            any("额外字段" in e for e in schemas.validate({"inner": {"a": "x", "b": 1}}, _outer)),
+            "嵌套对象同样按封闭契约校验",
+            str(schemas.validate({"inner": {"a": "x", "b": 1}}, _outer)),
+        )
+        check(
+            any("minLength" in e for e in schemas.validate("ab", {"type": "string", "minLength": 3})),
+            "minLength 生效",
+        )
+        check(
+            any("maxLength" in e for e in schemas.validate("abcd", {"type": "string", "maxLength": 3})),
+            "maxLength 生效",
+        )
+        check(
+            any("pattern" in e for e in schemas.validate("zzz", {"type": "string", "pattern": "^[a-c]+$"})),
+            "pattern 生效",
+        )
+        check(schemas.validate("x", {"type": "string", "pattern": "([bad"}) == [],
+              "schema 自带的正则写错时不判模型违约")
+        check(
+            schemas.validate({"a": "x"}, {"type": "object", "properties": {"a": {"type": "string"}}}) == [],
+            "没声明 additionalProperties 时保持开放（自由字典不被误杀）",
+        )
+        _unclosed: list[str] = []
+
+        def _scan_open(node, path):
+            if isinstance(node, dict):
+                if (node.get("type") == "object" and node.get("properties")
+                        and node.get("additionalProperties") is not False):
+                    _unclosed.append(path)
+                for _k, _v in node.items():
+                    _scan_open(_v, f"{path}.{_k}")
+            elif isinstance(node, list):
+                for _i, _v in enumerate(node):
+                    _scan_open(_v, f"{path}[{_i}]")
+
+        for _st, _sch in schemas.STAGE_SCHEMAS.items():
+            _scan_open(_sch, _st)
+        check(not _unclosed, "全部阶段契约对象都已按封闭校验（新增 schema 时不会漏）", str(_unclosed[:4]))
+
+        # ---------------------------------------------------------------- advice 脏行留痕
+        import contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+
+        _thr = root / "advice_thread"
+        (_thr / "advice").mkdir(parents=True, exist_ok=True)
+        (_thr / "advice" / "pm.jsonl").write_text(
+            '{"a": 1}\n{坏行\n{"b": 2}\n', encoding="utf-8"
+        )
+        _buf = _io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            _rows = advice.read_thread(_thr, "pm")
+        check(len(_rows) == 2, "线程里的坏行被跳过后，其余行照常读出", str(_rows))
+        check(
+            "第 2 行" in _buf.getvalue() and "不是合法 JSON" in _buf.getvalue(),
+            "坏行有告警留痕（不再静默吞掉）",
+            _buf.getvalue()[:120],
+        )
+        _buf2 = _io.StringIO()
+        with contextlib.redirect_stdout(_buf2):
+            for _ in range(10):
+                advice.read_thread(_thr, "pm")
+        _warns = _buf.getvalue().count("不是合法 JSON") + _buf2.getvalue().count("不是合法 JSON")
+        check(
+            _warns <= advice._BAD_LINE_WARN_LIMIT,
+            f"脏行告警有上限，轮询不会刷屏（共 {_warns} 次 ≤ {advice._BAD_LINE_WARN_LIMIT}）",
+        )
+
+        # ---------------------------------------------------------------- 流程分发数据化
+        # 阶段分发从 if 链改成 STEP_METHODS 表驱动：新增阶段漏写分支要在**启动期**
+        # 被 flow.validate() 抓到，而不是等真机跑到那个游标才报「未知编排游标」。
+        _handlers = flow.step_handlers()
+        _expect_handlers = {n for n in flow.EXEC_ORDER if n != flow.TERMINAL}
+        check(
+            set(_handlers) == _expect_handlers,
+            "游标 -> 处理函数的登记覆盖 EXEC_ORDER 全部非终止游标",
+            str(sorted(_expect_handlers ^ set(_handlers))),
+        )
+        check(
+            not [v for v in _handlers.values() if not callable(getattr(Orchestrator, v, None))],
+            "登记的处理函数都真实存在于 Orchestrator 上（不是写了个错名字）",
+            str(sorted(_handlers.values())),
+        )
+        _step_src = inspect.getsource(Orchestrator._step)
+        check("stage ==" not in _step_src, "_step 里不再有 if 链（分发完全由表决定）")
+        check(flow.validate() == [], "流定义跨表校验一致（含新增的执行函数登记）", str(flow.validate()))
+        _bak_handlers = flow.step_handlers()
+        flow.register_step_handlers({k: v for k, v in _bak_handlers.items() if k != "verify"})
+        _caught = any("执行函数登记" in p for p in flow.validate())
+        flow.register_step_handlers(_bak_handlers)
+        check(_caught, "漏登记一个游标会被 flow.validate() 抓到（不用等真机跑挂）")
+        check(flow.validate() == [], "恢复登记后校验重新一致")
+
+        # ---------------------------------------------------------------- 子进程退出原因
+        # 以前只留 exit_code：页面显示「已退出（码 1）」，而异常在 console.log 末尾 ——
+        # 人得先找到那次运行再翻到文件末尾。现在直接把原因摘出来。
+        from pipeline import server as server_mod  # noqa: PLC0415
+
+        _log = root / "exit_reason.log"
+        _log.write_text(
+            "起流水线\nTraceback (most recent call last):\nValueError: boom\n", encoding="utf-8"
+        )
+
+        class _FakeProc:
+            def __init__(self, rc: int) -> None:
+                self.returncode = rc
+
+            def poll(self) -> int:
+                return self.returncode
+
+        _r1 = server_mod._exit_reason({"proc": _FakeProc(1), "log": _log, "exit_code": 1})
+        check("ValueError: boom" in _r1, "异常退出的原因从日志尾部摘出（不用人去翻日志）", _r1)
+        check(
+            server_mod._exit_reason({"proc": _FakeProc(0), "log": _log, "exit_code": 0}) == "正常结束（码 0）",
+            "正常退出不报成异常",
+        )
+        _r3 = server_mod._exit_reason({"proc": _FakeProc(1), "log": root / "nope.log", "exit_code": 1})
+        check("日志末尾没有内容" in _r3, "日志缺失时如实说明，而不是编一个原因", _r3)
+        _r4 = server_mod._exit_reason({"proc": _FakeProc(1), "log": _log, "exit_code": 1})
+        check(len(_r4) <= 320, f"退出原因被压成长度可控的一行（{len(_r4)} 字符）")
+
+        # ---------------------------------------------------------------- 提示词版本
+        # 改了提示词就加版本号，否则「换了提示词后返工率变了」无法归因（只能翻 git，
+        # 还可能翻错那次运行用的是哪一版）。
+        _no_ver = [s for s in prompts.SYSTEM if s not in prompts.PROMPT_VERSIONS]
+        _no_ver += [s for s in prompts.SYSTEM_NEW if s not in prompts.PROMPT_VERSIONS]
+        check(not _no_ver, "每个阶段的系统提示词都登记了版本号", str(_no_ver))
+        check(
+            prompts.prompt_version("dev") == f"dev.{prompts.PROMPT_VERSIONS['dev']}",
+            "版本标识形如 <stage>.vN",
+            prompts.prompt_version("dev"),
+        )
+        # 新建项目用另一份独立文本（SYSTEM_NEW），版本必须能区分开
+        check(
+            prompts.prompt_version("dev", "new").endswith("-new"),
+            "新建项目的提示词版本带 -new 后缀（两份文本各自演进）",
+            prompts.prompt_version("dev", "new"),
+        )
+        check(
+            prompts.prompt_version("nope") == "nope.v0",
+            "未登记的阶段退回 v0（不抛异常）",
+            prompts.prompt_version("nope"),
+        )
+
+        # ---------------------------------------------------------------- 埋点固定列
+        # 以前是 {"stage": stage, **meta}：列集由 meta 的构造点隐式决定，真机数据里
+        # 47 条记录混着 41 条模型调用形状 + 6 条验证形状，按列聚合得先猜每条属于哪种。
+        _llm_rec = runstore.normalize_call_record({"stage": "dev", "prompt_tokens": 100})
+        check(_llm_rec.get("kind") == "llm", "模型调用记录判为 llm")
+        check(
+            runstore.normalize_call_record({"stage": "verify", "verdict": "pass"}).get("kind") == "verify",
+            "带 verdict 的历史记录能推断为 verify（旧产物也读得懂）",
+        )
+        check(
+            set(runstore.CALL_FIELDS) <= set(_llm_rec),
+            "规整后一定带齐全部声明列（缺的补 None）",
+            str(sorted(set(runstore.CALL_FIELDS) - set(_llm_rec))),
+        )
+        check(
+            list(_llm_rec)[: len(runstore.CALL_FIELDS)] == list(runstore.CALL_FIELDS),
+            "规整后列的顺序与 CALL_FIELDS 一致（人读 jsonl 时列对齐）",
+        )
+        _extra = runstore.normalize_call_record({"stage": "dev", "自定义字段": 1})
+        check(_extra.get("自定义字段") == 1, "声明之外的字段原样保留（不丢信息）")
+
+        # ---------------------------------------------------------------- 上下文预算自洽
+        # 输入预算 + 最大输出 必须 < ctx，否则服务端会截断 → schema 校验失败 → 重试。
+        # 最紧的是 14B 三档（4800+3072=7872 < 8192），token 估算误差上限 3.2%，余量刚好够。
+        _overflow = [
+            f"{st}: {sp.prompt_token_budget}+{sp.num_predict} >= {sp.num_ctx}"
+            for st, sp in config.STAGE_MODELS.items()
+            if sp.prompt_token_budget + sp.num_predict >= sp.num_ctx
+        ]
+        check(not _overflow, "各阶段「输入预算 + 最大输出」都在 ctx 以内（超出会被截断）", str(_overflow))
+
+        # ---------------------------------------------------------------- 安全响应头
+        _hdr = dict(server_mod._SECURITY_HEADERS)
+        check(_hdr.get("X-Content-Type-Options") == "nosniff", "响应头带 nosniff")
+        check("default-src 'self'" in (_hdr.get("Content-Security-Policy") or ""), "带同源 CSP")
+        check(
+            "unsafe-inline" in (_hdr.get("Content-Security-Policy") or ""),
+            "CSP 放开内联脚本/样式（页面是自包含单文件，不放开会白屏）",
+        )
+
+        # ---------------------------------------------------------------- 输出截断处理
+        # 撞 num_predict 被截断是**确定性失败**：同 prompt、同上限，必然在同一处再断。
+        # 真机 2026-09-26（run snake-detailed）就是被它整死的 —— test 阶段 7B 的输出被砍在
+        # 字符串中间，两次尝试都报「Unterminated string starting at ...」，整个运行崩掉、
+        # 连产物都没留下。这里守住两条：有 ctx 余量 → 抬高上限重试；没余量 → 报出可操作原因。
+        # 注意 OllamaClient 已在本模块顶部导入 —— **不要**在这里再局部 import 一次：
+        # 局部 import 会让这个名字在整个 main() 里变成局部变量，函数前面几处
+        # （第 308 行那个「mock 运行必须切回 MockClient」的断言）会直接 UnboundLocalError。
+        # ruff 的 F823 就是抓这个的，实测踩过。
+        class _Truncating(OllamaClient):
+            """首次返回被截断的响应，再次返回合法产物。prompt_tokens 可控以决定有无余量。"""
+
+            def __init__(self, prompt_tokens: int) -> None:
+                super().__init__("http://unused")
+                self.prompt_tokens = prompt_tokens
+                self.limits: list[int] = []
+
+            def _request(self, path, payload, method="POST", timeout=None):  # noqa: ANN001
+                self.limits.append(int(payload["options"]["num_predict"]))
+                if len(self.limits) == 1:
+                    return {
+                        "message": {"content": '{"a": "被砍在中间'},
+                        "done_reason": "length",
+                        "prompt_eval_count": self.prompt_tokens,
+                        "eval_count": 999,
+                    }
+                return {
+                    "message": {"content": '{"a": "ok"}'},
+                    "done_reason": "stop",
+                    "prompt_eval_count": self.prompt_tokens,
+                    "eval_count": 5,
+                }
+
+        _spec = config.STAGE_MODELS["test"]
+        _tiny = {"type": "object", "required": ["a"],
+                 "properties": {"a": {"type": "string"}}, "additionalProperties": False}
+
+        _c1 = _Truncating(prompt_tokens=500)  # 余量充足
+        _d1, _m1 = _c1.chat_json(_spec, "sys", "u", _tiny)
+        check(_d1 == {"a": "ok"}, "输出被截断后抬高上限重试，最终拿到合法产物")
+        check(
+            len(_c1.limits) == 2 and _c1.limits[1] > _c1.limits[0],
+            "第二次的输出上限确实被抬高（不是拿同一上限白试一次）", str(_c1.limits),
+        )
+        check(_m1.get("done_reason") == "stop", "埋点带 done_reason", str(_m1.get("done_reason")))
+        check(
+            _m1.get("num_predict") == _c1.limits[1],
+            "埋点带本次实际输出上限（截断排查要靠它）", str(_m1.get("num_predict")),
+        )
+
+        _c2 = _Truncating(prompt_tokens=_spec.num_ctx - 200)  # ctx 余量不足
+        try:
+            _c2.chat_json(_spec, "sys", "u", _tiny)
+            check(False, "无 ctx 余量时应当报错，而不是再白跑一次")
+        except Exception as exc:  # noqa: BLE001
+            _msg = str(exc)
+            check(
+                "输出被截断" in _msg and "num_ctx" in _msg,
+                "无余量时报出可操作的原因（截断 + num_ctx），不是笼统的契约失败", _msg[:170],
+            )
+        check(len(_c2.limits) == 1, "无余量时不白跑第二次", str(_c2.limits))
+
+        # ---------------------------------------------------------------- 入口命令不被挤掉
+        # 真机 2026-09-26（run snake-detailed）：test 阶段把第 1 轮的 `python main.py`
+        # 换成了 3 条窄命令 `python -c "import game_logic; ...move('Right')"`，
+        # 语法 + 导入 + 3 条 = max_commands，**入口探测一次机会都没有** →
+        # runnability_problems 报「没有任何命令真正执行交付物」→ rework → 再来一轮还是
+        # 被挤掉 → 三轮不收敛、最后 needs_human、什么都不交付。
+        # 这里钉住槽位分配：入口探测必须优先于模型随手写的命令。
+        ep_root = root / "entry_slot"
+        ep_work = ep_root / "work"
+        ep_work.mkdir(parents=True, exist_ok=True)
+        (ep_work / "main.py").write_text(
+            "def go():\n    return 1\n\n\nif __name__ == '__main__':\n    go()\n", encoding="utf-8"
+        )
+        (ep_work / "logic.py").write_text("def f(n):\n    return n\n", encoding="utf-8")
+        _written = ["main.py", "logic.py"]
+        _test_report = {
+            "automated_commands": [
+                {"command": 'python -c "import logic; logic.f(1)"'},
+                {"command": 'python -c "import logic; logic.f(2)"'},
+                {"command": 'python -c "import logic; logic.f(3)"'},
+            ]
+        }
+        _planned = verify_mod.plan_commands(
+            ep_work, _written, _test_report, max_commands=5, impl=None
+        )
+        _srcs = [p.get("source") for p in _planned]
+        check("probe" in _srcs, "槽位被模型命令占满时，入口探测仍拿到一个槽位", str(_srcs))
+        check(
+            any("main.py" in str(p.get("command")) for p in _planned if p.get("source") == "probe"),
+            "入口探测选的是真入口脚本（优先于 pytest）",
+            str([p.get("command") for p in _planned if p.get("source") == "probe"]),
+        )
+        # 反向：只有库模块（无入口、无测试）时不硬塞一条探测命令
+        ep_work2 = ep_root / "libonly"
+        ep_work2.mkdir(parents=True, exist_ok=True)
+        (ep_work2 / "helper.py").write_text("def h():\n    return 1\n", encoding="utf-8")
+        _planned2 = verify_mod.plan_commands(ep_work2, ["helper.py"], None, max_commands=5, impl=None)
+        check(
+            all(p.get("source") != "probe" for p in _planned2),
+            "只有库模块（无入口、无测试）时不硬塞探测命令",
+            str([p.get("source") for p in _planned2]),
+        )
+
+        # ---------------------------------------------------------------- 兜底交付必须与「验证过的那份」等价
+        # 真机 run snake-v2（2026-09-26）：第 3 轮 verify 判 pass（沙箱里 5 个文件、
+        # main.py 真能开窗口），但兜底交付取的 20-dev.json 只有 4 条 edits —— 少了
+        # game_logic.py，而 main.py 第一行就是 `from game_logic import GameLogic`。
+        # 根因：**验证的对象（各轮累积合并后的实现）与交付的对象（某一个 dev 快照）
+        # 不是同一份**。交付前必须先核对，凑不齐就宁可不交 ——
+        # 一份「看着交付成功、实际缺文件」的产物比什么都不交更糟。
+        gap_root = root / "last_good_gap"
+        gap_repo = gap_root / "repo"
+        gap_repo.mkdir(parents=True, exist_ok=True)
+        gap_runs = gap_root / "runs"
+        gap_run = gap_runs / "r1"
+        gap_run.mkdir(parents=True, exist_ok=True)
+        runstore.write_json(
+            gap_run / "03-dev.json",
+            {
+                "stage": "dev",
+                "meta": {},
+                "artifact": {
+                    "edits": [
+                        {"path": p, "change_type": "add", "target_symbol": "x", "patch": f"# {p}\n"}
+                        for p in ("main.py", "ui.py", "ui_test.py", "game_logic_test.py")
+                    ]
+                },
+                "request_preview": "",
+            },
+        )
+        gap_orch = make(gap_root, "runs", repo=gap_repo)
+        gap_orch.run_id = "r1"
+        gap_orch.run_dir = gap_run
+        gap_orch.cursor = "done"
+        gap_orch.status = "done"
+        gap_orch.state["last_good"] = {
+            "file": "03-dev.json",
+            "seq": 3,
+            "audit": {},
+            # 那一轮**真正被验证过**的文件集合：比快照多一个 game_logic.py
+            "materialized": ["main.py", "ui.py", "ui_test.py", "game_logic_test.py", "game_logic.py"],
+        }
+        gap_out = gap_orch._deliver_last_good()
+        check(
+            not gap_out.get("delivered"),
+            "兜底版本凑不齐被验证过的文件集合时拒绝交付", str(gap_out)[:190],
+        )
+        check(
+            bool(gap_out.get("partial")) and gap_out.get("missing_vs_sandbox") == ["game_logic.py"],
+            "拒绝时明确指出缺的是哪个文件", str(gap_out.get("missing_vs_sandbox")),
+        )
+        check(
+            not (gap_repo / "main.py").exists(),
+            "拒绝时确实一个文件都没写进目标目录（不是写完再报）",
+        )
+        # 对照组：集合对得上就正常交付，证明不是无差别拒绝
+        gap_orch.state["last_good"]["materialized"] = [
+            "main.py", "ui.py", "ui_test.py", "game_logic_test.py",
+        ]
+        gap_out2 = gap_orch._deliver_last_good()
+        check(gap_out2.get("delivered"), "集合对得上时正常交付", str(gap_out2)[:190])
+
+        # ---------------------------------------------------------------- dev 执行级自检
+        # 真机三轮里 `python -m unittest game_logic_test` **一次都没通过**，而在此之前
+        # dev 阶段的自检全是文本级的（写残 / 缺 import / 类型诊断）—— 没有任何一步会真的
+        # 执行代码，于是「测试跑挂」只能等 test→verify 那一整轮之后才发现，下一轮照样写挂。
+        ex_root = root / "dev_exec"
+        ex_repo = ex_root / "repo"
+        ex_repo.mkdir(parents=True, exist_ok=True)
+        ex_orch = make(ex_root, "runs", repo=ex_repo)
+        ex_orch.run_id = "r1"
+        ex_orch.run_dir = ex_root / "runs" / "r1"
+        ex_orch.run_dir.mkdir(parents=True, exist_ok=True)
+        _ed_logic = {
+            "path": "logic.py", "change_type": "add", "target_symbol": "add",
+            "patch": "def add(a, b):\n    return a + b\n",
+        }
+
+        def _impl_with(assert_line: str) -> dict:
+            return {"edits": [_ed_logic, {
+                "path": "logic_test.py", "change_type": "add", "target_symbol": "test_add",
+                "patch": (
+                    "import unittest\nfrom logic import add\n\n\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    f"        {assert_line}\n"
+                ),
+            }]}
+
+        _bad = ex_orch._execution_check(_impl_with("self.assertEqual(add(1, 1), 3)"))
+        check(bool(_bad["problems"]), "产物自带测试失败时被 dev 自检抓到", str(_bad["problems"])[:130])
+        check(
+            "AssertionError" in str(_bad["problems"]) or "1 != 2" in str(_bad["problems"]),
+            "回灌的是原始 traceback，不是「测试失败」四个字", str(_bad["problems"])[:220],
+        )
+        check(_bad["ran"] == ["logic_test"], "只跑产出的测试模块", str(_bad["ran"]))
+        _dg = (_bad.get("digest") or {}).get("logic.py") or []
+        check(any("def add" in m for m in _dg), "同时产出接口摘要（重问时当准绳）", str(_dg))
+        check(
+            not ex_orch._execution_check(_impl_with("self.assertEqual(add(1, 1), 2)"))["problems"],
+            "测试通过时不报问题（不是无差别告警）",
+        )
+
+        # 接口摘要：类的实例属性必须收进去 —— 属性不存在是 ast 层最难自查的一类
+        (ex_repo / "cls.py").write_text(
+            "class C:\n"
+            "    def __init__(self, x):\n"
+            "        self.x = x\n"
+            "        self.y = 0\n\n"
+            "    def go(self, n):\n"
+            "        return n\n\n\n"
+            "def top(a, b=1):\n"
+            "    return a\n",
+            encoding="utf-8",
+        )
+        _one = "\n".join(verify_mod.api_digest(ex_repo, ["cls.py"]).get("cls.py") or [])
+        check("class C" in _one, "摘要含类名", _one)
+        check("实例属性: x, y" in _one, "摘要含实例属性（最难自查的一类）", _one)
+        check("def go(n)" in _one, "方法签名里丢掉 self（省预算）", _one)
+        check("def top(a, b=1)" in _one, "模块级函数带默认值", _one)
+        check(verify_mod.api_digest(ex_repo, ["没这个文件.py"]) == {}, "不存在的文件不进摘要")
+
+        # 测试模块探测：只认两种命名约定，别把目录里的任意文件都当用例
+        tm_dir = root / "tm"
+        tm_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("logic_test.py", "test_x.py", "helper.py"):
+            (tm_dir / name).write_text("import unittest\n", encoding="utf-8")
+        _mods = verify_mod.test_modules(tm_dir, ["logic_test.py", "test_x.py", "helper.py"])
+        check(_mods == ["logic_test", "test_x"], "只认 test_*.py / *_test.py 两种命名", str(_mods))
+        check(prompts.api_digest_block({}) == "", "空摘要渲染成空串（不占预算）")
+        check(
+            "【本轮已产出文件的接口" in prompts.api_digest_block({"a.py": ["def f()"]}),
+            "摘要块是正面陈述（有什么），不是负面清单",
+        )
+
+        # 测试产物必须含一条「真跑入口」的命令
+        ex_orch.state["implementation"] = {"edits": [{
+            "path": "main.py", "change_type": "add", "target_symbol": "main",
+            "patch": "def main():\n    pass\n\n\nif __name__ == '__main__':\n    main()\n",
+        }]}
+        ex_orch.state["test_report"] = {"automated_commands": [{"command": 'python -c "import main"'}]}
+        check(
+            bool(ex_orch._entry_command_gap()),
+            "测试只声明窄命令时报出「没有一条真跑入口」", str(ex_orch._entry_command_gap())[:130],
+        )
+        ex_orch.state["test_report"] = {"automated_commands": [{"command": "python main.py"}]}
+        check(ex_orch._entry_command_gap() is None, "声明了入口命令就不再报")
+        ex_orch.state["implementation"] = {"edits": [{
+            "path": "lib.py", "change_type": "add", "target_symbol": "f",
+            "patch": "def f():\n    return 1\n",
+        }]}
+        check(ex_orch._entry_command_gap() is None, "没有入口的库模块不报（避免误伤）")
+
+        # ---------------------------------------------------------------- 自家模块名要算上「待检实现」
+        # 真机 run snake-v3：第 1 轮 state 里还没有任何实现，而 `_own_module_names()` 只读 state
+        # → 这一轮新产出的文件**互相 import** 全被判成「缺依赖」，5 个文件报了 6 处假阳性，
+        # 把 dev 的重问预算整个烧在一个不存在的问题上（`重问 2 次后仍不合法 5 处` 就是它），
+        # 还把更贵的语义/执行级检查全挡在门外。
+        own_root = root / "own_names"
+        own_repo = own_root / "repo"
+        own_repo.mkdir(parents=True, exist_ok=True)
+        own_orch = make(own_root, "runs", repo=own_repo)
+        _cross = {"edits": [
+            {"path": "game_logic.py", "change_type": "add", "target_symbol": "G",
+             "patch": "class G:\n    pass\n"},
+            {"path": "main.py", "change_type": "add", "target_symbol": "m",
+             "patch": "from game_logic import G\n\n\ndef m():\n    return G()\n"},
+        ]}
+        check(not own_orch.state.get("implementation"), "前置：state 里还没有实现（第 1 轮的真实处境）")
+        check(
+            own_orch._own_module_names(_cross) >= {"game_logic", "main"},
+            "自家模块名要算上**待检实现**里的文件", str(sorted(own_orch._own_module_names(_cross))),
+        )
+        check(
+            own_orch._invalid_new_files(_cross) == [],
+            "同一轮内互相 import 不再被误判成「缺依赖」", str(own_orch._invalid_new_files(_cross)),
+        )
+
+        # ---------------------------------------------------------------- 三档自检必须累积，不互相短路
+        # 修复前：字面/语义任一报问题，执行级就轮不到 —— 实测它在真机上一次都没运行过。
+        ex_orch.state.pop("implementation", None)
+        _mixed = {"edits": [
+            {   # 触发 ① 字面：缺依赖
+                "path": "uses_ghost.py", "change_type": "add", "target_symbol": "g",
+                "patch": "import pandas_that_does_not_exist\n\n\ndef g():\n    return 1\n",
+            },
+            {   # 触发 ③ 执行：测试自己跑不通
+                "path": "calc.py", "change_type": "add", "target_symbol": "add",
+                "patch": "def add(a, b):\n    return a + b\n",
+            },
+            {
+                "path": "calc_test.py", "change_type": "add", "target_symbol": "t",
+                "patch": ("import unittest\nfrom calc import add\n\n\n"
+                          "class T(unittest.TestCase):\n"
+                          "    def test_add(self):\n"
+                          "        self.assertEqual(add(1, 1), 3)\n"),
+            },
+        ]}
+        _sc = ex_orch._dev_selfcheck(_mixed)
+        check(
+            any("pandas_that_does_not_exist" in str(p) for p in _sc),
+            "① 字面的「缺依赖」进了回灌清单", str(_sc)[:150],
+        )
+        check(
+            any("没跑通" in str(p) for p in _sc),
+            "③ 执行级的结果与①**累积**（修复前会被①挡住，从不运行）", str(_sc)[:200],
+        )
+
+        # ------------------------------------------------------------ 缺 import 机械补全
+        # 真机 run snake-ds-plan 第 1 轮：pyright 连报三轮 `main.py 未定义 "random"` /
+        # `ui.py 未定义 "sys"`，流水线「带问题重问 dev」3 次（约 184 秒）**一次都没修掉** ——
+        # 模型每次重写整份文件，惟独没加那行 import。补一行 import 是确定性操作，
+        # pyright 已经精确指出是哪个文件、哪个名字，不该让模型重试。
+        _diag = {"diagnostics": [
+            {"file": "main.py", "line": 17, "rule": "reportUndefinedVariable",
+             "message": "未定义\u201crandom\u201d"},
+            {"file": "ui.py", "line": 28, "rule": "reportUndefinedVariable",
+             "message": "未定义\u201csys\u201d"},
+        ]}
+
+        def _add_edit(path, body, change_type="add"):
+            return {"path": path, "change_type": change_type, "target_symbol": "x",
+                    "anchor": "", "patch_mode": "full_symbol", "patch": body,
+                    "covers_tasks": [], "rationale": ""}
+
+        _imp = {"edits": [
+            _add_edit("main.py", '"""入口"""\nimport pygame\n\n\ndef main():\n    x = random.randint(0, 9)\n'),
+            _add_edit("ui.py", "import pygame\n\n\ndef draw():\n    sys.exit(0)\n"),
+        ]}
+        _fix = patches.repair_missing_imports(_imp, _diag)
+        check(_fix["repaired"] == 2, "用了却没 import 的模块被机械补上", str(_fix["detail"]))
+        _mb = _imp["edits"][0]["patch"]
+        check("import random" in _mb and "import sys" in _imp["edits"][1]["patch"],
+              "补的是缺的那两个模块", _mb[:60].replace("\n", "|"))
+        # 必须插在 docstring 之后、任何代码之前 —— 单行 docstring 曾让它被追加到文件末尾
+        check(
+            _mb.index('"""入口"""') < _mb.index("import random") < _mb.index("def main():"),
+            "import 插在 docstring 之后、代码之前（不是追加到末尾）", _mb[:60].replace("\n", "|"),
+        )
+        check(patches.repair_missing_imports(_imp, _diag)["repaired"] == 0,
+              "幂等：已补过就不再重复插")
+        # 不该动的情况
+        _inner = {"diagnostics": [
+            {"file": "ui.py", "line": 1, "rule": "reportUndefinedVariable", "message": "未定义\u201cCell\u201d"}]}
+        check(patches.repair_missing_imports(
+            {"edits": [_add_edit("ui.py", "def f():\n    return Cell()\n")]}, _inner)["repaired"] == 0,
+            "项目内部符号不补 import（不是模块，交给跨模块检查）")
+        check(patches.repair_missing_imports(
+            {"edits": [_add_edit("main.py", "@@ -1 +1,2 @@\n+x = random.randint(0,9)")]}, _diag
+        )["repaired"] == 0, "diff 形态不碰（拿不到全文）")
+        check(patches.repair_missing_imports(
+            {"edits": [_add_edit("main.py", "x = random.randint(0,9)", "modify")]}, _diag
+        )["repaired"] == 0, "modify 补丁不碰")
+        check(patches.repair_missing_imports({"edits": []}, None)["repaired"] == 0,
+              "没有诊断时不动")
+
+        # ------------------------------------------------------------ 常驻入口短超时
+        # 真机 run snake-impfix 第 1 轮：`python main.py` 两条各卡满 180s（游戏主循环
+        # 跑满超时本来就被判成「能跑起来」），一轮白扔约 6 分钟 —— 而 20s 足够证明
+        # 「进程起来了没立刻崩」，判定口径一点没变。
+        _vw = root / "_resident"
+        _vw.mkdir(parents=True, exist_ok=True)
+        (_vw / "main.py").write_text("import pygame\n\n\ndef main():\n    pygame.init()\n",
+                                     encoding="utf-8")
+        (_vw / "app.py").write_text("import tkinter\nroot.mainloop()\n", encoding="utf-8")
+        (_vw / "cli.py").write_text("def main():\n    print(1)\n", encoding="utf-8")
+        check(verify.is_resident_entry(_vw, "main.py"), "pygame 入口判为常驻（不会自己退出）")
+        check(verify.is_resident_entry(_vw, "app.py"), "tkinter + mainloop 判为常驻")
+        check(not verify.is_resident_entry(_vw, "cli.py"),
+              "普通 CLI **不**判为常驻（误判会把真失败掩盖成「一直在跑」）")
+        check(not verify.is_resident_entry(_vw, "nope.py"), "文件不存在时不判为常驻")
+        check(verify.RESIDENT_ENTRY_TIMEOUT < 180, "常驻入口的超时明显短于默认",
+              str(verify.RESIDENT_ENTRY_TIMEOUT))
+
+        # ------------------------------------------------------------ 重问改为定点修
+        # 以前一边说「只修这些」一边要求「给出完整内容」，而重问走的是 dev_pass=3
+        # （full_symbol 给完整符号），等于把模型推向重写整份 —— 实测 9 次重问问题集几乎没变。
+        _rb = prompts._repair_block(["main.py:17 未定义 random"])
+        check("定点修" in _rb, "重问明确要求定点修，而不是重写整份")
+        check("modify" in _rb and "add" in _rb, "写清了定点改与整份重写各自的适用条件")
+        check("没被点到的文件不要出现在 edits 里" in _rb,
+              "禁止重发没问题的文件（越改越少的来源）")
+        check(prompts._repair_block([]) == "", "没有问题时不加这段")
+
+        # ------------------------------------------------- 返工口径（锁基准 / 定范围 / 最小改）
+        # 首次生成与被打回修问题是**两种任务**。以前返工轮里首次那句【任务】照旧在
+        # （"按方案实现…"），与 fixes 并存 → 模型同时收到「实现完」和「只修这几处」。
+        # 真机 snake-ds-plan 在返工轮重新生成了整份方案；snake-impfix 的 dev 重问 9 次
+        # 每次都重写整份。所以返工轮要切成返工口径 —— 但**不是另写一套提示词**。
+        _rn = prompts._dev_rework_note(["ui.py:28 未定义 sys"], None)
+        check(prompts.REWORK_HEADING in _rn, "dev 返工时给出返工口径")
+        check("原样保留" in _rn, "返工口径要求「未被指出的内容原样保留」")
+        check("定点改" in _rn or "modify" in _rn, "返工口径要求优先定点改")
+        check(prompts._dev_rework_note(None, None) == "", "首次生成时不加返工口径")
+        check(prompts._dev_rework_note(None, ["写残"]) != "",
+              "自检重问与评审返工走**同一套**返工口径（两条通道以前各说各的）")
+        check(prompts._plan_rework_note(["漏规划了文件"]) != ""
+              and prompts._plan_rework_note([]) == "", "方案岗同样只在返工时切口径")
+        # 关键：公共输入不复制 —— 返工只是**多插一段**，而不是另起一套提示词
+        _p0 = prompts.parts_dev(REQ, None, None, None, "")
+        _p1 = prompts.parts_dev(REQ, None, None, None, "", fixes=["修这个"])
+        check(
+            any(prompts.REWORK_HEADING in p for p in _p1)
+            and not any(prompts.REWORK_HEADING in p for p in _p0),
+            "返工口径只在返工轮出现（首次生成没有）",
+        )
+        # 比「多出来的是哪些段」：只该多出「问题清单」与「返工口径」两段。
+        # 公共输入（需求 / 上游产物 / 禁区 / 接口摘要 / 运行验证）一份都没被复制，
+        # 那就证明是「切口径」而不是「另起一套提示词」。
+        _extra = [p for p in _p1 if p and p not in _p0]
+        check(
+            len(_extra) == 2
+            and any(prompts.REWORK_HEADING in p for p in _extra)
+            and any("评审要求修复项" in p for p in _extra),
+            "返工只多出「问题清单 + 返工口径」两段（公共输入零复制 ⇒ 不是两套提示词）",
+            str([p[:26] for p in _extra]),
+        )
+
+        # ------------------------------------------------- 超范围改动的机械举证
+        # 「锁基准」光靠提示词叮嘱不够，这里用 diff 举证：动到问题清单没点到的文件了吗。
+        def _ed(path, sym, body):
+            return {"path": path, "change_type": "modify", "target_symbol": sym,
+                    "anchor": "x", "patch_mode": "replace_span", "patch": body,
+                    "covers_tasks": []}
+
+        _prev = {"edits": [_ed("ui.py", "draw", "old"), _ed("other.py", "f", "same")]}
+        _new = {"edits": [_ed("ui.py", "draw", "new"), _ed("other.py", "f", "same")]}
+        _oos = Orchestrator._out_of_scope_edits(_prev, _new, ["ui.py:28 未定义 sys"])
+        check(_oos == [], "只改了被点到的文件 → 不算超范围", str(_oos))
+        _bad = {"edits": [_ed("ui.py", "draw", "new"), _ed("other.py", "f", "changed")]}
+        _oos2 = Orchestrator._out_of_scope_edits(_prev, _bad, ["ui.py:28 未定义 sys"])
+        check(any("other.py" in x for x in _oos2), "动到没被点到的文件会被举证", str(_oos2))
+        check(not any("ui.py" in x for x in _oos2), "被点到的文件不算超范围", str(_oos2))
+        check(Orchestrator._out_of_scope_edits(_prev, _bad, []) == [],
+              "没有问题清单时不举证（没有范围可依，避免满屏噪音）")
+        # 路径口径不一致也不能误判：问题写基名、改动写相对路径
+        _p3 = {"edits": [_ed("src/ui.py", "draw", "old")]}
+        _n3 = {"edits": [_ed("src/ui.py", "draw", "new")]}
+        check(Orchestrator._out_of_scope_edits(_p3, _n3, ["ui.py:28 未定义 sys"]) == [],
+              "问题写基名、改动写路径时不误判（口径不一致视为命中）")
+
+        # ------------------------------------------------------------ 方案文件集覆盖
+        # dev 自检的第 ④ 档。前三档问「写出来的好不好」，这一档问「方案点名的有没有写出来」
+        # —— 一个文件被整个漏掉时，字面/类型/执行三档**全都干净**（没有那个文件，
+        # 自然没有它的错误）。而契约只要求 edits 非空（minItems: 1），任务审计查的又是
+        # 「任务有没有被声明覆盖」。三者都拦不住漏文件。
+        # 实测（2026-09-26 模型对照实验）：候选模型 3 次有 2 次只交了硬约束要求的 5 个
+        # 文件里的 1 个，契约与审计全程放行，一路走到 verify。
+        _FILES = ["main.py", "game_logic.py", "ui.py", "game_logic_test.py", "ui_test.py"]
+        _FILE_TASK = {p: f"T-0{i + 1}" for i, p in enumerate(_FILES)}
+        _PLAN = {
+            "changes": [{"path": p} for p in _FILES],
+            "tasks": [{"id": _FILE_TASK[p], "target_files": [p]} for p in _FILES],
+        }
+
+        def _fake_orch(plan):
+            o = Orchestrator.__new__(Orchestrator)
+            o.state = {"plan": plan}
+            o.project_type = "new"
+            return o
+
+        def _fake_impl(paths, declared=(), auto_cover=True, covers=()):
+            """covers 显式给定时原样用；否则按路径自动对应任务（模拟 dev 正常填 covers_tasks）。"""
+            edits = []
+            for p in paths:
+                if covers:
+                    ct = list(covers)
+                elif auto_cover and p in _FILE_TASK:
+                    ct = [_FILE_TASK[p]]
+                else:
+                    ct = []
+                edits.append({
+                    "path": p, "change_type": "add", "target_symbol": "x", "anchor": "",
+                    "patch_mode": "full_symbol", "patch": "def x(): pass",
+                    "covers_tasks": ct, "rationale": "",
+                })
+            return {
+                "edits": edits,
+                "not_implemented": [{"task": t, "reason": "做不了"} for t in declared],
+            }
+
+        check(
+            _fake_orch(_PLAN)._missing_plan_files(_fake_impl(_FILES)) == [],
+            "方案要求的文件都产出、任务都覆盖时不报问题",
+        )
+        _miss = _fake_orch(_PLAN)._missing_plan_files(_fake_impl(["main.py"]))
+        check(len(_miss) == 4, "漏掉整个文件会被报出（契约与任务审计都拦不住这一类）", str(_miss))
+        check(
+            any("game_logic.py" in m and "T-02" in m for m in _miss),
+            "漏文件的描述带文件与任务号（重问时 dev 知道该补什么）", str(_miss[:1]),
+        )
+        check(
+            _fake_orch(_PLAN)._missing_plan_files(
+                _fake_impl(["main.py"], declared=["T-02", "T-03", "T-04", "T-05"])
+            ) == [],
+            "已声明未实现的文件不算漏（正常偏离不该触发重问）",
+        )
+        # 二开场景口径不一致：方案的 target_files 写绝对路径、dev 的 edits.path 写相对路径
+        check(
+            _fake_orch({"changes": [], "tasks": [
+                {"id": "T-01", "target_files": [r"D:\repo\greeting.py"]}]
+            })._missing_plan_files(_fake_impl(["greeting.py"], covers=["T-01"])) == [],
+            "方案绝对路径 vs 产出相对路径算命中（二开口径不一致不误报）",
+        )
+        check(
+            _fake_orch(None)._missing_plan_files(_fake_impl(["main.py"])) == [],
+            "没有方案时不报（不阻塞无 plan 的路径）",
+        )
+        # 边界：dev 一个任务都没覆盖 = 整体没按方案来，那是 plan_task_uncovered 的活，
+        # 不该由本档逐文件再报一遍并烧掉 dev 的重问预算。
+        check(
+            _fake_orch(_PLAN)._missing_plan_files(_fake_impl(_FILES, auto_cover=False)) == [],
+            "零任务覆盖时不逐文件报（交给 plan_task_uncovered，避免烧重问预算）",
+        )
+        # 两处共用同一真源：否则会出现「审计说没漏、自检说漏了」的自相矛盾
+        _cov = Orchestrator._plan_task_coverage(_PLAN, _fake_impl(["main.py"]))
+        check(
+            sorted(_cov["missing"]) == ["T-02", "T-03", "T-04", "T-05"],
+            "覆盖判定是 _audit_implementation 与 _missing_plan_files 共用的唯一真源",
+            str(_cov["missing"]),
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)

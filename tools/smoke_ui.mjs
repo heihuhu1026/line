@@ -53,6 +53,48 @@ async function fetchJson(path, init) {
  * 「切片带边界标题」这类断言会误报）。若已有运行在进行中（单驻留，接口返回 409），
  * 或造运行失败，则退回「挑一个已有运行」，并把标记相关断言自动放宽。
  */
+/**
+ * 模拟人工解决 **PM 强控闸门**（未裁决的 open_questions + 两列未明确项）。
+ *
+ * 强控的语义：产物里只要还有"不是陈述"的条目，pm 之后就不放行；续跑会被原地再挡一次。
+ * 所以这里必须**先把条目解决掉**再续跑 —— 只 resume 是白跑（这正是它与其它闸门的区别）。
+ */
+async function resolvePmGate(runId, detail) {
+  const pm = ((detail && detail.stages) || []).find((s) => s.stage === "pm");
+  const art = (pm && pm.artifact) || {};
+  const decisions = [];
+  (art.open_questions || []).forEach((q) => {
+    const ref = String((q && q.question) || "").trim();
+    if (ref) {
+      decisions.push({
+        kind: "pm_question",
+        ref,
+        decision: String((q && q.assumed_answer) || "（人工按建议执行）"),
+      });
+    }
+  });
+  const fixed = JSON.parse(JSON.stringify(art));
+  fixed.unknowns = [];
+  fixed.clarifying_questions = [];
+  await fetchJson(`/api/runs/${runId}/artifact`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stage: "pm", artifact: fixed }),
+  });
+  if (decisions.length) {
+    await fetchJson(`/api/runs/${runId}/pm-decisions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decisions }),
+    });
+  }
+  await fetchJson(`/api/runs/${runId}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+}
+
 async function ensureRun() {
   if (process.env.RUN_ID) return { id: process.env.RUN_ID, mine: false };
   const created = await fetchJson("/api/runs", {
@@ -75,8 +117,12 @@ async function ensureRun() {
       if (st === "done" || (st === "paused" && after === "human_review")) {
         return { id: runId, mine: true };
       }
-      if (st === "paused") {
-        // PM 未决项等闸门会先停一下；mock 运行直接放行继续跑
+      if (st === "paused" && after === "pm") {
+        // PM 强控：还有未成为陈述的条目时**不放行**，必须先由人工解决。
+        // 这里模拟人工：逐条裁决 open_questions，并把两列未明确项清空（＝写成确定结论）。
+        await resolvePmGate(runId, d);
+      } else if (st === "paused") {
+        // 其它闸门（如人工审核）直接放行继续跑
         await fetchJson(`/api/runs/${runId}/resume`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -88,7 +134,15 @@ async function ensureRun() {
     return { id: runId, mine: true }; // 没跑到理想停点也先用它验证
   }
   const rows = (await fetchJson("/api/runs") || {}).runs || [];
-  const pick = rows.find((r) => (r.stages || 0) > 0);
+  // 作业里的模块运行（job-…-M-xx）**不写自己的 console.log**：整个作业跑在一个子进程里，
+  // 日志都落在发起它的那次运行的日志中。拿它去验「按阶段切片」必然拿到空文本，
+  // 于是断言会假红（页面显示「该阶段暂无日志」其实是对的）。优先避开这类运行。
+  const own = (r) => !/^job-/.test(r.run_id);
+  // 按阶段产物**数量**挑最完整的一次：只按「最新」挑，曾挑到刚起步就中断的运行，
+  // 于是「已完成阶段标绿 / 日志按阶段切片 / 产物定位」一串断言假红（页面其实是对的）。
+  const scored = rows.filter((r) => (r.stages || 0) > 0)
+    .sort((a, b) => (b.stages || 0) - (a.stages || 0));
+  const pick = scored.find(own) || scored[0];
   return pick ? { id: pick.run_id, mine: false } : null;
 }
 
@@ -219,7 +273,18 @@ async function run() {
     raw.split(",").forEach((kv) => { const [k, v] = kv.split("="); statuses[k] = v; });
     check((raw.match(/g-done/g) || []).length >= 4, "已完成阶段被标绿",
       Object.entries(statuses).map(([k, v]) => `${k}${v}`).join(" ").slice(0, 90));
-    check(statuses["done"] !== "g-done", "未到达的终止节点不会被误标为已完成", statuses["done"]);
+    // 终止节点该不该绿，取决于这次运行**到底跑完没有**：跑完了绿是对的。
+    // 断言的原意是「**没到** done 却被标成已完成」，所以必须先判定前提 ——
+    // 否则一旦选中一次完整跑完的运行（自建 mock 运行就会跑完），这条会假红
+    // （页面其实是对的）。
+    const runState = (await fetchJson(`/api/runs/${runId}`)) || {};
+    const runStatus = (runState.state || {}).status || "";
+    if (runStatus === "done") {
+      skip(`运行 ${runId} 已跑完（status=done），终止节点标绿正确，跳过该断言`);
+    } else {
+      check(statuses["done"] !== "g-done", "未到达的终止节点不会被误标为已完成",
+        `${statuses["done"]}（status=${runStatus}）`);
+    }
 
     // 点击节点 → 详情面板
     await evalJs(`document.querySelector('.gnode[data-stage="${PICK_STAGE}"]').dispatchEvent(new MouseEvent('click',{bubbles:true}))`);
@@ -271,6 +336,103 @@ async function run() {
       "20);setTimeout(()=>{clearInterval(t);r(false)},3000)})");
     const dt = Date.now() - t0;
     check(dt < 1200, `点击到详情可读的响应时间 ${dt}ms（阈值 1200ms）`);
+
+    // 缺 state.json 的运行不该被劝退「只能查看，不能续跑」——被入口总闸拆成作业的运行
+    // **永远不会有** state.json（产物在 runs/_jobs/<job_id>/），说成不能续跑是误导
+    // （真机 20260926-154413 就是这么把人挡在门外的）。有这种运行就顺手验一把，没有就跳过。
+    const allRows = (await (await fetch(new URL("/api/runs", BASE))).json()).runs || [];
+    const split = allRows.find((r) => r.status === "job");
+    if (split) {
+      await evalJs(`openRun(${JSON.stringify(split.run_id)})`);
+      await sleep(1600);
+      const msg = await evalJs("$('d-msg').innerText");
+      check(/已拆分为作业|入口总闸/.test(msg) && !/不能续跑/.test(msg),
+        `缺 state 的运行给的是正解（${split.run_id}），不劝退`,
+        msg.split("\n").find((l) => l.trim()) || "");
+      const label = await evalJs(
+        `(document.querySelector('.run[data-run="${split.run_id}"] .b')||{}).innerText || ''`);
+      check(/拆分为作业|运行中/.test(label), "列表徽标不再写「启动失败」", label);
+    } else {
+      skip("没有「拆分为作业」的运行，跳过缺 state 文案断言");
+    }
+
+    // 作业页（三阶段视图）：相位 / 两处人工环节 / 续跑按钮语义 —— 顺手也把它纳入
+    // 「无 console.error」的覆盖范围（页面级的 JS 错会在这里现形）
+    const jobs = ((await fetchJson("/api/jobs")) || {}).jobs || [];
+    if (jobs.length) {
+      await evalJs(`openJob(${JSON.stringify(jobs[0].job_id)})`);
+      await sleep(1300);
+      const jmsg = await evalJs("$('j-msg').innerText");
+      check(
+        /相位/.test(jmsg) && /人工环节只有两处/.test(jmsg),
+        "作业页显示相位与「人工环节只有两处」",
+        (jmsg.split("\n").find((l) => l.trim()) || "").slice(0, 90)
+      );
+      const jbtn = await evalJs("$('j-resume').textContent");
+      check(/进入下游|继续跑下游|续跑作业/.test(jbtn), "续跑按钮文案随相位变化", jbtn);
+      const modBtns = await evalJs("document.querySelectorAll('#j-modules button').length");
+      check(modBtns >= 1, "作业页有子运行入口按钮", String(modBtns));
+
+      // 交付就绪度（4 门打分）只在「待统一验收」时才有材料 —— 没有就跳过，
+      // 有就必须把分数与**未验证项**都露出来（人审最需要后者）。
+      const jDetail = await fetchJson(`/api/jobs/${encodeURIComponent(jobs[0].job_id)}`);
+      const readiness = (jDetail?.human_review || {}).readiness;
+      if (readiness) {
+        const shown = await evalJs("$('j-msg').innerText");
+        check(shown.includes(`交付就绪度`) && shown.includes(`${readiness.score}/${readiness.max}`),
+          "验收卡片显示交付就绪度分数", String(readiness.score) + "/" + String(readiness.max));
+        check((readiness.unverified || []).length === 0 ||
+          /未验证项/.test(shown), "验收卡片披露未验证项",
+          `${(readiness.unverified || []).length} 条`);
+      } else {
+        skip("该作业还没有统一验收材料（未到验收相位），跳过就绪度卡片断言");
+      }
+      // 渲染器本身用**合成数据**验一把：不依赖"恰好有作业处在验收相位"这种事，
+      // 否则这条链路要等到真机跑到验收才第一次被执行。用的是页面里真实的那份
+      // readinessBlock（不是另写一份等价逻辑，那种"测的是副本"的断言最没用）。
+      const rdHtml = await evalJs(`readinessBlock({score:6,max:8,decision:"禁止放行：先返工",gates:[
+        {key:"functional",label:"功能落地",score:2,evidence:[]},
+        {key:"verified",label:"机械验证",score:2,evidence:[]},
+        {key:"redline",label:"工程红线",score:0,evidence:["M-01：1 条红线阻断"]},
+        {key:"delivered",label:"交付成型",score:2,evidence:[]}],
+        unverified:["覆盖率未测量：本环境没有接入覆盖率工具","没有断言型命令"]})`);
+      check(/交付就绪度/.test(rdHtml) && /6\/8/.test(rdHtml) && /覆盖率未测量/.test(rdHtml),
+        "就绪度卡片渲染出分数/扣分门/未验证项", rdHtml.length + " 字符");
+      check(/工程红线/.test(rdHtml) && /0\/2/.test(rdHtml) && /禁止放行/.test(rdHtml),
+        "扣分能定位到具体哪一门，并给出放行结论");
+      check((await evalJs("readinessBlock(null)")) === "", "没有就绪度数据时不渲染空卡片");
+
+      // 红线/未验证项必须真的渲染到详情页 **顶部提示区** —— 这条是奔着一个真机 bug 去的：
+      // 产物在 state.json 的 `artifacts` 层，而页面早期读的是顶层，于是「日志里有 5 条红线，
+      // 页面一片干净」。有带红线的运行就验一把（没有就跳过）。
+      const cand = (await (await fetch(new URL("/api/runs", BASE))).json()).runs || [];
+      let withRules = null;
+      for (const row of cand.slice(0, 10)) {
+        const det = await fetchJson(`/api/runs/${encodeURIComponent(row.run_id)}`);
+        // 两种形状都要认：详情接口给的是**白名单 state 视图**（产物层被摊平到顶层），
+        // 而纯快照里产物在 artifacts 下。
+        const art = Object.assign({}, det?.state || {}, det?.state?.artifacts || {});
+        if ((art.rule_findings || []).length) { withRules = { row, art }; break; }
+      }
+      if (withRules) {
+        await evalJs(`openRun(${JSON.stringify(withRules.row.run_id)})`);
+        await sleep(1500);
+        const msg = await evalJs("$('d-msg').innerText");
+        check(/工程红线/.test(msg), "详情页顶部渲染出工程红线（产物层数据读得到）",
+          `${withRules.row.run_id} 共 ${withRules.art.rule_findings.length} 条：` +
+          (msg.split("\n").find((l) => /红线/.test(l)) || "").slice(0, 70));
+        const uv = ((withRules.art.verify_report || {}).unverified || []).length;
+        if (uv) {
+          check(/未验证项/.test(msg), "详情页披露未验证项", `${uv} 条`);
+        } else {
+          skip("该运行没有未验证项，跳过未验证项展示断言");
+        }
+      } else {
+        skip("现有运行里没有带红线的，跳过红线展示断言");
+      }
+    } else {
+      skip("没有作业，跳过作业页断言");
+    }
 
     check(problems.length === 0, "页面无 console.error / 未捕获异常", problems.slice(0, 3).join(" | "));
 

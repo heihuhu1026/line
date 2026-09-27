@@ -1,29 +1,85 @@
 """上下文预算工具：token 估算、文本截断、上游产物蒸馏。
 
 14B 只有 8K 上下文（显存硬约束），因此评审/架构师阶段必须把上游产物蒸馏后再喂。
+
+token 估算的来历（2026-09-26 重做）
+----------------------------------
+旧实现是 ``len(text) / CHARS_PER_TOKEN``（固定 1.6 字符/token）。用真机 3 个 run、
+41 条样本对照 ollama 实回的 ``prompt_eval_count`` 实测：**平均高估 40.9%，且 41 条
+全是高估**——等于近一半预算浪费在「以为占了、其实没占」的额度上，真正该喂的代码被
+提前截掉。
+
+现按字符类别加权估算，系数由 ``tools/calibrate_tokens.py`` 在同一批真机样本上拟合：
+
+    ASCII      0.28 token/字
+    非 ASCII   0.76 token/字
+
+同一批样本上平均绝对误差 **1.7%**（各阶段 1.2%~3.2%），带符号偏差 -0.4%。
+注意：这些系数是**量出来的，不是猜的**——外部文档曾建议 CJK 取 1.5 token/字，
+按那组系数实测误差 **50.6%**，比不改还差，所以没有采用。
+
+换模型/换硬件后想重新校准：``python -m tools.calibrate_tokens``，它会打印可直接
+粘贴的系数值。
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from .config import CHARS_PER_TOKEN
+from .config import CHARS_PER_TOKEN, TOK_PER_ASCII_CHAR, TOK_PER_NONASCII_CHAR
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（中英混排），仅用于预算裁剪，真实值以 ollama 返回的 prompt_eval_count 为准。"""
+    """按字符类别加权估算 token 数（中英混排）。
+
+    只用于预算裁剪；真实值以 ollama 返回的 ``prompt_eval_count`` 为准。
+    """
     if not text:
         return 0
-    return int(len(text) / CHARS_PER_TOKEN) + 1
+    total = len(text)
+    # ``encode('ascii', 'ignore')`` 会丢掉所有非 ASCII 字符，长度即 ASCII 字数；
+    # 这是 C 层实现，比逐字符 ord() 快得多，且结果精确（不是估算）。
+    ascii_n = len(text.encode("ascii", "ignore")) if not text.isascii() else total
+    return int(ascii_n * TOK_PER_ASCII_CHAR + (total - ascii_n) * TOK_PER_NONASCII_CHAR) + 1
+
+
+def chars_for_tokens(max_tokens: int, sample: str | None = None) -> int:
+    """把 token 上限换算成字符上限。
+
+    给了 ``sample`` 就按该文本自身的「字符/token」比换算 —— 同一台机器上代码与中文
+    的比例差近 3 倍（代码约 3.6 字/token、中文约 1.3 字/token），用固定常数必然
+    一侧浪费一侧超限。没有样本时退回 ``CHARS_PER_TOKEN``（保守值）。
+    """
+    if max_tokens <= 0:
+        return 0
+    if sample:
+        est = estimate_tokens(sample)
+        if est > 0:
+            return max(int(max_tokens * len(sample) / est), 1)
+    return max(int(max_tokens * CHARS_PER_TOKEN), 1)
 
 
 def truncate_text(text: str, max_tokens: int, marker: str = "\n…（已截断）") -> str:
+    """按 token 预算截断文本。
+
+    旧实现用 ``max_tokens * CHARS_PER_TOKEN`` 反推字符数：那个常数在代码与中文之间
+    差近 3 倍，截出来的长度必然忽长忽短。现在直接对「估算 token 数」二分——估算对
+    前缀长度单调不减，所以二分正确，且长度自适应文本自身构成。
+    """
     if not text:
         return ""
-    max_chars = max(int(max_tokens * CHARS_PER_TOKEN), 200)
-    if len(text) <= max_chars:
+    if max_tokens <= 0:
+        return marker
+    if estimate_tokens(text) <= max_tokens:
         return text
-    return text[:max_chars] + marker
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_tokens(text[:mid]) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + marker
 
 
 def distill(obj: Any, str_tokens: int = 160, list_items: int = 12, depth: int = 0) -> Any:

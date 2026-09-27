@@ -1359,3 +1359,380 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
   fix 列表污染源 `orchestrator.py:1630`；运行态相位 `console.html:772 runPhase`、续跑按钮 `:988`；
   入口探测 `verify.py:307 entry_script_problems`。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。
+
+---
+
+## §24 本次会话：dev/verify 流水线优化（2026-09-26）
+
+### 24.1 背景与决策
+
+- **模型切换议题（结论：不切）**：原议题是否把全局/方案岗位从 qwen3-14b 换成 DeepSeek-Coder-V2-Lite。
+  实测对照（同一条 dev prompt 各 3 次）：DeepSeek 3 次有 2 次只交 1/5 文件；真机把 `architect_plan`
+  换成 DeepSeek 后，方案只列 1 个文件（漏 4 个需求硬约束文件），验证直接 fail；且它**不支持 think**
+  （按代码默认下发 `think=true` 被 ollama 拒 HTTP 400）。**结论：全局保持 qwen3-14b-arch-8k，
+  dev/test 保持 qwen2.5-coder-7b，不切换。** 任何"全局/架构"岗换 DeepSeek 都等于同时关掉思考模式，
+  比较不再是纯模型对比。
+- 转而修「真机上反复观察到的浪费」。
+
+### 24.2 本次改动（全部未提交，回归绿）
+
+1. **漏文件闸门**：`orchestrator._plan_task_coverage`（任务覆盖判定的唯一真源）+ `_missing_plan_files`
+   （dev 自检第④档，只报"方案点名、dev 大体在按方案干却漏掉整个文件产出"的文件）。已固化断言。
+2. **机械补 import**：`patches.repair_missing_imports`（只认 pyright `reportUndefinedVariable` +
+   名字确为可导入模块 + `add` 整份 + 幂等），挂在 dev 重问循环**先于重问**。修掉首版的 bug：单行
+   docstring 会让 import 被追加到文件末尾。
+3. **重问无进展提前停止**：`_shown` 比对问题集，与上版完全相同则停，交评审/人工。
+4. **GUI 常驻入口短超时**：`verify.RESIDENT_ENTRY_TIMEOUT=20` + `is_resident_entry`
+   （pygame/tkinter/mainloop 等识别）；常驻入口用短超时（长超时本就被判"能跑起来"，纯浪费）。
+5. **重问改定点修**：`prompts._repair_block` 改为要求逐条 `modify`/`replace_span`、禁止重发没问题的文件；
+   标题抽成常量 `REPAIR_HEADING`（避免改措辞打瞎测试）。
+6. **返工口径（锁基准/定范围/最小改）**：`prompts.rework_task_block` + `_dev_rework_note`（统一
+   `fixes` 评审返工 与 `repair` 自检重问两条通道，共享同一把口径钥匙）+ `_plan_rework_note`；
+   只切任务段，公共输入零复制（非两套提示词）。
+7. **超范围机械举证**：`orchestrator._out_of_scope_edits`（diff 比对，改动碰到问题清单没点到的文件
+   只记告警、不判负），挂在重问循环。
+
+### 24.3 测试
+
+- `ruff check pipeline tools` 全绿。
+- `tools/smoke_mock` 603 断言（本轮 +13）、`tools/smoke_console` 128 断言（本轮 +1）。
+- console 偶发 90s 超时是残留 `pipeline.server` 进程抢资源，非代码问题（多次重跑即可过）。
+
+### 24.4 基线对照与待办
+
+- **基线 `snake-impfix`（未带 2/3/4/5/6/7）**：wall 3228s、重问 9 次、import 补全 4 次、
+  180s 超时 3 次、needs_human、3 轮未收敛。
+- **待办（最高优先级）**：真机验证 `返工口径` + `超范围告警` 比例 —— 唯一能证明它们真有效的办法。
+  验证运行 `snake-fix2` 已被手动停止（`.running.json` 已删），目标仓库 `D:\AI\tcs` 已清空，
+  `config` 已还原全 qwen。重起命令见 §24.5。
+- test/assess/review 三岗的返工口径排在 dev 之后；GA 全局架构师无 `fixes` 重入分支，暂不做。
+- **可选**：方案漏文件闸门（plan 阶段校验需求点名文件是否被 `changes`/`target_files` 覆盖）——
+  今天真机发现 ④ 只防"dev 漏"、防不住"plan 自己漏文件"。
+
+### 24.5 如何继续
+
+- 重起验证（同需求、同配置、只有代码不同）：
+  `python -m pipeline.cli --requirement-file _req_snake.md --project-type new --scale small --repo D:\AI\tcs --out runs --run-id snake-impfix2`
+- 对照基线 `snake-impfix`，重点看日志里 `[超范围]` 命中多少、dev 重问次数是否下降、
+  `[import 补全]` 是否仍稳定触发、wall 时间是否缩短。
+- 环境：`config` 已还原全 qwen；需求文件 `D:\AI\line\_req_snake.md` 仍在（重跑用）；
+  临时运行日志 `_run_*.log`/`_run_*.err` 已清理。
+
+---
+
+## §25 本轮会话移交上下文（2026-09-26 晚 · 技能吸纳 + 全量补齐遗留）
+
+### 25.1 起因
+
+把两份外部 skill（`C:\Users\Administrator\.workbuddy\skills\dev-expert`、`fullstack-dev`）里
+可搬的机制落到本项目。收敛出一条口径：**能机械判定的才进阻断，判不了的只进提示词**
+（与 §22/§23 的教训一致：模型自述不可信，机械证据才可信）。
+
+### 25.2 主要改动（按文件）
+
+| 文件 | 改动 |
+|---|---|
+| `pipeline/rules.py` + `rules.json`（新） | 声明式工程红线规则库：**16 条（8 阻断 / 8 提示，7 条条件触发）**。每条**必须**有 `evidence`（凭什么判负）与 `negative`（什么反例能推翻它）—— 缺 negative 自动降级为 warn、不可判负；引擎任何异常只跳过该条，绝不拖垮流水线 |
+| `pipeline/orchestrator.py` | ① dev 结束时**落盘前**扫红线（`_rule_findings`），verify 后扫真文件（编码/`.env`）；② `_rule_blockers` 并入 `_mechanical_blockers`（**评审给 pass 也改判 rework_dev**）；③ `_refute_stale_blockers`：主张"跑不起来/语法错/导入失败"的旧阻断项，在本轮机械证据**全绿**时剔除（断 §23.2 的自指循环），证伪判据保守（任一处有疑点就保留）；④ `run()` 里**同 run_id 全新运行先归档上一代快照**（`--only` 除外）；⑤ dev 提示词**点名消失的符号**（`prompts.dev_regression_block`）；⑥ `_audit_test.boundary_gap`；⑦ `_audit_plan.vague_acceptance / weak_rollback`；⑧ handoff 增交付证据表；⑨ `rounds[].routed_to` 记**实际**去向 |
+| `pipeline/verify.py` | `unverified_claims`（未验证项强制披露）+ `coverage_fact`（**只从真实输出**解析 pytest-cov/jest/go cover，有数字才判 80% 门槛）+ `negative_control`（**撤掉改动后断言仍通过 ⇒ 对本次交付没有判别力**；跑完必还原沙箱） |
+| `pipeline/prompts.py` | 评审：`falsify_block`（证伪门禁）+ `rationalization_block`（9 条合理化红旗）+ 红线证据块；`_verify_view` 带上未验证项/覆盖率/负向对照；plan/test 审计块加新判据 |
+| `pipeline/evidence.py`（新） | 交付证据表：**验收标准 ↔ 用例 ↔ 执行 ↔ 红线/未验证项**。匹配是**启发式**（关键词覆盖率 ≥0.34 且重合 ≥2），产物里明写"不许当已核对用" |
+| `pipeline/gateway.py` | `job_readiness`（4 门 × 0–2，取**最弱一环**；≤6 禁止放行、7 带例外、8 可放行）+ `job_evidence_md`（作业级证据表）+ GA 调模型**前**落 `ga.json{status:running}` |
+| `pipeline/issues.py` | `Issue` 增**误判复盘三栏**（错判点/正确判据/盲区）；新增 5 个 kind（`rule_violation`/`refuted_stale_fix`/`unverified_claim`/`stage_seq_conflict`/`rule_load_problem`）；`escalation_candidates`（≥8 次且跨 ≥3 次运行 → 建议升规则）并渲染进 `report_markdown` |
+| `pipeline/runstore.py` | `duplicate_stage_seqs`（两代产物混存探测）、`GATEWAY_LINK_NAME` 常量 |
+| `pipeline/server.py` | `/api/rules`；详情带 `ga`/`log_source`；**模块运行日志回退到所属作业**；`PYTHONUNBUFFERED=1` |
+| `pipeline/console.html` | 详情页顶部显示红线/未验证项/被证伪项/两代混存/规则库加载问题；配置页规则库清单；作业验收卡片显示就绪度 + 可展开证据表；日志注明来源 |
+| `tools/smoke_rules.py`（新） | 规则库正反用例 + **接线**断言（判负/证伪/账本/人审清单/就绪度/证据表/覆盖率/负向对照/GA 痕迹） |
+
+### 25.3 验证（本轮改动后的实测）
+
+- `tools/smoke_rules.py` **77/77**；`tools/smoke_mock.py` **639/639**；`tools/smoke_console.py` **150/150**；`tools/smoke_ui.mjs` **31/31**。
+- 评审提示词预算**实测**：加块前 768 tok → 加块后 1094 tok（预算 4800）⇒ 新增块不挤占任何片段。
+- 过程中被真测修正两处：证据表用**绝对重合数**会把「空结果集导出…」误判为已覆盖（只因共享「结果」二字）→ 改成**覆盖率比值**；`smoke_ui` 一条**缺前提的假红**（已跑完的运行，终止节点本就该绿）。
+- 真机校准又抓出 3 个 mock/离线覆盖不到的真 bug（见 25.5），全部已修并补了回归防线。
+
+### 25.4 `smoke_console` 偶发超时的定论
+
+- 现象：mock 运行 0.3s 就跑完，却等满 90s；连败 2 次、第 3 次全绿。
+- **定论（与 §24 一致）**：**残留 `pipeline.server` 进程抢资源**。证据：两次失败时 8787 服务**活着**（PID 15084/26872），全绿那次机器上**没有任何 python 进程**。
+- 本轮加固：失败消息带 `status/running/orphaned/presence/busy_with/resume_error`；续跑被拒（409）不再被静默吞掉。
+- 复现时先 `Get-Process python` 看有没有残留 server，别急着怀疑代码。
+
+### 25.5 真机校准（两轮：`20260926-205505` / `20260926-212611`）
+
+需求：命令行温度换算工具（新建项目、`--gateway off`、无人工闸门）。
+- **PM 强控两次拦住**：第一次只裁了 `open_questions` + `unknowns`，闸门**正确**继续拦 —— 未明确项有
+  **两列**（`PM_VAGUE_FIELDS = ('unknowns', 'clarifying_questions')`）；补齐第二条后 `merged=2` 即放行。
+  结论：闸门行为正确，是**我的裁决脚本裁漏了**；顺带证明了"裁决存在却还说没裁决"的加固有效。
+- 单阶段耗时：intake 44.8s / pm 50.2s（8B）；**architect_plan 368.5s**（14B，prompt 2657tok @9 t/s，out 1315tok @21.5 t/s）—— **14B 是长板**。
+- 进入 dev 时 `rule_findings=0`（红线在 dev 结束时才扫）。
+
+**真机校准抓到 3 个真 bug（全部已修 + 都补了回归防线）** —— 都是 mock/离线用例覆盖不到的：
+
+1. **读错层 ⇒ 静默为空**：阶段产物在 `state.json` 的 `artifacts` 层，而 `read_state()` 返回
+   **整份快照**（顶层只有 status/cursor/rounds/verify_report…）。`gateway.job_readiness` /
+   `job_evidence_md` / `issues.collect_issues` 都直接 `state.get("rule_findings")` ⇒ 永远为空
+   （日志明明打了「[红线] 阻断 0 条 / 提示 5 条」，账本、就绪度、证据表全是 0）。
+   修：新增 `runstore.artifact_view()` 统一取产物层；`collect_issues` 的 artifacts 也走它。
+   防线：smoke_rules 增加**快照形状**断言；就绪度用例改成写快照形状（原来写成"摊平"，所以没测到）。
+2. **页面白名单视图**：`run_detail` 的 `state` 是**白名单**（27 个键）—— 新键必须
+   ①摊平进 `state` ②**同时**登记进白名单，否则又是"页面一片干净"。两条都补了。
+   防线：smoke_console「详情把产物层的红线/被证伪项摊平给页面」。
+3. **`renderGatewayLink` 清空整个 `d-msg`**：先开一个「拆分为作业」的运行、再打开普通运行时，
+   它执行 `box.textContent = ""`，把**别人写的**（未接地路径 / 工程红线 / 未验证项）一起擦掉。
+   修：只维护自己的 `#d-gw-note` 子元素，不再清空共用提示区。
+   防线：smoke_ui「详情页顶部渲染出工程红线」（拿真机上带红线的运行当素材）。
+4. **`debug_residue` 在 CLI 项目上 5/5 全是误报**（真机证据：`print('摄氏 100 = 华氏 212')` 就是
+   用户可见输出）。修：把入口文件（`main/__main__/run/app/cli/index`…）加进 `exclude_paths_regex`
+   豁免，并在 negative 里写明这条豁免；**非入口模块**里的 `print` 仍算残留。
+
+> 校准运行本身因没传 `--repo`，"运行验证"整段跳过（`没有仓库路径`），所以覆盖率/负向对照那一轮
+> 没拿到数据 —— 第二轮带了 `--repo` 补上（见下）。
+
+**第二轮校准（run `20260926-212611`，`--repo D:\AI\tcs-calib`）—— 新机制端到端实测**
+
+| 机制 | 实测结果 |
+|---|---|
+| 运行验证 | `verdict=pass`，真跑 **5/5** 条命令（含 3 条断言型 `python -c "import tempconv; assert tempconv.C2F(0) == 32.00"`） |
+| **负向对照** | `checked=2, no_power=[]` ⇒ 撤掉补丁后那两条断言**确实失败**（import 不到模块）⇒ 判定有判别力 —— 这正是 Red→Green→Red 要的结果 |
+| 覆盖率 | `percent=null`（本机无 coverage / pytest-cov）⇒ 走**诚实的"未验证"路径**，未验证项里明写「不给数字也不假装达标」；门槛分支由离线断言钉住（smoke_rules 84/84） |
+| 未验证项披露 | 3 条具体事实：找不到测试文件 / 覆盖率未测量 / 性能与并发未测量 |
+| `test_audit.boundary_gap` | 14 条用例、三类齐全、`boundary_count=1` ⇒ **False**（有一条在测异常/边界）—— 没误报 |
+| `plan_audit` | `vague_acceptance=[]`、`weak_rollback=""` —— 没误报 |
+
+**第 3 个真问题（已修）**：那 3 条 `debug_residue` 全是**误报**（入口脚本 `tempconv.py` 里的
+`print` 是用户可见输出），根因是入口名是**项目自定义**的，固定名单（main/cli/index…）抓不到。
+修法：新增 `exempt_entry_paths` + `orchestrator._entry_path_candidates()` —— 从需求/方案里的
+``python xxx.py`` 命令提取入口脚本。
+**闭环证据**（用真机需求 + 真机补丁重放，非合成数据）：不带入口信息 **3 条**，带入口信息 **0 条**。
+
+**⚠ 这次误报的真实代价（值得记住的因果链）**：评审把它当成了返工理由 —— 该轮 `reasons` 第 2 条
+就是「tempconv.py 中存在疑似调试残留的 print（行 11、16、18）」，`verdict=rework_dev`
+（`mechanical_blockers=0`、`forced=False`，是评审**自主**判的），于是白烧一整轮
+dev+test+verify+review。结论：**提示级规则的误报，代价同样是整轮返工** ——
+"误报率"不是锦上添花，是关键指标。
+
+**另记**：该轮 `reasons` 第 1 条「测试用例 expected 过于笼统（如 REG-01=True）」来自
+`test_audit.vague_expected`，第 2 条来自新加的**红线证据块** —— 说明机械证据确实进了评审的判断链
+（不再是"凭感觉凑条目"）。
+
+**⚠ 改动生效范围**：规则库/提示词/代码的改动**对已在跑的运行不生效**（子进程已加载旧代码），
+改了 `rules.json` 后要**新起**的运行才用得上；页面 `/api/rules` 每次 force reload，所以页面能看到新规则。
+
+### 25.6 如何继续
+
+- 看真机运行：`Invoke-RestMethod -Uri http://127.0.0.1:8787/api/runs/20260926-205505`；
+  红线与未验证项在 `runs/<id>/state.json` 的 `rule_findings` / `verify_report.unverified`。
+- 规则库清单：`http://127.0.0.1:8787/api/rules`（或页面「配置」页）。
+- 加/改规则：只改 `pipeline/rules.json`（数据文件），存盘即生效（下个进程）；**必须写 evidence + negative**。
+- 回归：`python tools/smoke_rules.py` → `smoke_mock.py` → `smoke_console.py` → `node tools/smoke_ui.mjs`
+  （UI 需先起服务；跑之前确认没有残留 server）。
+- `CONTEXT.md` 只做增量追加，勿整份覆盖。
+
+### 25.7 本轮主动收窄与待校准
+
+1. **plan schema 没动**：没给 `tasks[]` 加 `exit/security/checkpoint`、没加 ADR/`revisit_when`；
+   改为审计侧用已有字段（`vague_acceptance` + `weak_rollback`）。理由：改契约会连带动提示词、mock
+   与所有审计断言，风险大于收益。
+2. **覆盖完整性枚举（对称操作 / 调用方全 grep）没做**：高度依赖项目约定，通用规则必然误报；
+   `audit_impact` 保持"只给事实、不判负"。
+3. **`applies_when` 仍是单条补丁视角**，没有项目级视图（判不了"整仓库依赖没锁"这种跨文件条件）。
+4. **待真机校准（本轮只拿到部分数据）**：`_refute_stale_blockers` 的关键词表与"全绿"门槛；
+   8 条 blocker 规则的 severity；**覆盖率门槛与负向对照**（这一轮因未传 `--repo` 整段跳过了，
+   要量得再跑一轮并传 `--repo <生成目录>`）。`debug_residue` 的 CLI 误报见 25.5-④，已处理。
+5. `env_file_committed` 在"仓库根 = 生成目录"的常规用法下几乎不可能命中（写了但基本不触发）。
+
+### 25.8 继续真机校准（第三批）
+
+起因：25.7-④ 里「`_refute_stale_blockers` 关键词表与 blocker severity 待校准」缺样本。
+做法：① 续跑 `20260926-212611`（新进程 ⇒ 加载修好的代码）；② 用**历史运行回放**校准证伪表；
+③ 另起 run `20260926-214757`（命令行记账工具 + SQLite，专门冲 B 层规则
+`sql_string_concat` / `select_star`）。
+
+**又抓到两个真问题（都已修 + 都补了防线）**
+
+1. **证伪网只盖了一半通道**。契约改版后评审的返工项主要落在 `required_fixes_detail`
+   （→ `in_material`），而 `_refute_stale_blockers` 只过滤了 `blockers`。
+   回放 `20260926-212611` 时发现：那一轮 `blockers` 为空、返工项**全在 `in_material`**
+   ⇒ 陈旧返工项照样被原样喂回下一轮。修：**两条通道都过证伪网**。
+2. **红线跨轮累积**（我自己引入的 bug，被真机抓到）：第 2 轮的补丁里**已经没有 `print(`**
+   了，`rule_findings` 却还挂着第 1 轮的 3 条（旧行号、旧原文）⇒ 下一轮评审继续拿它当返工
+   理由 —— 正是我们花大力气要断的"陈旧锚点"自指循环，只不过这次是**机制自己喂进去的**。
+   修：dev 阶段每轮 `reset=True` 重算；verify 阶段只在同轮 editsfinding 上补 treefinding
+   （按 `scan` 标签同类覆盖、异类保留）。
+   防线：smoke_rules「红线不跨轮累积（第 1 轮 1 条 → 第 2 轮 0 条）」。
+
+**证伪表的关键词校准（用历史回放，不靠猜）**
+
+回放 `20260925-184300` 的 2 条真实阻断项，发现**漏词**：
+「模块 game_logic 缺少核心符号 Snake，导致依赖文件**无法正常运行**」—— 精确子串 `无法运行`
+匹配不到它（中间多了「正常」二字）。
+修：把子串表换成**模式表**（`无法[\w]{0,6}运行`、`导入[\w]{0,4}失败`、
+`缺[\w]{0,6}(少|失)[\w]{0,10}(模块|文件|符号|…)`、`import\s*error|module\s*not\s*found` 等），
+并保留「设计 / 兼容性类不参与剔除」。smoke_rules 用 5 条真实/近似说法钉住（3 剔 2 留）。
+
+诚实边界：**新跑很难采样到这一支** —— 上游修复（机械证据优先 + 证伪门禁）正是要减少这种矛盾，
+所以它更像"安全网"；验证靠历史回放 + 离线断言，别指望它天天触发。
+
+**⚠ 历史铁证已被删**：§23 引以为据的 run `20260924-185507`（以及整个 `20260924*` 批次）
+在 `runs/` 里**已经不存在**了 ⇒ 回放只能靠 CONTEXT.md 里的文字记述。
+这也是"把铁证写进 CONTEXT.md"本身很重要的原因：运行目录会被清理。
+
+**第 4 个真问题（旧代码，已修）**：`patches.STATUS_CN["unchecked"]` 写死成
+「未核对（没提供仓库）」，但这个状态被**两种成因**共用：① 真没传 `--repo`；
+② **目标文件不在仓库里**（`analyze_all` 里 `source is None and repo` 走的就是它）。
+真机 `20260926-214757` 传了 `--repo`，verify 却报「有 2 条补丁未能套用：未核对（**没提供仓库**）」
+—— 把人引去查 `--repo`，而真实原因是新建项目的 `cli.py`/`main.py` 在空仓库里当然不存在。
+
+修：① 文案改成「未核对（原因见备注）」；② 两种成因**分开写备注**
+（「目标文件不存在（modify 要求文件已在仓库里；新建文件要用 add）—— 仓库路径本身没问题」/
+「没有提供仓库路径，无法核对（新建项目请把生成目录作为 --repo 传入）」）；
+③ `problem_detail` 与 `apply_all` 的 skipped reason **都带上备注**（只给三个字，人就只能猜）。
+防线：smoke_rules 三条断言（文案不再断言"没提供仓库" + 两种成因各自的备注 + 明细带上原因）。
+
+**这几轮的其它校准观察**
+
+- **B 层规则第一次真机命中、且判对**：`select_star` 命中 `ledger.py:20`
+  `self.cursor.execute('SELECT * FROM records ORDER BY id')` —— 真问题（表结构一变就悄悄多取列）；
+  而同一文件里的参数化/字面量 SQL **没有**被误报成 `sql_string_concat` ✓（这条最怕误报）。
+- **机制兜底生效**：该轮 verify `fail`（2 条补丁 unchecked + 2 条命令失败）⇒
+  `mechanical_blockers=4`，评审即便想判 pass 也会被改判 `rework_dev`（`rounds[1].mech=4`）。
+- **红线跨轮累积的修复在机验证**：attempt 2 的 dev 结束后扫描结果仍是 1 条 `select_star`，
+  且**原文/行号与当前代码一致**（模型确实保留了那行）—— 说明 `reset` 生效、不再挂陈旧条目。
+- **负向对照这一轮 skipped**：`skipped="本轮没有通过的断言型命令"`。测试阶段给的三条命令是
+  `py_compile`、import 自检、`import ledger; ledger.LedgerDB().insert(...)`（**执行型**，不是断言型）。
+  这是**诚实行为**（不假装验过），但也暴露口径局限：只写"调用一下"的命令时负向对照不会触发。
+  要不要把「含 `import X; X.method(...)` 的直接调用」也算断言型，得再想 —— 判据一宽就容易误判。
+
+**最终结局（可作为"机制兜底"的完整样本）**：4 轮全部被机制判负（`mech` 分别 4/5/5，
+verify 始终是 `fail`：`cli.py` 那条命令一直失败 + 2 条补丁 unchecked），第 4 轮后
+`needs_human=True`、`verdict=needs_human` —— **安全阀生效**，既没有无限循环，也没有假装通过。
+
+- `rule_findings` 最终为 2 条 `select_star`（`ledger.py:13`、`ledger.py:20`），**都是当前代码的真命中**，
+  没有陈旧条目 ⇒ 跨轮 `reset` 的修复在机上确认有效。
+- `refuted_blockers` 始终为空 —— 正如预期：**机械证据每一轮都不干净**，证伪分支不该触发；
+  它只能靠历史回放 + 离线断言来验证（见上）。
+- 观察到一个待查的小异常：`rounds[]` 里只有 attempt 1/2/4，**attempt 3 没有落 round 条目**。
+  可能是那次评审调用重试/契约失败导致没写 round —— 若属实，账本会丢一轮记录，值得回头确认。
+
+## §26 「首次开发」与「返工修缺陷」未分家 —— 全仓排查记录（2026-09-26 晚）
+
+### 26.1 起因
+
+真机 `20260926-214757`（命令行记账工具 + SQLite，新建项目）**四轮零进展**后触顶 `needs_human`：
+4 轮 `mech` 分别 4/5/5，`verify` 恒 `fail`，沙箱 `materialized=['ledger.py']` ——
+`cli.py` / `main.py` 从头到尾没被写出来，所以 `import cli` 必然退出码 1。
+
+### 26.2 根因（三层，实测证据）
+
+| 层 | 结论 | 证据 |
+|---|---|---|
+| L0 直接 | dev 违反「全新项目 = `add` + `full_symbol` 整份内容」契约，输出 `modify` + 片段 | `implementation.edits`：`cli.py` modify/1307 字符、`main.py` modify/157+1339；唯一落盘的是 `ledger.py` add/full_symbol |
+| L1 死循环机制 | 判负反馈只报现象、不报文件名、不回指契约，dev 无从得知该改"提交形态" | `verify.py:191-196` 只 join `reason`、丢 `path`；`unchecked` 不在阻断名单 `orchestrator.py:2202-2214` |
+| L2 根本 | 原文固定取自 `self.repo`，而全仓只有交付时才 `in_place=True`（`orchestrator.py:3651`），中间轮次都写沙箱 ⇒ 新建项目整个返工循环里"原文恒不存在" | `orchestrator.py:2182` `patches.analyze_all(self.repo, ...)` |
+
+dev 的 `summary` 写的是「所有任务均已完成，未发现未实现项」——它真诚地以为完成了。
+
+### 26.3 全仓排查：**「本轮性质」从未被显式建模**
+
+```2149:2161:pipeline/prompts.py
+def system_prompt(stage: str, project_type: str = "secondary") -> str:
+    ...
+    if project_type == "new":
+        return SYSTEM_NEW.get(stage) or SYSTEM[stage]
+    return SYSTEM[stage]
+```
+
+契约只有 **stage × project_type** 两维，**没有「首轮 / 返工」这一维**。全仓不存在
+`is_rework` / `round_kind` / `first_pass`；唯一代理量是 `bool(self.fixes)`。
+`rework_task_block` 只被 `prompts.py:1325`(plan) 与 `:1415`(dev) 调用 ——
+**test 与 review 完全用首轮契约跑返工**。
+
+#### 分阶段清单
+
+| 阶段 | 冲突的两句话 | 位置 |
+|---|---|---|
+| **dev**（高） | 「全新项目一律用 `add`」「`patch_mode` 必须用 `full_symbol`」 ↔ 「**优先定点改**：`change_type` 用 `modify`，`patch_mode` 用 `replace_span`」 ↔ 「【当前项目已有代码…请在此**基础上修改**」 | `prompts.py:2014/2016/2017` ↔ `:1399-1401` ↔ `:346-350` |
+| dev 判定依据错 | `has_code` 只看**检索池**（新建项目恒空），与同 prompt 里的 `_current_code_block`（真实文件）结论相反 | `prompts.py:1488` |
+| **test**（高） | 「评审要求**补**测项」（增量）↔「【任务】产出新功能/回归/兼容**三类**测试用例」（全量）；且**没有 `prev_test` 参数**，上一版用例集进不来 | `prompts.py:1588` ↔ `:1589`；`:1573-1580` 签名 |
+| test 机械侧加码 | 按**当前实现全部符号**重算 `missing_symbols` → 升阻断；「最小范围改一处」必然触发漏测 | `orchestrator.py:1549-1589`、`:1643-1649`、`prompts.py:1091-1097` |
+| **architect_plan**（高） | 「必须基于下面给出的**当前产物 / 上一版输出**修改」↔ 提示词里**根本没有"上一版方案"这一段**（`prev_plan` 只被 `_verify_view` 当入参消耗） | `prompts.py:1237` ↔ `:1331-1359`、`:1351` |
+| plan 二次伤害 | task id 被重编号 ⇒ 跨轮累积的 `covers_tasks` 全部变成"编造" | `prompts.py:899-900`、`orchestrator.py:1942-1961` |
+| **review**（中高） | 五条标准每轮全量重跑 ↔ 没有一句"上一轮已通过的部分本轮不得重开"；只有证伪口径 | `prompts.py:1907`、`:2080-2084` |
+| review 实证 | 注释自证：`required_fixes` 走势 `3→2→0→2→4→4→5→4`，第 3 轮 pass 后又反弹到 attempt=11 | `orchestrator.py:2949-2951` |
+| intake/PM | **不适用**：`LOOP_EDGES` 只有 `review→dev`、`review→architect_plan`、`human_review→dev` | `flow.py` |
+
+#### 机制侧同类问题（"契约假设" vs "实际状态"不匹配）
+
+| # | 位置 | 问题 |
+|---|---|---|
+| 1 | `orchestrator.py:2182` | 原文恒取 `self.repo`，返工期间恒空 |
+| 2 | `orchestrator.py:2202-2214` | 阻断名单不含 `unchecked` ⇒ "文件没落盘"拿不到强制判负信号 |
+| 3 | `verify.py:191-196` | 只 join `reason`、丢 `path`（数据里有） |
+| 4 | `verify.py:307` | 文件没落盘 ⇒ 语法/导入检查命令**根本不生成** ⇒ 报 `can't open file` / `ModuleNotFoundError`，被读成"代码有 bug" |
+| 5 | `rules.py:182-209` | `_applies(rule, path, suffix, text)` **无 `change_type` 维度** ⇒ 返工整份重吐同一文件时旧 finding 每轮复活 |
+| 6 | `schemas.py:239` | `covers_tasks` **minItems:1** ⇒ 返工只改一处也必填 task id ⇒ 逼模型编造 |
+| 7 | `orchestrator.py:1099` | `deviations` 跨轮无去重累积 ⇔ 与 `falsify_block`"已被证伪必须停止引用"直接打架 |
+| 8 | `orchestrator.py:3365-3375` | `_rewind` 到 dev 时 `implementation` 被 pop 但 `fixes` **不清** ⇒ "基于上一版修改"而上一版已删 |
+| 9 | `schemas.py:400` | review schema 无字段能表达"不再重开" |
+
+（安全项：`vanished_symbols` 首轮恒空 `orchestrator.py:813-815`，不误判；但它依赖"实现跨轮累积"，
+而 `modify` 路径不做符号并集，返工轮会开始咬人。）
+
+**更正**：此前判断「`source is None` 时 notes 为空、反馈指向不存在的备注」是**错的** ——
+那是 `analyze_edit` 内部早退分支；`analyze_all` 层面已补可操作备注：
+`patches.py:514-518`「目标文件不存在（modify 要求文件已在仓库里；新建文件要用 add）—— 仓库路径本身没问题」。
+缺的仍是 `path` 与阻断资格。
+
+### 26.4 用户提出的 feature / bugfix 双任务类型方案 —— 适配分析
+
+**结论：方向正确，但需校准一处。**
+
+- 用户方案里的 `bugfix` = **外部缺陷单**驱动（有 `bug_report` / 复现步骤 / 失败测试 / base_commit）。
+- 我们今天的死循环 = **流水线内部下游驳回**（review/verify 判负 → 回退 dev/plan），输入是
+  `blockers` / `required_fixes` 文本列表，**不是结构化缺陷单**。
+- 但两者的**性质同构**：都是「从有问题 → 符合预期」，都要求最小改动、不扩范围、验收=判负项转绿。
+  ⇒ **同一条 `task_type` 维度可以同时覆盖两者**，只需把 bug_report 的字段映射到我们已有的机械证据上。
+
+**映射表（我们的产物天然就是缺陷单，只是从没以缺陷单的形态喂给 dev）**
+
+| Task schema 字段 | 我们的来源 |
+|---|---|
+| `repro_steps` | `verify_report.commands[].command`（失败的那几条） |
+| `expected` / `actual` | 退出码 0 vs 实际退出码 + `problems[]` |
+| `failing_tests` | verify 失败命令 + `test_report` 的 `missing_symbols` |
+| `logs` | verify 命令输出 / `console.log` |
+| `environment` | `env.json`、沙箱路径 `verify_report.sandbox` |
+| `base_commit` | **无 git**（新建项目）⇒ 用「上一轮沙箱产物 + 上一版 `implementation`」 |
+| `constraints` | 最小改动 / 不新增依赖 / 禁重构 / 禁删测试绕过 |
+| `acceptance` | 指定失败项转绿 + 无回归（`out_of_scope_edits` 已能做越界检查） |
+
+**不建议照搬的三点**
+
+1. **不要开两条 pipeline**（FeaturePipeline / BugfixPipeline）：我们的 intake/PM/plan/test/verify/review
+   是共享的，复制一条会双倍维护且两套提示词必然漂移。改成**单流水线 + 按 `task_type` 切换契约分支**。
+2. **不要"每个 BUG 独立上下文"**：我们的返工轮靠 `_merge_impl_across_rounds` **跨轮累积**，
+   拆成每 BUG 独立上下文会破坏累积。正确做法是**裁剪视图**（只注入失败证据 + 相关文件），仍单轮产出一份 edits。
+3. **不要新增 Reproducer / Locator 阶段**：每个阶段都是一次 LLM 调用（dev 一轮 40~100s），
+   本地 7B/14B 上下文 24K，拆多了时间爆炸。先做 **单 Coder 双模式 + 复用现有 verify 当 Verifier**，
+   定位效果差再拆。
+
+### 26.4b 操作备忘：PM 强控闸门要**两类**裁决都录完
+
+页面上的待裁决项不止一种录入形态：既有「采用建议答案」类的条目，也有**文本框手填**的条目。
+只提交前者，闸门仍会判「未裁决」并继续暂停 —— 这不是 bug，是裁决没做全。
+
+（本次教训：用接口提交了 7 条 open_questions/unknowns 的裁决，`merged=7` 且产物里
+`unknowns` 已清空，**但闸门仍暂停**；我一度误判为"两处口径不一致的 bug"，实际是
+文本框类条目还没录入。人工在页面补录并保存后即放行。以后遇到闸门不放行，
+**先确认页面上是否还有未录入的条目**，再去怀疑代码。）
+
+### 26.5 拟落地方案（待实施）
+
+- 新增第三维：`round_kind ∈ {feature, bugfix}`，显式进 state，随 `--from` / `_rewind` / 作业重跑维护，
+  并进 `system_prompt(stage, project_type, round_kind)`。
+- `prompts`：加 `SYSTEM_NEW_BUGFIX["dev"]`（最小改动 / 禁重构 / 禁全文件重写 / 禁删测试 / 禁扩范围 / 先确认失败证据）。
+- `tasktype.py`：`bug_report_from_state(state)` 把 verify/test/review 的机械证据规范化成缺陷单 + `format_bug_report()`。
+- 编排层：返工轮（`self.fixes` 非空）⇒ `round_kind=bugfix`，dev 收到【缺陷单】而非裸 fixes 列表。
+- 判定"文件是否存在"的依据改成【当前项目已有代码】（`current_code`），修掉 `prompts.py:1488` 只认检索池的问题。
+- 后续批次：test / plan / review 各自的 bugfix 口径；`rules` 加 `change_type` 维度；`covers_tasks` 返工允许空。

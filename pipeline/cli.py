@@ -96,10 +96,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--project-type",
         choices=["secondary", "new"],
-        default="secondary",
+        # 默认 None（＝没传）而不是 "secondary"：`--resume-job` 这条链上「没传」必须能与
+        # 「传了 secondary」区分开，否则 argparse 的默认值会静默覆盖作业落盘的配置，
+        # 把新建项目的模块用二次开发提示词重跑（真机 job-20260926-154657 即此）。
+        default=None,
         help=(
             "secondary＝基于存量仓库的二次开发（默认）；"
-            "new＝从零生成的全新项目：换用专用系统提示词，并跳过存量代码评估阶段"
+            "new＝从零生成的全新项目：换用专用系统提示词，并跳过存量代码评估阶段。"
+            "续跑作业时不传＝沿用该作业记录的配置"
         ),
     )
     parser.add_argument("--run-id", help="指定运行目录名（默认按时间戳生成；操作页面用它绑定日志）")
@@ -115,8 +119,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--review-every",
         type=int,
-        default=REVIEW_EVERY,
-        help=f"每 N 轮评审一次（1=每轮都评审）；首轮与末轮必评审，默认 {REVIEW_EVERY}",
+        # 同 --project-type：默认 None（＝没传）。传了才覆盖，没传就沿用
+        # 该 run / 作业落盘的值（否则续跑会把作业的评审频率静默改回代码默认）
+        default=None,
+        help=f"每 N 轮评审一次（1=每轮都评审）；首轮与末轮必评审，新运行默认 {REVIEW_EVERY}",
     )
     parser.add_argument(
         "--only",
@@ -337,9 +343,10 @@ def main(argv: list[str] | None = None) -> int:
         runs_dir=args.out,
         max_rework=MAX_REWORK_ROUNDS if args.max_rework is None else args.max_rework,
         unload_at_end=not args.keep_warm,
-        review_every=args.review_every,
+        # 没传就用代码默认（Orchestrator 不接受 None）；续跑时 `_restore` 还会按 state 校正
+        review_every=REVIEW_EVERY if args.review_every is None else args.review_every,
         pause_after=pause_after or [],
-        project_type=args.project_type,
+        project_type=args.project_type or "secondary",
     )
 
     try:
@@ -349,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
                 runs_dir=args.out,
                 client=client,
                 logger=print,
-                pause_after=pause_after or [],
+                # 不写 `or []`：None＝没传（沿用作业落盘值），[]＝--no-pause（显式清空闸门）
+                pause_after=pause_after,
                 review_every=args.review_every,
                 max_rework=args.max_rework,
                 project_type=args.project_type,
@@ -393,6 +401,14 @@ def main(argv: list[str] | None = None) -> int:
                     scale_override=args.scale,
                     client=client,
                     forbidden=_parse_list(args.forbidden),
+                    # 运行参数一并交给 dispatch 落进 job.json：作业续跑只带 job_id，
+                    # 没落盘就只能退回代码默认值（真机 job-20260926-154657 的教训）
+                    project_type=args.project_type,
+                    review_every=args.review_every,
+                    max_rework=args.max_rework,
+                    pause_after=pause_after,
+                    # GA 产物留痕到发起运行的目录：降级 small 时也要能看到模型拆成了什么样
+                    run_dir=(Path(args.out) / args.run_id) if args.run_id else None,
                 )
                 print(f"== 规模路由：{route.describe()}")
                 for item in route.reasons:
@@ -416,7 +432,8 @@ def main(argv: list[str] | None = None) -> int:
                         runs_dir=args.out,
                         client=client,
                         repo=args.repo,
-                        pause_after=pause_after or [],
+                        # 同上：None 与 [] 语义不同，别用 `or []` 抹平
+                        pause_after=pause_after,
                         review_every=args.review_every,
                         max_rework=args.max_rework,
                         project_type=args.project_type,

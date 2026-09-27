@@ -1,0 +1,319 @@
+{
+  "version": 1,
+  "notes": [
+    "机械可判定的工程红线。放在数据文件里而不是散在 Python 中：同一条规则要同时服务三个地方 ——",
+    "① 补丁落盘前的拦截（orchestrator._rule_findings）；② 运行验证的静态检查；③ 评审提示词里的机械证据。",
+    "每条规则都必须能回答两个问题，缺一不可：evidence（凭什么判它负）与 negative（什么反例能推翻它）。",
+    "severity=blocker 的规则必须满足：判负即「机器已证明」且**开发改得动**。任何会误伤合法写法的规则只能 warn ——",
+    "把 warn 误升成 blocker 的代价是一整轮无谓返工（本项目反复踩过，见 orchestrator 里多处「误判成阻断」注释）。",
+    "applies_when 是**触发条件**：本项目是技术栈无关的（tkinter 贪吃蛇与 FastAPI 服务都跑同一条流水线），",
+    "Web/数据库专用规则必须由条件触发，否则会在不相干的项目里全红。"
+  ],
+  "rules": [
+    {
+      "id": "secret_in_code",
+      "title": "硬编码密钥 / 口令 / 令牌",
+      "layer": "A",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {},
+      "patterns": [
+        "(?i)(api[_-]?key|apikey|secret|password|passwd|token|credential|access[_-]?key)\\s*[:=]\\s*[\"'][^\"'\\s]{8,}[\"']",
+        "(?i)(sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})"
+      ],
+      "exclude": [
+        "(?i)(os\\.environ|os\\.getenv|getenv\\(|process\\.env|System\\.getenv|\\$\\{|\\{\\s*os\\.)",
+        "(?i)[\"'][^\"']*(your|placeholder|changeme|change_me|example|sample|dummy|fake|test|redacted|xxx|todo|fixme|<[a-z_]+>)[^\"']*[\"']"
+      ],
+      "message": "代码里出现了看起来是真实值的密钥/口令/令牌。",
+      "evidence": "命中行原文 + 它来自哪条补丁（path:line）。",
+      "negative": "若该值来自环境变量/密钥管理服务，或只是占位符（<YOUR_KEY>/changeme/example），即为反例 —— 需在 deviations 里说明取值来源。",
+      "source": "fullstack-dev §2 / environment-management.md；dev-expert hooks/secret_scan.py"
+    },
+    {
+      "id": "log_sensitive",
+      "title": "日志/打印里带敏感字段",
+      "layer": "A",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {},
+      "patterns": [
+        "(?i)(log(ger)?|logging|console|print|fmt\\.Print|System\\.out)[\\w.]*\\s*\\([^)]*(\\{\\}|\\{\\w+\\}|%s|%\\()[^)]*\\b(password|passwd|token|secret|credential|api[_-]?key)\\b",
+        "(?i)(log(ger)?|logging|console|print)[\\w.]*\\s*\\([^)\"']*\\b(password|passwd|token|secret|credential|api[_-]?key)\\b",
+        "(?i)(log(ger)?|logging|console|print)[\\w.]*\\s*\\([^)]*,\\s*(password|passwd|token|secret|credential|api[_-]?key)\\s*[),]"
+      ],
+      "exclude": [
+        "(?i)(mask|redact|\\*\\*\\*|placeholder|has_?password|verify_password|password_hash)"
+      ],
+      "message": "日志/输出语句里直接打印了口令或令牌。",
+      "evidence": "命中行原文。",
+      "negative": "若打印的是「是否已设置」这类布尔/脱敏结果（如 bool(token) 或 token 的前缀掩码），即为反例。",
+      "source": "fullstack-dev §7 Logging & Observability"
+    },
+    {
+      "id": "debug_residue",
+      "title": "调试残留（临时打印/断点）",
+      "layer": "A",
+      "severity": "warn",
+      "kind": "regex",
+      "applies_when": {},
+      "exempt_entry_paths": true,
+      "exclude_paths_regex": "(?i)(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]*\\.py$|_test\\.(go|py)$|\\.test\\.[jt]sx?$|(^|/)(main|__main__|run|app|cli|manage|wsgi|asgi)\\.(py|js|ts|mjs|cjs)$|(^|/)index\\.(js|ts|mjs|cjs)$",
+      "patterns": [
+        "(?m)^\\s*print\\(",
+        "(?i)\\bconsole\\.(log|debug)\\(",
+        "(?i)\\bvar_dump\\s*\\(|\\bprint_r\\s*\\(",
+        "(?i)\\bdebugger\\s*;"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|//)"
+      ],
+      "message": "疑似调试残留语句（正式交付里应移除或改成结构化日志）。",
+      "evidence": "命中行原文。",
+      "negative": "若该输出就是程序的**用户可见输出**（CLI 工具的正常 stdout），即为反例 —— 入口脚本已按此豁免：常见入口名见 exclude_paths_regex，**项目自定义的入口名**（如 `tempconv.py`）由 `exempt_entry_paths` 从需求/方案里提取后豁免。",
+      "source": "dev-expert hooks/debug_residue.py；fullstack-dev Anti-Patterns #3"
+    },
+    {
+      "id": "generic_error",
+      "title": "泛型异常（无类型的错误）",
+      "layer": "A",
+      "severity": "warn",
+      "kind": "regex",
+      "applies_when": {},
+      "patterns": [
+        "(?m)^\\s*raise\\s+(Exception|RuntimeError)\\(",
+        "(?m)^\\s*throw\\s+new\\s+Error\\("
+      ],
+      "exclude": [],
+      "message": "抛了泛型异常，调用方无法按类型分流处理。",
+      "evidence": "命中行原文。",
+      "negative": "若是测试代码里的断言式抛错、或本文件已定义专门异常类型而此处是它的兜底，即为反例。",
+      "source": "fullstack-dev §3 Error Handling / Anti-Patterns #4"
+    },
+    {
+      "id": "hardcoded_localhost",
+      "title": "硬编码本机地址",
+      "layer": "A",
+      "severity": "warn",
+      "kind": "regex",
+      "applies_when": {},
+      "exclude_paths_regex": "(?i)(test|spec|example|sample|readme|\\.md$|\\.env|docker-compose|\\.ya?ml$)",
+      "patterns": [
+        "(?i)https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?"
+      ],
+      "exclude": [],
+      "message": "把本机地址写死在代码里（应走配置）。",
+      "evidence": "命中行原文。",
+      "negative": "若是配置文件/示例/文档里的默认值，或该地址本身就是被测对象，即为反例。",
+      "source": "fullstack-dev environment-management.md / Anti-Patterns #11"
+    },
+    {
+      "id": "floating_dependency",
+      "title": "浮动依赖版本（latest / *）",
+      "layer": "A",
+      "severity": "blocker",
+      "kind": "manifest",
+      "applies_when": {
+        "paths_regex": "(?i)(^|/)(requirements[^/]*\\.txt|pyproject\\.toml|package\\.json|Cargo\\.toml|go\\.mod|Gemfile|composer\\.json)$"
+      },
+      "patterns": [
+        "(?m)^\\s*[A-Za-z0-9_.\\-]+\\s*[=><!~]*\\s*(latest|\\*)\\s*$",
+        "\"[A-Za-z0-9_.\\-@/]+\"\\s*:\\s*\"(latest|\\*)\""
+      ],
+      "exclude": [],
+      "message": "依赖版本浮动：同一个锁文件在不同时间装出不同版本，问题无法复现。",
+      "evidence": "依赖清单里的命中行。",
+      "negative": "若该依赖本就要求浮动且已在文档里说明理由（如插件生态的 peer 依赖），即为反例。",
+      "source": "karpathy-coding-guidelines.md 依赖管理；release-checklist Gate 3"
+    },
+    {
+      "id": "loose_dependency",
+      "title": "只有下界的依赖约束",
+      "layer": "A",
+      "severity": "warn",
+      "kind": "manifest",
+      "applies_when": {
+        "paths_regex": "(?i)(^|/)(requirements[^/]*\\.txt|pyproject\\.toml)$"
+      },
+      "patterns": [
+        "(?m)^\\s*[A-Za-z0-9_.\\-]+\\s*>=\\s*[0-9]"
+      ],
+      "exclude": [
+        "(?m)<[0-9]",
+        "(?i)lock"
+      ],
+      "message": "只写了下界约束（>=），上游发新版即可能装出不兼容的组合。",
+      "evidence": "依赖清单里的命中行。",
+      "negative": "若同文件/锁文件已给出上界或哈希锁定，即为反例。",
+      "source": "release-checklist Gate 3（锁文件必须入库）"
+    },
+    {
+      "id": "non_utf8_content",
+      "title": "文本文件不是合法 UTF-8",
+      "layer": "A",
+      "severity": "blocker",
+      "kind": "encoding",
+      "applies_when": {},
+      "patterns": [],
+      "exclude": [],
+      "message": "文件不是合法 UTF-8（多为 GBK 混入），跨平台读取会直接抛错。",
+      "evidence": "文件路径 + 首个非法字节偏移。",
+      "negative": "若该文件被声明为二进制资源（图片/字体/压缩包），即为反例 —— 规则只扫文本类后缀。",
+      "source": "dev-expert hooks/utf8_check.py"
+    },
+    {
+      "id": "env_file_committed",
+      "title": ".env 未进忽略清单",
+      "layer": "A",
+      "severity": "warn",
+      "kind": "env_unignored",
+      "applies_when": {},
+      "patterns": [],
+      "exclude": [],
+      "message": "仓库里有 .env，但 .gitignore 没忽略它 —— 真实配置会被提交。",
+      "evidence": ".env 的路径 + .gitignore 是否含该规则。",
+      "negative": "若该 .env 只有占位值（已提供 .env.example 的等价物）且团队刻意入库，即为反例。",
+      "source": "fullstack-dev §2 Rules / environment-management.md"
+    },
+    {
+      "id": "token_in_storage",
+      "title": "令牌存进 Web Storage",
+      "layer": "B",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {
+        "suffixes": [".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".html"]
+      },
+      "patterns": [
+        "(?i)(local|session)Storage\\s*\\.\\s*setItem\\(\\s*[\"'][^\"']*(token|jwt|auth|session)[^\"']*[\"']"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|//)"
+      ],
+      "message": "把令牌写进 localStorage/sessionStorage：任何 XSS 都能直接读走它。",
+      "evidence": "命中行原文。",
+      "negative": "若存的是非敏感标识（主题偏好、非鉴权用的 UI 状态），即为反例。",
+      "source": "fullstack-dev §6 Auth / auth-flow.md Iron Rules"
+    },
+    {
+      "id": "cors_wildcard",
+      "title": "CORS 允许任意来源",
+      "layer": "B",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {
+        "content_regex": "(?i)cors|allow_origins|access-control-allow-origin"
+      },
+      "patterns": [
+        "(?i)(allow_origins|allowed_origins|origins|origin)\\s*[:=]\\s*\\[?\\s*[\"']\\*[\"']",
+        "(?i)access-control-allow-origin[\"'\\s:,]+\\*"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|//)"
+      ],
+      "message": "CORS 放开为 *：带凭证时浏览器会拒绝，且等于放开任何站点调用。",
+      "evidence": "命中行原文。",
+      "negative": "若是公开只读 API 且明确不带凭证（allow_credentials=False），可在 deviations 里声明后视为反例。",
+      "source": "fullstack-dev §13 Production Hardening"
+    },
+    {
+      "id": "destructive_migration",
+      "title": "单步破坏性迁移（丢数据）",
+      "layer": "B",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {
+        "paths_regex": "(?i)(^|/)(migrations?|alembic/versions|versions)/|\\.sql$|schema\\.prisma$"
+      },
+      "patterns": [
+        "(?i)\\b(drop\\s+table|drop\\s+column|rename\\s+column|rename\\s+to|drop_table|drop_column|rename_column|remove_column)\\b"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|--)"
+      ],
+      "message": "迁移里单步删除/改名：一次部署内无法回滚，存量数据直接丢。",
+      "evidence": "迁移文件里的命中行。",
+      "negative": "若该列/表在同一次迁移里被新建、或项目尚无任何真实数据（greenfield 首版建表），即为反例 —— 需在 deviations 里说明。",
+      "source": "fullstack-dev db-schema.md §4 Zero-Downtime Migrations"
+    },
+    {
+      "id": "migration_irreversible",
+      "title": "迁移没有回滚路径",
+      "layer": "B",
+      "severity": "warn",
+      "kind": "require",
+      "applies_when": {
+        "paths_regex": "(?i)(^|/)(migrations?|alembic/versions|versions)/|\\.sql$"
+      },
+      "require_patterns": [
+        "(?i)(downgrade\\s*\\(|def\\s+down\\b|--\\s*down|\\.down\\.|down\\s*:|rollback|reversible)"
+      ],
+      "patterns": [],
+      "exclude": [],
+      "message": "迁移文件里找不到任何回滚路径（down/downgrade/rollback）。",
+      "evidence": "整个迁移文件内未命中回滚关键字。",
+      "negative": "若该迁移是纯新建表且删除该表即为回滚（无状态要恢复），即为反例。",
+      "source": "fullstack-dev db-schema.md Migration Safety Checklist"
+    },
+    {
+      "id": "blocking_create_index",
+      "title": "建索引未用 CONCURRENTLY",
+      "layer": "B",
+      "severity": "warn",
+      "kind": "regex",
+      "applies_when": {
+        "paths_regex": "(?i)(^|/)(migrations?|alembic/versions|versions)/|\\.sql$"
+      },
+      "patterns": [
+        "(?i)create\\s+(unique\\s+)?index\\s+(?!concurrently)"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|--)"
+      ],
+      "message": "建索引没加 CONCURRENTLY：会锁表，存量数据量大时写入全停。",
+      "evidence": "迁移文件里的命中行。",
+      "negative": "若是小表初始化脚本或本地开发用 schema（明确无生产数据），即为反例。",
+      "source": "fullstack-dev db-schema.md §4"
+    },
+    {
+      "id": "sql_string_concat",
+      "title": "SQL 用字符串拼接/插值",
+      "layer": "B",
+      "severity": "blocker",
+      "kind": "regex",
+      "applies_when": {
+        "content_regex": "(?i)(execute|executemany|cursor\\s*\\.|query|raw)\\s*\\("
+      },
+      "patterns": [
+        "(?i)(execute|executemany|query|raw|executeQuery|queryAsync)\\s*\\(\\s*f[\"']",
+        "(?i)(execute|executemany|query|raw)\\s*\\(\\s*[\"'][^\"']*\\b(select|insert|update|delete)\\b[^\"']*[\"']\\s*(\\+|%|\\.format)",
+        "(?i)(execute|query)\\s*\\(\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\+\\s*[\"']"
+      ],
+      "exclude": [],
+      "message": "SQL 由拼接/插值构造，注入面直接暴露。",
+      "evidence": "命中行原文。",
+      "negative": "若拼进去的是**代码内固定常量**（表名白名单、列名枚举）而非用户输入，即为反例 —— 需给出该常量的来源。",
+      "source": "dev-expert hooks/sql_injection_check.py；fullstack-dev §4"
+    },
+    {
+      "id": "select_star",
+      "title": "裸 SELECT *",
+      "layer": "B",
+      "severity": "warn",
+      "kind": "regex",
+      "applies_when": {
+        "content_regex": "(?i)select"
+      },
+      "patterns": [
+        "(?i)\\bselect\\s+\\*\\s+from\\b"
+      ],
+      "exclude": [
+        "(?m)^\\s*(#|//|--)"
+      ],
+      "message": "裸 SELECT *：表结构一变就悄悄多取列，索引也难覆盖。",
+      "evidence": "命中行原文。",
+      "negative": "若是 exists/count 判定或调试脚本，即为反例。",
+      "source": "dev-expert hooks/select_star.py"
+    }
+  ]
+}

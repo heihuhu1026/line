@@ -40,7 +40,9 @@ IMPORT_RE = re.compile(r"^(?:import|from)\s")
 
 STATUS_CN = {
     "ok": "可套用",
-    "unchecked": "未核对（没提供仓库）",
+    # 这个状态有两种完全不同的成因：**没提供仓库** 与 **目标文件不在仓库里**。
+    # 文案不能只写前者 —— 真机上「明明传了 --repo 却报没提供仓库」，人会查错方向。
+    "unchecked": "未核对（原因见备注）",
     "anchor_not_found": "anchor 在原文里找不到",
     "anchor_ambiguous": "anchor 在原文里不唯一",
     "symbol_not_found": "原文里没有这个符号",
@@ -511,14 +513,25 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
         row = analyze_edit(source, edit)
         if source is None and repo:
             row["status"] = "unchecked"
-            row["notes"].append("目标文件不存在（可能是新增文件），无法核对")
+            row["notes"].append(
+                "目标文件不存在（modify 要求文件已在仓库里；新建文件要用 add）—— 仓库路径本身没问题"
+            )
+        elif source is None:
+            # **真**没提供仓库。与上面那条共用 unchecked 状态，所以原因必须分开写清楚，
+            # 否则就成了「传了 --repo 却说没传」（真机 20260926-214757 踩到）。
+            row["status"] = "unchecked"
+            row["notes"].append(
+                "没有提供仓库路径，无法核对（新建项目请把生成目录作为 --repo 传入）"
+            )
         audit["edits"].append(row)
 
     # 新增文件的**内容**校验：不依赖原文，只看补丁本身 —— 所以单独跑一遍而不是塞进
     # analyze_edit，这样 repo 缺失（新建项目没给 --repo）时同样生效。
     # 真机 run 20260924-185507：dev 把 renderer.py 写残（`print(f'{`，277 字节），
     # 原先一律判 ok /「整份写入」，一路放行到 verify 才炸 —— 白烧 test+verify+review 一整轮。
-    for row, edit in zip(audit["edits"], edits):
+    # strict=False 是**刻意的**：audit["edits"] 就是按 edits 逐条生成的，天然等长；
+    # 万一将来不等长，这里截断处理比在物化中途抛 ValueError 炸掉整轮要好。
+    for row, edit in zip(audit["edits"], edits, strict=False):
         if row.get("patch_kind") != "block" or str(edit.get("change_type") or "") != "add":
             continue  # diff 取不全文；非 add 交给各自的检查
         if row["status"] not in ("ok", "unchecked"):
@@ -565,8 +578,10 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
             audit["ok"] += 1
         else:
             audit["problems"] += 1
+            detail = STATUS_CN.get(row["status"], row["status"])
+            note = "；".join(str(x) for x in (row.get("notes") or [])[:1])
             audit["problem_detail"].append(
-                f"{row['symbol'] or row['path']}：{STATUS_CN.get(row['status'], row['status'])}"
+                f"{row['symbol'] or row['path']}：{detail}" + (f"（{note}）" if note else "")
             )
     return audit
 
@@ -625,7 +640,7 @@ def write_patch_files(run_dir: Path, repo: str | Path | None, impl: dict | None,
     rows = audit.get("edits") or []
 
     new_groups: dict[str, list[tuple[int, dict, dict]]] = {}
-    for index, (edit, row) in enumerate(zip(edits, rows), 1):
+    for index, (edit, row) in enumerate(zip(edits, rows, strict=False), 1):
         if row.get("status") == "ok" and row.get("patch_mode_used") == "new_file":
             new_groups.setdefault(str(edit.get("path") or ""), []).append((index, edit, row))
     for path, group in new_groups.items():
@@ -640,7 +655,7 @@ def write_patch_files(run_dir: Path, repo: str | Path | None, impl: dict | None,
             written.append({"file": row["patch_file"], "symbol": row.get("symbol"),
                             "path": path, "merged": len(group)})
 
-    for index, (edit, row) in enumerate(zip(edits, rows), 1):
+    for index, (edit, row) in enumerate(zip(edits, rows, strict=False), 1):
         if row.get("status") != "ok" or row.get("patch_mode_used") == "new_file":
             continue
         path = str(edit.get("path") or "")
@@ -706,6 +721,121 @@ def _symbol_text(source: str, symbol: str, *, whole: bool) -> str | None:
     end = min(max(end, start), len(lines))
     text = "\n".join(lines[start - 1 : end]).rstrip()
     return text or None
+
+
+def _importable_module(name: str) -> bool:
+    """这个名字是不是**能被 import 的模块**（标准库 / builtin / 本环境已安装）。"""
+    if not name or name.startswith("_") or not name.isidentifier():
+        return False
+    stdlib = set(getattr(sys, "stdlib_module_names", frozenset())) | set(sys.builtin_module_names)
+    if name in stdlib:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError, TypeError, ModuleNotFoundError):
+        return False
+
+
+def _insert_import(body: str, name: str) -> str:
+    """在文件正文里插入 ``import <name>`` —— 跳过 shebang / 开头注释 / 模块 docstring。
+
+    插在 docstring **之后**而不是文件最前面：否则模块 docstring 会退化成一条
+    无用的字符串语句（`main.py` 这类入口文件通常有）。
+    """
+    lines = body.splitlines()
+    pos = 0
+    while pos < len(lines) and (
+        not lines[pos].strip() or lines[pos].lstrip().startswith("#")
+    ):
+        pos += 1
+    if pos < len(lines) and lines[pos].lstrip().startswith(('"""', "'''")):
+        quote = lines[pos].lstrip()[:3]
+        if lines[pos].lstrip().count(quote) >= 2:
+            pos += 1  # 单行 docstring：开合都在这一行（`"""入口"""`），别去找结束引号，
+            # 否则会一路走到文件末尾，把 import 追加到最后 —— 顶层语句用到它就 NameError。
+        else:
+            pos += 1
+            while pos < len(lines) and quote not in lines[pos]:
+                pos += 1
+            if pos < len(lines):
+                pos += 1
+    lines.insert(pos, f"import {name}")
+    return "\n".join(lines) + "\n"
+
+
+def repair_missing_imports(impl: dict | None, semantic_audit: dict | None = None) -> dict[str, Any]:
+    """机械补上「用了但没 import」的模块（原地修改 impl）。
+
+    真机教训（run snake-ds-plan 第 1 轮，2026-09-26）：pyright 连报三轮
+    ``main.py:17 未定义 "random"`` / ``ui.py:28 未定义 "sys"``，流水线按
+    「带问题重问 dev」处理了 3 次（约 184 秒），**一次都没修掉** —— 模型每次
+    重写整份文件，惟独没加上那行 import。
+
+    性质与「anchor 抄缩写」完全一样（见 :func:`repair_anchors`）：pyright 已经
+    **精确指出**是哪个文件、哪个名字，而补一行 import 是确定性操作，没有任何
+    需要模型判断的地方。让模型重试是纯浪费，而且重问传的还是上一版正文，越问越偏。
+
+    安全闸门（全过才动，任何一条不满足就原样返回）：
+      1. 只认 pyright 的 ``reportUndefinedVariable`` —— 用的是**它的判定**，不是猜的；
+      2. 那个名字必须**确实是可导入的模块**（标准库 / builtin / 已安装），
+         这样补的 import 一定成立，不会把不存在的包引进来（``Cell`` 这类
+         项目内部符号不在此列，交给跨模块检查去管）；
+      3. 只处理 ``change_type == "add"`` 且 patch 是**整份正文**（非 diff）——
+         只有拿到全文才能安全地在头部插入；
+      4. 该文件里**还没有**这个 import（幂等，重复调用不会重复插）。
+    """
+    report: dict[str, Any] = {"repaired": 0, "detail": []}
+    if not impl or not semantic_audit:
+        return report
+    wanted: dict[str, set[str]] = {}
+    for diag in semantic_audit.get("diagnostics") or []:
+        if not isinstance(diag, dict):
+            continue
+        if str(diag.get("rule") or "") != "reportUndefinedVariable":
+            continue
+        match = re.search(r"未定义[“\"']?([\w.]+)[”\"']?", str(diag.get("message") or ""))
+        if not match:
+            continue
+        name = match.group(1).split(".")[0]
+        path = str(diag.get("file") or "").replace("\\", "/").strip()
+        if not name or not path or Path(path).suffix.lower() != ".py":
+            continue
+        if not _importable_module(name):
+            continue
+        wanted.setdefault(path, set()).add(name)
+    if not wanted:
+        return report
+
+    def _key(p: str) -> str:
+        return str(p or "").replace("\\", "/").strip()
+
+    for edit in impl.get("edits") or []:
+        if not isinstance(edit, dict):
+            continue
+        path = _key(edit.get("path"))
+        if not path or str(edit.get("change_type") or "") != "add":
+            continue
+        names = next(
+            (v for k, v in wanted.items()
+             if k == path or k.endswith("/" + path) or path.endswith("/" + k)),
+            None,
+        )
+        if not names:
+            continue
+        patch_text = str(edit.get("patch") or "")
+        if not patch_text.strip() or DIFF_RE.search(patch_text):
+            continue  # diff 形态拿不到全文，不碰
+        body = _new_file_body(patch_text)
+        for name in sorted(names):
+            if re.search(rf"^\s*(import\s+{re.escape(name)}\b|from\s+{re.escape(name)}\b)",
+                         body, re.M):
+                continue  # 已经有这个 import
+            body = _insert_import(body, name)
+            report["repaired"] += 1
+            report["detail"].append(f"{path}: import {name}")
+        if report["detail"]:
+            edit["patch"] = body
+    return report
 
 
 def repair_anchors(repo: str | Path | None, impl: dict | None) -> dict[str, Any]:
@@ -850,7 +980,7 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
     edits = [_normalize_edit_path(repo, e) for e in edits]
     rows = audit.get("edits") or []
     by_path: dict[str, list[tuple[dict, dict]]] = {}
-    for edit, row in zip(edits, rows):
+    for edit, row in zip(edits, rows, strict=False):
         # new_file 的行不进这条路径：目标文件本来就不在仓库里，逐条套用只会得到
         # 一堆误导性的「跳过：文件不存在」，真正该做的是下面的合并写入。
         if (row.get("status") == "ok" and row.get("patch_kind") == "block"
@@ -874,7 +1004,7 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
     # （真机教训 run 20260924-135801：game_logic.py 的 Snake/Food/Collision/Game
     #  四条补丁落盘后只剩 Game 一个类）。
     new_paths: dict[str, list[tuple[dict, dict]]] = {}
-    for edit, row in zip(edits, rows):
+    for edit, row in zip(edits, rows, strict=False):
         if row.get("status") == "ok" and row.get("patch_mode_used") == "new_file":
             new_paths.setdefault(str(edit.get("path") or ""), []).append((edit, row))
     for path, items in new_paths.items():
@@ -935,11 +1065,15 @@ def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool =
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(text, encoding="utf-8")
             report["files"].append({"path": path, "written": str(dest), "patches": applied})
-    for edit, row in zip(edits, rows):
+    for _edit, row in zip(edits, rows, strict=False):
         if row.get("status") != "ok":
+            # 把行内备注一并带出来：只给「未核对」三个字，人会去猜 —— 真机上就有人
+            # 按「没提供仓库」去查 --repo，而真实原因是目标文件不在仓库里。
+            note = "；".join(str(x) for x in (row.get("notes") or [])[:1])
             report["skipped"].append(
                 {"path": row.get("path"), "symbol": row.get("symbol"),
-                 "reason": STATUS_CN.get(row.get("status"), row.get("status"))}
+                 "reason": STATUS_CN.get(row.get("status"), row.get("status"))
+                 + (f"（{note}）" if note else "")}
             )
         elif row.get("patch_kind") == "diff":
             report["skipped"].append(

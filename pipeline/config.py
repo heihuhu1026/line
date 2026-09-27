@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from . import flow
 
@@ -21,26 +22,71 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = Path(os.getenv("PIPELINE_RUNS_DIR", str(ROOT / "runs")))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
+# --------------------------------------------------------------------------- 环境变量读取
+# 裸 ``int(os.getenv(...))`` 的坑：``PIPELINE_TIMEOUT=180s`` 这种带单位的写法（很自然
+# 的误输入）会抛 ValueError，而 config 是每个入口的**第一个** import —— 于是表现为
+# 「整条流水线起不来」，报错栈还指向 config 内部，看不出是哪个变量的问题。
+# 这里统一容错：值非法就降级为默认值并告警，绝不因为一个手误把进程拦在启动前。
+
+#: 只认这些写法为「假」。旧写法 ``not in ("0","false","False")`` 漏掉了 "no"/"off"/
+#: 大写 "FALSE"，写成那些会被当成**真** —— 想关掉闸门却关不掉，而且是静默的。
+_FALSE_WORDS = frozenset({"0", "false", "no", "off", "none", "disable", "disabled"})
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        print(f"[config] {name}={raw!r} 不是整数，已降级为默认值 {default}")
+        return default
+    if minimum is not None and value < minimum:
+        print(f"[config] {name}={value} 小于下限 {minimum}，已改为 {minimum}")
+        return minimum
+    return value
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"[config] {name}={raw!r} 不是数字，已降级为默认值 {default}")
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """开关型环境变量。未设置或写空 = 用默认值；其余按上面 _FALSE_WORDS 判真假。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in _FALSE_WORDS
+
+
 # 阶段驻留期内的 keep_alive，切换模型时显式卸载
 KEEP_ALIVE = os.getenv("PIPELINE_KEEP_ALIVE", "10m")
-REQUEST_TIMEOUT = int(os.getenv("PIPELINE_TIMEOUT", "1800"))
+REQUEST_TIMEOUT = _env_int("PIPELINE_TIMEOUT", 1800)
 
 # 回流上限：达到上限仍未 pass 则标记 needs_human 并保留全部中间产物
-MAX_REWORK_ROUNDS = int(os.getenv("PIPELINE_MAX_REWORK", "2"))
+MAX_REWORK_ROUNDS = _env_int("PIPELINE_MAX_REWORK", 2)
 
 # 人工介入的预算语义：人工点一次「打回」= 一次明确要求再修一轮，理应给它预算。
 # 为什么必须有：`_begin_round` 会把 attempt 推进一格，而 `_step_review` 用的是**绝对**判据
 # `attempt > max_rework`。真机 run 20260924-185507：人工在 attempt=3 打回，下一轮 attempt=4 > 2
 # → 那一轮评审一判返工就直接 needs_human 结束 —— 人工介入只换来一轮、且必然判死，等于白救。
 # 规则：人工介入时把上限抬到 `max(当前上限, attempt + 该值)`（单调不减）。
-HUMAN_REWORK_BUDGET = int(os.getenv("PIPELINE_HUMAN_REWORK_BUDGET", "1"))
+HUMAN_REWORK_BUDGET = _env_int("PIPELINE_HUMAN_REWORK_BUDGET", 1)
 # 人工追加次数上限（防止无人值守时无限增长）；到顶后需显式给 --max-rework
-HUMAN_REWORK_TOPUP_MAX = int(os.getenv("PIPELINE_HUMAN_REWORK_TOPUP_MAX", "3"))
+HUMAN_REWORK_TOPUP_MAX = _env_int("PIPELINE_HUMAN_REWORK_TOPUP_MAX", 3)
 
 # 评审频率：每 N 轮评审一次（1 = 每轮都评审）。
 # 首轮与「末轮（触顶那次）」必定评审 —— 前者为了早暴露问题，后者为了拿到真实判定而不是直接 needs_human。
 # 取值 2 时典型回流路径（上限 2，共 3 轮）只评审第 1、3 轮，省掉 2 次模型切换。
-REVIEW_EVERY = max(1, int(os.getenv("PIPELINE_REVIEW_EVERY", "2")))
+REVIEW_EVERY = _env_int("PIPELINE_REVIEW_EVERY", 2, minimum=1)
 
 # 各档位的 prefill 健康基线（token/s）：tools/preflight.py 与 issues 的问题判定共用这一份。
 # 口径是「数量级」——探针短则快、长则慢，所以只用来抓「掉了一个数量级」的情况：
@@ -54,10 +100,19 @@ DEFAULT_BASELINE_PREFILL = 120
 
 # PM 上下文：实测 prompt 仅 ~300 token，16K 足够，省下约 1.2GB 显存。
 # 若要喂很长的需求文档（>6000 字），用 PIPELINE_PM_CTX=32768 临时调回（tag 里的 num_ctx 会被请求覆盖）。
-PM_NUM_CTX = int(os.getenv("PIPELINE_PM_CTX", "16384"))
+PM_NUM_CTX = _env_int("PIPELINE_PM_CTX", 16384)
 
-# 字符 -> token 的启发式因子（实测中文约 1.5~1.6 字符/token，取 1.6 略偏保守）
+# 字符 -> token 的**保守**换算因子。只用于「token 上限 -> 字符上限」这个反向换算
+# （budget.chars_for_tokens 在没有文本样本时的兜底）。正向估算见下面的 TOK_PER_*。
 CHARS_PER_TOKEN = 1.6
+
+# 正向估算系数：每字符 token 数，按 ASCII / 非 ASCII 分档。
+# 由 tools/calibrate_tokens.py 在真机 41 条样本（3 个 run）上拟合，平均绝对误差 1.7%；
+# 旧实现 len(text)/1.6 在同一批样本上高估 40.9%（全是高估，近半预算被浪费）。
+# 换模型后可重新校准：python -m tools.calibrate_tokens
+# 注意：外部文档曾建议 CJK 取 1.5 token/字 —— 按那组系数实测误差 50.6%，比不改还差，未采用。
+TOK_PER_ASCII_CHAR = _env_float("PIPELINE_TOK_ASCII", 0.28)
+TOK_PER_NONASCII_CHAR = _env_float("PIPELINE_TOK_NONASCII", 0.76)
 
 # 单次调用结束后，若实际 prompt token 超过该比例 * num_ctx，记录告警（便于回头调预算）
 PROMPT_HARD_RATIO = 0.85
@@ -123,13 +178,21 @@ FULL_STAGE_ORDER = list(flow.FLOW_ORDER)
 # 交付前人工审核闸门：review 通过之后、正式收尾之前，强制暂停等人工核对 4 项
 # （核心路径通顺 / 无明显低级硬伤 / 交付物齐全 / 对照需求核心诉求满足），
 # 通过则放行交付，打回则回流到开发修复。设为 False 可关闭（跳过该闸门直接交付）。
-HUMAN_REVIEW_GATE = os.getenv("PIPELINE_HUMAN_REVIEW", "1") not in ("0", "false", "False")
+HUMAN_REVIEW_GATE = _env_bool("PIPELINE_HUMAN_REVIEW", True)
 
-# PM 未决项闸门：PM 一旦提出未决问题（open_questions 非空），就在 pm 阶段后强制暂停，等人工确认。
-# 这些未决项是**带着默认取值**往下走的：默认值一旦猜错，下游方案/实现/测试全都建在错误前提上，
-# 返工成本远高于停下来问一句。没有未决项时不暂停 —— 无条件停在 pm 只是白白浪费人机交互。
-# 设为 0 可关闭（PIPELINE_PAUSE_ON_OPEN_QUESTIONS=0）。
-PAUSE_ON_OPEN_QUESTIONS = os.getenv("PIPELINE_PAUSE_ON_OPEN_QUESTIONS", "1") not in ("0", "false", "False")
+# PM 未决项闸门：**强控，不可配置**（2026-09-26）。
+#
+# 规则：PM 产物里只要有「还不是陈述」的条目 —— 未裁决的 open_questions，或两列未明确项
+# （unknowns / clarifying_questions）—— pm 阶段之后就**必须**人工介入，且**裁决不完不放行**：
+#   · 续跑时会**重新判定**（orchestrator._execute 开头的复核）：人工什么都不裁决直接点继续，
+#     会被原地再停一次，不会把未定项带进下游；
+#   · 部分裁决也不放行（只裁一条，其余仍卡着）。
+# 目标就一句话：往下流的必须是**陈述**。真机教训 —— GA 写进模块需求的一句"假设"
+# 被下游当成硬约束，一路传到方案与补丁（job-20260926-154657 的 M-01）。
+#
+# 因此这一项**不再暴露**给环境变量 / 页面「配置」/ config.local.json：老值一律忽略并提示
+# （见 apply_overrides 末尾的废弃检查）。代码级逃生门只有 Orchestrator(pause_on_open_questions=False)，
+# 那是测试与嵌入方显式选择的，不是随手能关的开关。
 
 # 需求补强闸门：补强阶段识别出 **high 重要度**的待确认项时，在 intake 后强制暂停等人工确认。
 # 与 PM 的 open_questions 闸门同理 —— 建议取值一旦猜错，下游 PM/架构/开发/测试全建在错误前提上。
@@ -148,20 +211,20 @@ PAUSE_ON_OPEN_QUESTIONS = os.getenv("PIPELINE_PAUSE_ON_OPEN_QUESTIONS", "1") not
 #   · 所以：**代码默认不动**，需要入口卡人的场景（需求普遍模糊）用**本地覆盖**
 #     （config.local.json 的 runtime.intake_pause_on_gaps，页面「配置」里勾）或
 #     `--pause-after intake` 显式指定。本地覆盖只影响这台机器，改完无需动代码。
-INTAKE_PAUSE_ON_GAPS = os.getenv("PIPELINE_INTAKE_PAUSE", "0") not in ("0", "false", "False")
+INTAKE_PAUSE_ON_GAPS = _env_bool("PIPELINE_INTAKE_PAUSE", False)
 
 # ------------------------------------------------------------------ 运行验证（verify 阶段）
 # 「最终输出结果的验证与确认」：把补丁物化到沙箱（runs/<id>/verify/work）后真的跑一遍，
 # 把退出码与输出当**机械证据**喂给评审 —— 而不是让模型读文件猜「能不能跑」。
 # 安全约定：只在沙箱副本里跑、只跑白名单程序、逐条超时、输出截断、命中危险片段不执行；
 # 验证失败即使在评审里被判 pass 也会被改判 rework_dev。设为 0 可关闭（PIPELINE_VERIFY=0）。
-VERIFY_ENABLED = os.getenv("PIPELINE_VERIFY", "1") not in ("0", "false", "False")
+VERIFY_ENABLED = _env_bool("PIPELINE_VERIFY", True)
 # 单条命令超时（秒）：给足编译/启动时间，又不至于让死循环挂住整条流水线
-VERIFY_TIMEOUT = int(os.getenv("PIPELINE_VERIFY_TIMEOUT", "180"))
+VERIFY_TIMEOUT = _env_int("PIPELINE_VERIFY_TIMEOUT", 180)
 # 最多执行几条命令（含必跑的语法检查）
-VERIFY_MAX_COMMANDS = int(os.getenv("PIPELINE_VERIFY_MAX_COMMANDS", "5"))
+VERIFY_MAX_COMMANDS = _env_int("PIPELINE_VERIFY_MAX_COMMANDS", 5)
 # 复制仓库进沙箱的体积上限（MB）：超了就只物化补丁涉及的文件，并记一条 note
-VERIFY_COPY_LIMIT_MB = int(os.getenv("PIPELINE_VERIFY_COPY_LIMIT_MB", "1500"))
+VERIFY_COPY_LIMIT_MB = _env_int("PIPELINE_VERIFY_COPY_LIMIT_MB", 1500)
 # 允许执行的程序（首 token，按小写、去扩展名比对）；不在表里的命令只记录、不执行
 VERIFY_ALLOWED_BINS = frozenset(
     {"python", "pytest", "node", "npm", "npx", "go", "cargo", "dotnet", "java", "mvn", "gradle"}
@@ -196,23 +259,23 @@ VERIFY_DENY_PATTERNS = (
 #
 # **刻意做成可选增强**：pyright 装在全局 npm 目录（`npm i -g pyright`），换机器/换环境
 # 就没有。探测不到时各接口返回空结果并说明原因，绝不让流水线因此失败。
-LSP_ENABLED = os.getenv("PIPELINE_LSP", "1") not in ("0", "false", "False")
+LSP_ENABLED = _env_bool("PIPELINE_LSP", True)
 # 单次诊断超时（秒）。实测：5 文件 2.1s、20 文件 4.9s、整个项目根 5.7s。
-LSP_TIMEOUT = int(os.getenv("PIPELINE_LSP_TIMEOUT", "120"))
+LSP_TIMEOUT = _env_int("PIPELINE_LSP_TIMEOUT", 120)
 # 单次最多回灌多少条诊断给模型 —— 太多会淹没真正要修的那条
-LSP_MAX_DIAGNOSTICS = int(os.getenv("PIPELINE_LSP_MAX_DIAGNOSTICS", "8"))
+LSP_MAX_DIAGNOSTICS = _env_int("PIPELINE_LSP_MAX_DIAGNOSTICS", 8)
 # 这些 rule 属「高置信」：符号/属性不存在、参数与调用不匹配 —— 几乎不可能是误报，
 # 可以进 dev 的重问清单；其余（类型推断、可选值下标等）只记进报告让评审与人工看。
 # 引用查找（LSP）：首次请求要等 pyright 索引完工作区，实测约 2~3s（且**不需要**逐个
 # didOpen，server 会自己扫盘），所以做成「启动一次会话、多个符号复用 + 轮询到有结果」。
 # 轮询上限 × 间隔 = 单符号最多等多久。
-LSP_REFERENCE_ROUNDS = int(os.getenv("PIPELINE_LSP_REFERENCE_ROUNDS", "6"))
-LSP_REFERENCE_INTERVAL = float(os.getenv("PIPELINE_LSP_REFERENCE_INTERVAL", "1.0"))
+LSP_REFERENCE_ROUNDS = _env_int("PIPELINE_LSP_REFERENCE_ROUNDS", 6)
+LSP_REFERENCE_INTERVAL = _env_float("PIPELINE_LSP_REFERENCE_INTERVAL", 1.0)
 # 一次会话最多查多少个符号：每个符号要单独一轮请求，避免把时间花在长尾上
-LSP_MAX_SYMBOLS = int(os.getenv("PIPELINE_LSP_MAX_SYMBOLS", "8"))
+LSP_MAX_SYMBOLS = _env_int("PIPELINE_LSP_MAX_SYMBOLS", 8)
 # 整段引用查找的墙钟上限（秒）：超了就放弃 LSP、退回 ast 结果，不拖住 verify。
 # 实测瓶颈在 server 启动 + 首次索引（约 3s），会话建立后每个符号只要零点几秒。
-LSP_REFERENCE_BUDGET = int(os.getenv("PIPELINE_LSP_REFERENCE_BUDGET", "45"))
+LSP_REFERENCE_BUDGET = _env_int("PIPELINE_LSP_REFERENCE_BUDGET", 45)
 LSP_BLOCKING_RULES = frozenset(
     {
         "reportAttributeAccessIssue",
@@ -255,12 +318,24 @@ STAGE_PER_FILE_TOKENS: dict[str, int] = {
 # 拆成「先铺小函数、再薄薄地串起来」后，full_symbol 的主函数更容易写完整、写对。
 DEV_TWO_PASS = True
 
+#: **按 task 分派**：一次 dev 只做方案里的一张施工图，而不是把整个方案一把丢给它。
+#:
+#: 为什么必须这样（与本地 7B 的容量直接相关）：实测单轮输出 ~1385 tok，一个模块若有
+#: 5~8 个任务，一次调用根本写不完 ⇒ 写浅、漏任务 ⇒ 覆盖审计判负 ⇒ 整批重写 ⇒ 反复返工。
+#: 按 task 分派后：① 单次输出只服务一张图，写得深；② 哪个任务没过就重做哪个，
+#: **「最小改动」不再依赖提示词约束，而是由调度天然保证**；③ 两遍模式不再需要（单张图够小）。
+DEV_PER_TASK = _env_bool("PIPELINE_DEV_PER_TASK", True)
+
 # 新增文件内容不合法时，**带问题重问 dev 的次数**（0 = 关闭）。
 # 为什么必须重问而不是只记阻断：7B 在「回填」那遍会把文件写断（真机 run 20260924-185507 的
 # renderer.py 连续 4 轮停在 `print(f'{`），而它的 JSON 本身是合法的 → 契约重试不会触发。
 # 只记阻断的代价是**整整一轮**（dev+test+verify+review ≈5 分钟 + 一次 14B 评审），
 # 而模型下一轮照样写断 —— 典型的「改不动却一直返工」。重问一次只要几十秒。
-DEV_CONTENT_REPAIR_TRIES = int(os.getenv("PIPELINE_DEV_CONTENT_REPAIR_TRIES", "2"))
+#
+# 取 3 而不是 2：2026-09-26 把「真跑产物自带测试」接进重问后，一次重问的**信息量**比
+# 以前高得多（带完整 traceback，而不是「测试失败」四个字），值得多给一次机会。
+# 代价只在真有问题时才付（多一次几十秒的重问），而崩一轮是十几分钟算力 + 全部中间态。
+DEV_CONTENT_REPAIR_TRIES = _env_int("PIPELINE_DEV_CONTENT_REPAIR_TRIES", 3)
 
 
 # --------------------------------------------------------------------------- 交付落盘
@@ -269,7 +344,7 @@ DEV_CONTENT_REPAIR_TRIES = int(os.getenv("PIPELINE_DEV_CONTENT_REPAIR_TRIES", "2
 # 产物只落在 runs/<id>/verify/work —— 真机 run 20260924-185507 / 20260924-135801
 # 跑完 8 轮评审后目标目录 D:\AI\CODE 仍是空的，等于全部算力白烧。
 # 设为 0 则退回「只验证不交付」（产物仅留在沙箱，便于审查后再手动物化）。
-DELIVER_ENABLED = os.getenv("PIPELINE_DELIVER", "1") not in ("0", "false", "False")
+DELIVER_ENABLED = _env_bool("PIPELINE_DELIVER", True)
 
 # --------------------------------------------------------------------------- 收敛与预算护栏
 # 停滞护栏：最近 N 轮「待修项数量」没有下降就停止返工、转人工。
@@ -277,12 +352,12 @@ DELIVER_ENABLED = os.getenv("PIPELINE_DELIVER", "1") not in ("0", "false", "Fals
 # 之后又反弹，一路烧到 attempt=11/max=12。光靠 max_rework 只能在撞顶时才停，
 # 而这一路并没有变好，纯粹在烧算力与独占显存（单驻留期间无法新建运行）。
 # 0 = 不做停滞判定（只保留 max_rework）。
-REWORK_STAGNATION_LIMIT = int(os.getenv("PIPELINE_STAGNATION", "3"))
+REWORK_STAGNATION_LIMIT = _env_int("PIPELINE_STAGNATION", 3)
 
 # 运行级预算护栏（0 = 不限）。注意与 REQUEST_TIMEOUT 区分：后者是**单次 HTTP 请求**超时，
 # 挡不住「一轮返工累积很久」这种情况。
-MAX_WALL_S = int(os.getenv("PIPELINE_MAX_WALL_S", "0"))
-MAX_TOTAL_TOKENS = int(os.getenv("PIPELINE_MAX_TOKENS", "0"))
+MAX_WALL_S = _env_int("PIPELINE_MAX_WALL_S", 0)
+MAX_TOTAL_TOKENS = _env_int("PIPELINE_MAX_TOKENS", 0)
 
 # --------------------------------------------------------------------------- 裁决参谋
 # 人工在闸门上裁决时，可以就某一条**反复**向模型提问（风险 / 收益 / 可逆性 / 建议）。
@@ -293,18 +368,40 @@ MAX_TOTAL_TOKENS = int(os.getenv("PIPELINE_MAX_TOKENS", "0"))
 # 它**不是流程节点**：不进 EXEC_ORDER / STAGE_MODELS / STAGE_SCHEMAS 等注册表，
 # 也不产出阶段 artifact —— 问答逐轮追加到 runs/<id>/advice/<stage>.jsonl（可读、可审计），
 # 是「随闸门可用」的旁路环节。
-ADVICE_ENABLED = os.getenv("PIPELINE_ADVICE", "1") not in ("0", "false", "False")
+ADVICE_ENABLED = _env_bool("PIPELINE_ADVICE", True)
 # 用哪个模型：留空 = 复用**该阶段自己的模型**（建议要落在该阶段的视角上，
 # 也避免多引入一个要加载的 tag）。想要更强的判断力时设 PIPELINE_ADVICE_TAG
 # （例如 qwen3-14b-arch-8k）。
 ADVICE_TAG = os.getenv("PIPELINE_ADVICE_TAG", "").strip()
 # 带几轮历史进上下文（0 = 每轮独立）。裁决问答是**多轮**的，但历史太长会挤掉
 # 阶段产物本身 —— 那才是判断的依据。
-ADVICE_MAX_HISTORY = int(os.getenv("PIPELINE_ADVICE_HISTORY", "4"))
+ADVICE_MAX_HISTORY = _env_int("PIPELINE_ADVICE_HISTORY", 4)
 # 单轮墙钟上限（秒）。旁路环节不该因为一次调用把页面吊死。
-ADVICE_TIMEOUT = int(os.getenv("PIPELINE_ADVICE_TIMEOUT", "600"))
+ADVICE_TIMEOUT = _env_int("PIPELINE_ADVICE_TIMEOUT", 600)
 # 阶段产物注入裁决参谋时的字符预算（不够就从尾部截断）
-ADVICE_CONTEXT_CHARS = int(os.getenv("PIPELINE_ADVICE_CONTEXT_CHARS", "6000"))
+ADVICE_CONTEXT_CHARS = _env_int("PIPELINE_ADVICE_CONTEXT_CHARS", 6000)
+
+# --------------------------------------------------------------------------- 入口总闸粒度
+# GA 模块数上限（粒度硬约束）：超过就判**过度拆分**，降级 small 直通并记 note。
+#
+# 为什么需要这条：GA 只是"全局架构师"提示词调用一次 14B，它没有任何数量约束，
+# 而 `derive_scale` 的判据是「模块数 ≥ 2 就 large」。真机 20260926-170359 就把一个
+# 贪吃蛇拆成 8 个模块（核心逻辑/渲染/数据存储/输入/配置/测试框架/扩展接口/性能优化），
+# 其中 7 个都直接依赖 M-01 —— 实质是「1 主干 + 7 附件」，8 条完整流水线接力改同一批文件，
+# 成本 ≈ ×8、成品还是那几个文件。
+#
+# 上限取 5 的依据：一个"可独立交付"的模块应当能由一个开发者在一轮流水线内交付；
+# 超过 5 个通常意味着把**横切关注点**（测试/配置/性能/日志）当成了模块。
+GA_MAX_MODULES = _env_int("PIPELINE_GA_MAX_MODULES", 5, minimum=1)
+
+# 新建项目（无存量代码）的**疑似大型**线索：需求明确要求多个可独立交付的子系统/端。
+# 缺了它们，"需求写得很详细"本身不该被当成规模证据 —— 详细描述一个小成品（如贪吃蛇）
+# 会让 `prejudge` 的枚举条目/字数两条弱信号同时命中，于是白调一次 GA 还拆出 8 个模块。
+MULTI_DELIVERABLE_WORDS = (
+    "前端", "后端", "前后端", "服务端", "客户端", "微服务", "多端", "多个服务",
+    "多个子系统", "子系统", "多模块", "插件系统", "插件化", "中台", "网关",
+    "api 服务", "rest", "grpc", "消息队列", "数据库迁移", "分布式",
+)
 
 
 # --------------------------------------------------------------------------- 本地覆盖
@@ -327,15 +424,13 @@ RUNTIME_SCALARS: dict[str, str] = {
     "advice_context_chars": "ADVICE_CONTEXT_CHARS",
     "lsp_timeout": "LSP_TIMEOUT",
     "lsp_max_diagnostics": "LSP_MAX_DIAGNOSTICS",
+    "ga_max_modules": "GA_MAX_MODULES",
 }
 RUNTIME_FLAGS: dict[str, str] = {
     "dev_two_pass": "DEV_TWO_PASS",
     "human_review_gate": "HUMAN_REVIEW_GATE",
-    # 此前只认环境变量 PIPELINE_PAUSE_ON_OPEN_QUESTIONS，漏登记在这张表里 ——
-    # 后果是「PM 未决项闸门」在页面「配置」里看不到、也写不进 config.local.json，
-    # 于是想让运行无人值守的人把 human_review_gate / intake_pause_on_gaps 都关了，
-    # 它照样在 PM 结束后停下等人（真机 run 20260925-153925 就停在这里）。
-    "pause_on_open_questions": "PAUSE_ON_OPEN_QUESTIONS",
+    # 注意：PM 未决项闸门**刻意不在这里** —— 它是强控（未裁决不放行），
+    # 不提供环境变量 / 页面 / config.local.json 任何一处开关（见文件上方说明）。
     "intake_pause_on_gaps": "INTAKE_PAUSE_ON_GAPS",
     "verify": "VERIFY_ENABLED",
     "deliver": "DELIVER_ENABLED",
@@ -424,6 +519,17 @@ def apply_overrides() -> None:
             num_predict=base.num_predict,
         )
 
+    # 废弃开关的显式提示：PM 未决项闸门已是强控，但 config.local.json / 环境变量里
+    # 可能还留着老值。静默忽略会让人以为「我明明关了它」—— 那是更坏的结果。
+    if rt.get("pause_on_open_questions") is not None or os.environ.get(
+        "PIPELINE_PAUSE_ON_OPEN_QUESTIONS"
+    ):
+        print(
+            "[config] pause_on_open_questions / PIPELINE_PAUSE_ON_OPEN_QUESTIONS 已废弃并被忽略："
+            "PM 未决项现在是强控 —— 只要存在未明确或未裁决条目，pm 之后就必须人工介入，"
+            "全部裁决完才放行（见 pipeline/config.py 与 orchestrator._conditional_gate）。"
+        )
+
 
 # 代码默认值快照：必须在应用覆盖**之前**记录，否则页面无法区分
 # 「当前值」与「默认值」，也就无从判断是否被本地配置改动过。
@@ -436,9 +542,7 @@ CODE_DEFAULTS: dict[str, Any] = {
         "pm_num_ctx": PM_NUM_CTX,
         "dev_two_pass": DEV_TWO_PASS,
         "human_review_gate": HUMAN_REVIEW_GATE,
-        # 必须与 RUNTIME_FLAGS 一一对应：缺这一项时页面「还原默认」会把
-        # PAUSE_ON_OPEN_QUESTIONS 还原成 None（falsy），等于**静默关掉闸门**。
-        "pause_on_open_questions": PAUSE_ON_OPEN_QUESTIONS,
+        # PM 未决项闸门不在这张表里：它是强控、不可配置（见文件上方说明）
         "intake_pause_on_gaps": INTAKE_PAUSE_ON_GAPS,
         "chars_per_token": CHARS_PER_TOKEN,
         "prompt_hard_ratio": PROMPT_HARD_RATIO,
@@ -451,6 +555,7 @@ CODE_DEFAULTS: dict[str, Any] = {
         "lsp": LSP_ENABLED,
         "lsp_timeout": LSP_TIMEOUT,
         "lsp_max_diagnostics": LSP_MAX_DIAGNOSTICS,
+        "ga_max_modules": GA_MAX_MODULES,
         "rework_stagnation": REWORK_STAGNATION_LIMIT,
         "max_wall_s": MAX_WALL_S,
         "max_total_tokens": MAX_TOTAL_TOKENS,

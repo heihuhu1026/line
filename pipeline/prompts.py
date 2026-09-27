@@ -270,6 +270,10 @@ SYSTEM: dict[str, str] = {
         "    **命令必须能在本环境直接跑起来**：优先用 Python 标准库（`python -m unittest`）"
         "与项目自带依赖，不要声明环境里没装的第三方工具（如 `pytest`）—— "
         "声明了只会记一条「程序不可用」，既验不了东西又白占一条命令位；\n"
+        "    ⚠ **命令必须自包含、可直接执行**：命令里要构造某个类 / 调用某个函数时，参数必须"
+        "**按【本轮已产出文件的接口】写齐**（含构造参数）。`python -c \"import m; assert m.Cls().f()\"` "
+        "在 `Cls.__init__` 需要参数时**必然**报 TypeError —— 那是命令写错，会被机械自检拦下退回重写；"
+        "需要显示器 / 网络等外部环境的对象不要直接实例化，改为断言不需要它们的纯逻辑；\n"
         "  · coverage_gaps 每项给 {gap, reason, impact}：缺口是什么、为什么覆盖不了、对结论影响多大；\n"
         "    ⚠ **改动的符号必须逐个被某条用例的 target 覆盖**，否则会被机械判为漏测并直接打回。"
         "确实无需单独用例的（例如只改了内部常量），必须在 coverage_gaps 里写明原因是哪个符号、"
@@ -292,6 +296,9 @@ SYSTEM: dict[str, str] = {
         "  · in_material —— 实现层就能改掉（改补丁、补测试用例文本…）→ 下一轮回开发；\n"
         "  · architect —— **方案层**才能改：方案漏规划了某个文件、漏定义接口/数据结构、"
         "任务边界划错导致某产出没人负责、依赖没在方案里声明 → 下一轮**直接回架构师方案**；\n"
+        "⚠ architect 返工项必须写成**具体缺口**（缺哪个文件 / 哪个文件没人负责 / 哪条依赖没声明），"
+        "**禁止**写「实现所有未覆盖的任务 T-01 至 T-05」这类空话 —— 架构师看不到自己的上一版，"
+        "拿到空话只会把整个方案重设计一遍（真机 011207：5 版方案文件划分次次不同）。\n"
         "  · needs_external —— 需要运行系统、访问外部环境或人工确认才能定论（接口是否存在、阈值取多少、"
         "字段是否齐全、迁移脚本实际执行结果…），编排器会把这类自动改判进 residual_risks。\n"
         "只要有一条判 architect，下一轮就从**方案**重跑；全是 in_material 才只回开发。\n"
@@ -324,12 +331,18 @@ def _requirement_block(requirement: str) -> str:
 
 
 def _upstream(title: str, obj: Any, str_tokens: int = 160, list_items: int = 12) -> str:
+    # 空片段**整个不渲染**：真机 20260927-011207 里架构师的 8 个输入片段有 4 个是空的
+    # （新建项目的存量评估 / 检索池全空），却各自渲染出一个光秃秃的标题 ——
+    # 既不提供信息，又占掉注意力最强的位置。没有内容就什么都别给。
     if not obj:
-        return f"【{title}】\n（无）"
+        return ""
     return f"【{title}】\n{distill_json(obj, str_tokens=str_tokens, list_items=list_items)}"
 
 
 def _code_block(excerpts_text: str) -> str:
+    # 新建项目的检索池恒空，此时不该渲染一个空标题（真机 011207 里它就是纯噪声）
+    if not excerpts_text or not excerpts_text.strip():
+        return ""
     return "【存量代码片段（按相关度挑选，可能被截断）】\n" + excerpts_text
 
 
@@ -545,8 +558,33 @@ def apply_intake_decisions(intake: Any, decisions: Any) -> Any:
     return out
 
 
-def apply_pm_decisions(scope: Any, decisions: Any) -> Any:
-    """同上，对象是 PM 的 ``open_questions``。"""
+#: PM 产物里「未明确」的两列：模型自己标了"这里没弄清楚"、**没给建议值**的条目。
+#: 它们与 open_questions（带建议/默认取值、待人工裁决）是两类，但都属于"还不是陈述"，
+#: 在强控里同样必须人工介入（裁决后从这两列移除、作为陈述进 confirmed_facts）。
+PM_VAGUE_FIELDS: tuple[str, ...] = ("unknowns", "clarifying_questions")
+
+
+def pm_vague_text(item: Any) -> str:
+    """取一条未明确项的文本（新契约是字符串数组，但模型偶尔会写成对象）。"""
+    if isinstance(item, dict):
+        return str(item.get("item") or item.get("question") or item.get("text") or "").strip()
+    return str(item or "").strip()
+
+
+def apply_pm_decisions(scope: Any, decisions: Any, *, overwrite: bool = False) -> Any:
+    """同上，对象是 PM 的 ``open_questions`` **以及两列未明确项**。
+
+    - ``open_questions``：按 ``question`` 匹配，写入 ``final_decision`` / ``confirmed``；
+    - ``unknowns`` / ``clarifying_questions``：按**条目文本**匹配，裁掉的条目从这两列
+      移除并写进 ``confirmed_facts`` —— 人工给了结论，它就不再是"未明确"，下游只能看到
+      那句陈述（这正是「往下流的都是陈述」在数据结构上的落点）。
+
+    ``overwrite`` 区分两条路径：
+      · ``False``（读取时并回）：产物里已有 ``final_decision`` 就保留 —— 产物优先，
+        这是既有约定（见 smoke_mock 的「产物里的 final_decision 优先于 state」）；
+      · ``True``（**人工保存裁决**）：人刚做的决定是最终决定，要覆盖产物里的旧值。
+        没有这一条，人工改判会被"看起来已经裁过"的旧值挡住，界面显示已保存却不生效。
+    """
     if not isinstance(scope, dict):
         return scope
     by_ref = {
@@ -563,19 +601,60 @@ def apply_pm_decisions(scope: Any, decisions: Any) -> Any:
             continue
         item = dict(row)
         topic = str(item.get("question") or "")
-        if topic in by_ref and not str(item.get("final_decision") or "").strip():
+        if topic in by_ref and (overwrite or not str(item.get("final_decision") or "").strip()):
             item["final_decision"] = by_ref[topic]
             item["confirmed"] = True
             changed = True
         rows.append(item)
+    facts = [str(x).strip() for x in (scope.get("confirmed_facts") or []) if str(x).strip()]
+
+    def put_fact(text: str) -> None:
+        """写入一条陈述，**按问题/条目文本去重并覆盖**。
+
+        PM 自己可能已经把同一件事写进 ``confirmed_facts``（`问题 → 结论`），裁决写回的是
+        `问题：结论` —— 直接 append 会得到两条指向同一问题的"事实"（一条还是旧的猜测）。
+        这里按主键替换：人工的裁决是最终说法。
+        """
+        key = fact_key(text)
+        for idx, existing in enumerate(facts):
+            if fact_key(existing) == key:
+                facts[idx] = text
+                return
+        facts.append(text)
+
+    out = dict(scope)
+    for field in PM_VAGUE_FIELDS:
+        raw = list(out.get(field) or [])
+        if not raw:
+            continue
+        kept: list[Any] = []
+        for item in raw:
+            text = pm_vague_text(item)
+            decision = by_ref.get(text, "")
+            if text and decision:
+                put_fact(f"{text}：{decision}")
+                changed = True
+                continue
+            kept.append(item)
+        if len(kept) != len(raw):
+            out[field] = kept
     if not changed:
         return scope
-    out = dict(scope)
     out["open_questions"] = rows
-    out["confirmed_facts"] = [
-        f"{r.get('question')}：{r.get('final_decision')}" for r in rows if r.get("final_decision")
-    ]
+    for row in rows:
+        if row.get("final_decision"):
+            put_fact(f"{row.get('question')}：{row.get('final_decision')}")
+    if facts:
+        out["confirmed_facts"] = facts
     return out
+
+
+def fact_key(text: Any) -> str:
+    """结论式事实的主键：取 `→` / `：` 之前的问题或条目文本。
+
+    PM 自己写的 `问题 → 结论` 与人工裁决写回的 `问题：结论` 指向同一条，去重与覆盖都按它判。
+    """
+    return re.split(r"[→：]", str(text or ""), maxsplit=1)[0].strip()
 
 
 def tidy_intake(intake: Any) -> tuple[Any, list[str]]:
@@ -949,6 +1028,66 @@ def impact_audit_block(audit: dict) -> str:
     return "\n".join(lines)
 
 
+def api_digest_block(
+    digest: dict,
+    only_paths: set[str] | None = None,
+    *,
+    title: str = "【本轮已产出文件的接口（以此为准，不要凭记忆写）】",
+    tail: str = "  ↑ 引用其它文件里的类/函数时，成员名与参数只能从这里取；这里没有的就是不存在。",
+) -> str:
+    """把「接口摘要」渲染成一段准绳（喂给 dev）。
+
+    `only_paths`（按 task 分派时才传）：只保留与**这一张施工图相关**的文件接口。
+    7B 一次只做一张图，把全部 7 个文件的接口都摊在它面前，等于让它同时惦记
+    「这次不用做」的文件 —— 既吃掉上下文预算，又把注意力从本任务的符号上引开。
+    跨文件契约需要的只是**它依赖的那几个**文件（见 orchestrator._task_paths）。
+
+    刻意做成**正面陈述**（有什么）而不是**负面清单**（哪里错）：模型真正缺的是
+    「另一份文件里实际存在哪些成员」。只告诉它「属性不存在」，它仍然要靠记忆去猜
+    正确写法 —— 而脑补正是这类缺陷的源头（真机 run snake-v2：`ui.py` 读
+    `self.game_logic.score`，那个属性并不存在）。
+
+    `title` / `tail` 可换：**冻结基准**（方案期定的接口）与**已产出接口**（事实）语义不同，
+    标题必须能区分，否则模型分不清「必须这样写」和「现在长这样」。
+    """
+    if not digest:
+        return ""
+    wanted = {str(p).replace("\\", "/") for p in (only_paths or ())} or None
+    rows = [
+        (rel, members)
+        for rel, members in digest.items()
+        if wanted is None or str(rel).replace("\\", "/") in wanted
+    ]
+    if not rows:
+        return ""
+    lines = [title]
+    for rel, members in rows:
+        lines.append(f"  {rel}:")
+        lines.extend(f"    {m}" for m in members)
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+def skeleton_block(skeleton: dict, only_paths: set[str] | None = None) -> str:
+    """**冻结的接口基准**：方案期定下、这一版开发必须照着实现的接口。
+
+    与 ``api_digest_block`` 的区别（两者会同时出现在一轮 dev 里）：
+      · 这个是**应当长什么样**（方案已冻结，改它要回方案阶段）；
+      · 那个是**现在实际长什么样**（已产出的既成事实，用来接续前几轮）。
+    分开陈述的理由：混成一段时模型无法判断冲突该以谁为准 —— 而"谁为准"恰恰是
+    跨文件接口错配的根源（真机 run snake-v2：`ui.py` 读了并不存在的 `game_logic.score`）。
+    """
+    return api_digest_block(
+        skeleton,
+        only_paths,
+        title="【接口基准（方案已冻结：必须按这些名字与参数实现，不得擅自改名/改参数）】",
+        tail=(
+            "  ↑ 这是**方案的接口基准**：本文件对外暴露的类/函数/参数必须与之逐字一致。"
+            "确实需要调整接口时，不要在实现里偷偷改 —— 写进 deviations 说明原因。"
+        ),
+    )
+
+
 def test_audit_block(audit: dict) -> str:
     """测试产物审计：编排器用确定性规则核对三类用例是否齐全，不是模型的判断。
 
@@ -975,6 +1114,20 @@ def test_audit_block(audit: dict) -> str:
             + "；".join(audit["vague_expected"])
             + " —— 这类表述无法转成断言，应要求补成可观测结果"
         )
+    if audit.get("entry_gap"):
+        # 真机 run snake-detailed：test 第 2、3 轮把入口命令换成了窄命令，
+        # verify 拿不到「产物能跑」的证据 → 三轮不收敛。这里让评审看得见。
+        lines.append(f"- **{audit['entry_gap']}**")
+    if audit.get("boundary_gap"):
+        # 「正常路径测了、坏路径一条没测」是 AI 生成用例最常见的形状。
+        # 只作提示级：措辞差异大，判负会逼模型编造用例（与 missing_symbols 同因）。
+        lines.append(
+            "- **没有任何一条用例在测异常/边界路径**（非法输入、空值、越界、冲突…）："
+            f"共 {audit.get('case_count', 0)} 条用例全是正常路径 —— 请判断是否要补，"
+            "或说明为何本项目无需（例如纯计算库由入口统一校验）"
+        )
+    if audit.get("boundary_count"):
+        lines.append(f"- 其中测异常/边界路径的用例 {audit['boundary_count']} 条")
     if audit.get("missing_symbols"):
         # 「写了很多用例」≠「测到了改动之处」：用例 target 写文件名、补丁是符号级时，
         # 覆盖对不上（真机 run 20260925-184300 只有 1/5 对得上）。这条把它摆到评审面前。
@@ -992,7 +1145,7 @@ def test_audit_block(audit: dict) -> str:
             )
     if audit.get("missing_unexplained"):
         lines.append(
-            f"- **漏测（既没用例覆盖、也没在 coverage_gaps 申诉）**："
+            "- **漏测（既没用例覆盖、也没在 coverage_gaps 申诉）**："
             + "、".join(str(s) for s in audit["missing_unexplained"])
             + " —— 属阻断级，已由机制强制判 rework_dev；用例 target 要写到符号级"
             "（写文件名会与补丁的 target_symbol 对不上）"
@@ -1060,14 +1213,62 @@ def plan_audit_block(audit: dict) -> str:
         )
     if audit.get("duplicate_task_ids"):
         lines.append(f"- 重复的任务 id：{'、'.join(audit['duplicate_task_ids'])}")
+    if audit.get("oversized_tasks"):
+        # 粒度上限：一张施工图一轮写不完，按 task 分派后只能写浅、漏符号
+        lines.append(
+            f"- **这些任务超出单轮容量（必须拆细）**：{'、'.join(audit['oversized_tasks'])}"
+            " —— 单个任务最多 2 个 target_files、4 个 symbols"
+        )
+    if audit.get("tasks_without_symbols"):
+        lines.append(
+            f"- **这些任务没有声明 symbols**：{'、'.join(audit['tasks_without_symbols'])}"
+            " —— symbols 既是粒度判据，也是开发的自检清单（漏定义会被符号消失检测抓到）"
+        )
+    if audit.get("over_covered_files"):
+        # 「同一个文件被多少张图覆盖」才是拆太碎的真正判据（整体 task 数抓不到）
+        lines.append(
+            f"- **这些文件被拆给了太多张施工图**：{'、'.join(audit['over_covered_files'])}"
+            f" —— 单个文件最多由 {2} 张图覆盖，请合并（同一文件多次改动，依赖顺序与合并都更容易出错）"
+        )
+    if audit.get("contracts_missing"):
+        # 不声明契约 ⇒ 后续跨文件比对无从下手，"0 条问题"会被误读成"接口都对得上"
+        lines.append(
+            f"- **这些施工图没有声明 interface / contracts**：{'、'.join(audit['contracts_missing'])}"
+            " —— 跨文件接口没写清，各张图独立施工必然拼不上，且无法被机械比对"
+        )
+    if audit.get("over_split"):
+        lines.append(
+            "- **任务拆得过细**：任务数超过改动文件数的 2 倍 —— "
+            "同一文件被多个任务改动时，依赖顺序与合并都更容易出错，建议合并同类任务"
+        )
     if audit.get("unknown_depends_on"):
         lines.append(
             f"- depends_on 引用了不存在的任务 id：{'、'.join(audit['unknown_depends_on'])}"
+        )
+    if audit.get("vague_acceptance"):
+        # 任务出口必须可判定：acceptance 的用途是**设计测试用例**，写成"功能正常"就转不成断言
+        lines.append(
+            f"- **这些任务的 acceptance 无法转成断言**（剥掉模糊词后没有实质内容）："
+            f"{'、'.join(audit['vague_acceptance'])} —— 请改写成可观测结果"
+            "（具体值/具体行为/具体文件），否则测试阶段只能编出空用例"
+        )
+    if audit.get("weak_rollback"):
+        # 撤销条件是"出事了怎么退"，与"改了什么"同等重要
+        lines.append(
+            f"- **方案没有可执行的撤销条件（rollback）**：当前内容「{audit['weak_rollback']}」"
+            " —— 请写清：什么现象出现就回退、回退到哪个状态、代价是什么"
         )
     if audit.get("forbidden_touched"):
         lines.append(
             f"- **改动了禁改路径**：{'、'.join(audit['forbidden_touched'])}"
             "（评估阶段已列为 forbidden_paths，必须换方案）"
+        )
+    if audit.get("forbidden_ignored"):
+        # 只说「没判负」，不说「已豁免」：机械化不了的自由文本规则既不冤枉改动，
+        # 也不替模型/人工下结论
+        lines.append(
+            "- 以下 forbidden_paths 条目不是路径（含描述文字），**未参与机械判负**、"
+            f"也不构成改动禁区，仅供理解意图：{'、'.join(audit['forbidden_ignored'])}"
         )
     if audit.get("mixed_languages"):
         lines.append(
@@ -1110,6 +1311,43 @@ def patch_audit_block(audit: dict) -> str:
     return "\n".join(lines)
 
 
+#: 返工轮的任务段标题
+REWORK_HEADING = "【返工口径·锁基准 / 定范围 / 最小改】"
+
+#: 返工口径的公共规则（各角色共用）
+_REWORK_RULES = (
+    "⚠ **这是返工，不是重做**：\n"
+    "1. 必须基于下面给出的**当前产物 / 上一版输出**修改，禁止脱离它凭空重写；\n"
+    "2. 只改问题清单明确指向的条目 —— **未被指出的内容必须原样保留**，"
+    "禁止重构、删减、重命名、格式调整、顺带优化；\n"
+    "3. 禁止新增问题清单没有要求的东西（新任务 / 新模块 / 新功能 / 新依赖）；\n"
+    "4. 改完逐条核对：清单里每条都改到了吗？有没有碰到清单外的东西？\n"
+)
+
+
+def rework_task_block(scope_rules: str) -> str:
+    """返工轮的任务段 —— **只切这一小段**，公共输入与首次生成完全共用。
+
+    为什么不是「另写一套提示词」：需求 / 上游产物 / 禁区 / 接口摘要 / 运行验证这些
+    公共部分，首次与返工**都要喂**。复制一份就等于凭空制造第二处真源 —— 改一处漏一处，
+    两边还会各自漂移。真正需要切换的只有「这次要你做什么」这一句：
+    首次是「把它做出来」，返工是「只把指出的问题改掉，其余原样保留」。
+
+    真机上这个区分不是理论问题：`snake-ds-plan` 在返工轮重新生成了**整份方案**
+    （产物里出现了第二份 `architect_plan`）；`snake-impfix` 的 dev 连着重问 9 次，
+    每次都重写整份文件，问题集几乎没变 —— 因为提示词里「按方案实现」的口径一直还在。
+
+    ``scope_rules`` 是该角色特有的「什么算超出范围」。
+    """
+    return f"{REWORK_HEADING}\n{_REWORK_RULES}{scope_rules}"
+
+
+#: 重问（自检回灌）那一段的标题。**公开成常量**是因为调用方要靠它识别「这是重问轮次」
+#: （冒烟里 `_RepairClient` 据此给出「修好了的那一版」）—— 以前它是写在函数里的字面量，
+#: 改一次措辞就把测试打瞎一次（`repair_prompts` 恒为 0，那条断言形同虚设）。
+REPAIR_HEADING = "【上一版自检没过，请修这几处】"
+
+
 def _repair_block(items: list[str] | None) -> str:
     """「上一版被判不合法，请重出」—— 机制自检出来的问题回灌给**同一阶段**。
 
@@ -1119,11 +1357,23 @@ def _repair_block(items: list[str] | None) -> str:
     if not items:
         return ""
     listing = "\n".join(f"- {x}" for x in items[:4])
+    # 为什么把「定点修」写成硬要求（真机 run snake-impfix，2026-09-26）：
+    # 重问走的是 dev_pass=3 的口径（`full_symbol` 直接给完整符号实现），模型因此每次都
+    # **重新吐一遍整份文件**（2000+ token、40–140s）。而报错往往只是局部的一行
+    # （缺 import、某个断言没过）—— 重写整份既慢，又会顺手改掉本来没问题的地方
+    # （「越改越少」就是这么来的）。实测 3 轮 9 次重问，问题集几乎一次都没变小。
+    # 所以这里明确要求逐条对应、能定点就定点，把重写限定在「该文件真没原文」的情形。
     return (
-        "【上一版被判为不合法，请重出这几处（只修这些，其余保持原样）】\n"
+        f"{REPAIR_HEADING}\n"
         f"{listing}\n"
-        "⚠ 这次必须给出**完整**的内容：不要写到一半就停；字符串 / 括号 / 花括号都要闭合；"
-        "写完后自己从头到尾看一遍是否完整、能否编译。"
+        "⚠ **这是定点修，不是重写**：\n"
+        "1. 上面每一条都要有一条 edit 对应它，逐条修，不要合并成一份大改；\n"
+        "2. **优先定点改**：该文件有原文时，`change_type` 用 `modify`，`patch_mode` 用 "
+        "`replace_span`（anchor 直接取报错里给出的那一行原文）或 `insert_after`；\n"
+        "3. 只有该文件**没有原文**（新建文件、或整个文件写残 / 漏了）时，才用 `change_type` 为 "
+        "`add` 给出全文 —— 其余情况不要重发完整文件；\n"
+        "4. **没被点到的文件不要出现在 edits 里**：重发它们既浪费，又会把本来能跑的地方改坏；\n"
+        "5. 给出的内容必须完整可编译：不要写到一半就停，字符串 / 括号 / 花括号都要闭合。"
     )
 
 
@@ -1137,6 +1387,118 @@ def human_feedback_block(items: list[str]) -> str:
     )
 
 
+#: 方案岗特有的「超出范围」判据
+_PLAN_REWORK_SCOPE = (
+    "5. 只调整问题指向的 task / changes 条目：未被指出的任务拆分、target_files、"
+    "依赖关系与执行顺序必须原样保留；\n"
+    "6. 禁止新增问题清单没有要求的变更点 / 文件；禁止在这一层输出具体实现代码。\n"
+)
+
+
+def _plan_rework_note(fixes: list[str] | None) -> str:
+    """方案的返工口径。
+
+    为什么必须有：方案被退回时它倾向于**整份重写** —— 真机 run snake-ds-plan 的产物里
+    出现了第二份 `architect_plan`，而上一版里已经定好的文件清单在新版里被整个换掉了
+    （5 个文件漏成 1 个）。重写一份方案等于把上一轮评审通过的部分也一起推翻。
+    """
+    if not fixes:
+        return ""
+    return (
+        rework_task_block(_PLAN_REWORK_SCOPE)
+        + "下面【任务】段里「最小侵入变更方案与任务拆解」的**格式与字段要求仍然有效**，"
+        "但**改动范围以本节为准**：只改问题指向的条目。"
+    )
+
+
+def _pm_design_view(scope: Any) -> dict:
+    """架构师要的 PM 信息：**只挑对设计有用的字段**。
+
+    整份渲染 PM 产物会把 `background` / `impact_areas` / `risks` 这类叙述性内容一起带进来：
+    既占预算，又容易让架构师在"需求该怎么理解"上自己发挥 —— 而那是 PM 已经拍过的事。
+
+    架构师真正需要的只有**边界与验收**：要做什么、不做什么、算做完的标准、已裁决的前提。
+    """
+    if not isinstance(scope, dict):
+        return {}
+    # 刻意**不含 `confirmed_facts`**：它存的是「问题：裁决结论」，而 `pm_assumptions_block`
+    # 已经把同一批条目渲染成「问题 → 已裁决：结论」（且还覆盖了**未裁决**时走默认假设的情形）。
+    # 两个都给就是同一份内容喂两遍 —— 真机 20260927-011207 里 7 条裁决被完整重复了一遍，
+    # 既占预算，又让"到底哪个是准的"变得含糊。裁决类信息只保留一个来源。
+    # `functional_requirements` 与 `impact_areas` **必须保留**：它们是模块划分的直接依据
+    # （impact_areas 还带严重度）。真机 011207 里我把它们当"叙述性内容"丢掉了，
+    # 架构师只剩 6 条 in_scope 要点去自由发挥 —— 于是同一需求 5 次出方案，文件划分次次不同。
+    keep = (
+        "goal",
+        "functional_requirements",
+        "in_scope",
+        "out_of_scope",
+        "acceptance_criteria",
+        "impact_areas",
+        "constraints",
+    )
+    return {k: scope.get(k) for k in keep if scope.get(k)}
+
+
+#: 「方案·接口骨架」的系统提示。与 `architect_plan` **共用同一段 14B 驻留**
+#: （见 ``orchestrator._freeze_skeleton``），所以不额外产生模型切换。
+#: 核心纪律只有一条：**只列结构，一行实现都不许有** —— 一旦开始写函数体，8K 上下文立刻被吃光，
+#: 注意力也会从"定接口"被拉到"写实现"上，而后者本来就是下一阶段的事。
+SKELETON_SYSTEM = (
+    "你是资深架构师。本次**只做一件事：把方案的接口骨架冻结下来**，供下游开发照着写实现。\n"
+    "绝对红线（违反即不合格）：\n"
+    "  1. **只输出结构，不得出现任何函数体、伪代码、示例逻辑或实现说明** ——"
+    "每个方法只给「名字 + 参数名」，不写它做什么；\n"
+    "  2. 文件清单必须与【方案的文件清单】**逐字一致**：不多一个、不少一个"
+    "（确有必要新增文件，必须在 notes 里写明理由）；\n"
+    "  3. **必须包含方案里的可执行入口文件**（main.py / __main__.py / run.py 等），"
+    "并为它列出入口函数；\n"
+    "  4. 严禁编造方案与 PM 范围里没有的功能、模块、依赖或数据表。\n"
+    "字段规范：\n"
+    "  · files[].path：与方案一致的相对路径（用正斜杠）；\n"
+    "  · files[].classes[]：{name, bases, attributes, methods}。"
+    "**methods[].params 只写实例方法真正接收的参数名（不要写 self/cls）**，多个用逗号分隔；"
+    "attributes 只列**对外可见的实例属性名**（不要写 self. 前缀）；\n"
+    "  · files[].functions[]：模块级函数 {name, params}；constants：模块级常量（形如 `WIDTH = 400`）；\n"
+    "  · entry：可执行入口文件路径（没有就留空串）；notes：取舍说明（可空）。\n"
+    "执行步骤：① 读 PM 的范围与验收，确认本次要交付哪些能力；② 读方案的文件清单，"
+    "逐个文件定出对外接口；③ 自检后输出 JSON。\n"
+    "输出前自检：① 有没有一行实现代码混进来？② 文件清单与方案逐字一致吗？"
+    "③ 会被别的文件引用的类/函数/属性都列了吗（下游只能按你列的写）？④ 入口文件列了吗？\n" + _TAIL
+)
+
+
+def parts_skeleton(scope: Any, plan: Any) -> list[str]:
+    """「方案·接口骨架」的输入构造：只喂**边界**与**文件清单**，不喂任何实现细节。
+
+    刻意不喂实现（连 ``changes[].approach`` 都不整段喂）：这一步要的是「把接口列全」，
+    喂了实现细节或代码片段，注意力会被拉去复述实现，输出的结构反而更稀 —— 与「输入裁剪」
+    是同一个道理，只不过这次裁掉的是**干扰它做枚举的东西**。
+    """
+    changes = [
+        {"path": c.get("path"), "intent": c.get("intent")}
+        for c in ((plan or {}).get("changes") or [])
+        if isinstance(c, dict) and str(c.get("path") or "").strip()
+    ]
+    return [
+        _upstream(
+            "产品经理范围（**权威**：边界与验收已在此拍定）",
+            _pm_design_view(scope),
+            str_tokens=140,
+            list_items=12,
+        ),
+        pm_assumptions_block(scope),
+        _upstream(
+            "方案的文件清单（**必须逐一覆盖，不得增删**）",
+            {"changes": changes},
+            str_tokens=200,
+            list_items=20,
+        ),
+        "【任务】为上面每个文件定出**对外接口骨架**（类 / 方法 / 函数 / 公开属性），"
+        "只列结构，一行实现都不要写。",
+    ]
+
+
 def parts_plan(
     requirement: str,
     scope: Any,
@@ -1148,9 +1510,31 @@ def parts_plan(
     impl: Any = None,
 ) -> list[str]:
     return [
-        _requirement_block(requirement),
-        _upstream("产品经理范围说明", _scope_view(scope), str_tokens=120, list_items=10),
+        # **需求原文不注入**：它是 PM 的输入，架构师的输入权威是 PM 的产物。
+        # 越级把原始需求（以及需求补强那一层的产出）喂给架构师，等于让它再做一遍 PM 的判断
+        # —— 与"给开发喂需求原文"是同一个毛病，只是换了一层。
+        # （`requirement` 参数保留但不注入：签名不动，避免牵连调用方。）
+        _upstream(
+            "产品经理范围说明（**权威**：边界与验收已在此拍定）",
+            _pm_design_view(scope),
+            str_tokens=140,
+            list_items=12,
+        ),
         pm_assumptions_block(scope),
+        # 返工轮必须看到**自己的上一版**：此前 `prev_plan` 只被用来算机械事实、从不渲染，
+        # 于是架构师每轮都在看不见上一版的情况下重新设计 —— 真机 011207 出 5 版方案，
+        # 文件划分（是否分包、文件名）次次不同，dev 拿到的施工图也就跟着天天变。
+        (
+            _upstream(
+                "上一版方案（**必须在此基础上做差分修改**：未被返工项指出的 changes / tasks、"
+                "文件划分与 task 编号一律保持原样，不要重新设计一遍）",
+                prev_plan,
+                str_tokens=200,
+                list_items=16,
+            )
+            if prev_plan
+            else ""
+        ),
         _upstream("存量代码评估", assessment, str_tokens=140, list_items=12),
         # 回退到方案重跑时（评审把根因判为方案层），运行验证的失败证据必须让方案看到 ——
         # 否则它不知道自己漏规划了什么文件，下一轮还会漏。
@@ -1163,6 +1547,7 @@ def parts_plan(
         ),
         _code_block(excerpts_text),
         _feedback_block("上一轮评审要求返工的原因（必须逐条解决）", fixes),
+        _plan_rework_note(fixes),
         "【任务】给出最小侵入变更方案与任务拆解。每个改动文件都要有 minimality_reason。",
     ]
 
@@ -1202,6 +1587,192 @@ def longest_definition(excerpts_text: str) -> tuple[str, str] | None:
     return best
 
 
+#: 开发岗特有的「超出范围」判据
+_DEV_REWORK_SCOPE = (
+    "5. **优先定点改**：`change_type` 用 `modify`，`patch_mode` 用 `replace_span`"
+    "（anchor 取问题里给出的那一行原文）或 `insert_after`；"
+    "只有该文件没有原文（新建 / 整份写残）时才用 `add` 给全文；\n"
+    "6. 禁止改动未被指出的 anchor、patch_mode、目标文件路径；\n"
+    "7. 禁止触碰禁区路径（forbidden_paths）内的文件，禁止跨模块改未提及的代码。\n"
+)
+
+
+def _dev_rework_note(fixes: list[str] | None, repair: list[str] | None) -> str:
+    """开发的返工口径。``fixes``（评审返工）与 ``repair``（自检重问）是**两条回灌通道**，
+    这里统一成同一套说法 —— 以前前者只说「必须解决」、后者说「重出这几处」，
+    而末尾【任务】段一直是首次生成的口径，模型同时收到「把方案实现完」和「只修这几处」。
+    """
+    if not (fixes or repair):
+        return ""
+    return (
+        rework_task_block(_DEV_REWORK_SCOPE)
+        + "下面【任务】段里关于「实现 / 补齐 / 分片」的**机械纪律仍然有效**"
+        "（锚点逐字且唯一、单条 ≤40 行、不得占位），但**改动范围以本节为准**。"
+    )
+
+
+def dev_regression_block(lost: list[str] | None, only_paths: set[str] | None = None) -> str:
+    """返工退化点名：上一轮有、这一轮消失的符号。
+
+    为什么必须点名：`vanished_symbols` 已经能机械判负，但判负只等于"打回去改"——模型拿到
+    一句「要么恢复、要么说明理由」之后，下一轮极易把**另一个**符号再丢掉（真机
+    run 20260924-185507：`InputHandler` 悄悄消失，第 3 轮评审还"通过"了，人工实测才发现
+    方向控制没了）。把"丢了哪些"直接摆到提示词最前面，比事后一轮轮抓便宜得多。
+    """
+    names = [str(x).strip() for x in (lost or []) if str(x).strip()]
+    if only_paths:
+        # 条目形如 `path::symbol`：按 task 分派时只点名**这张图负责的文件**里消失的符号，
+        # 别的文件丢了什么由它自己的那张图去处理 —— 否则 7B 会把注意力摊到无关文件上。
+        wanted = {str(p).replace("\\", "/") for p in only_paths}
+        names = [n for n in names if str(n).split("::", 1)[0].replace("\\", "/") in wanted]
+    if not names:
+        return ""
+    lines = [
+        "【返工退化警告（上一轮有、这一轮没了 —— 必须处理）】",
+        "下列符号在上一轮实现里存在，当前这一版里消失了：",
+        *[f"- {name}" for name in names[:12]],
+        "处理方式只有两种，二选一并且必须显式说明：① 恢复它们（原样或等价实现）；"
+        "② 若确实是刻意删除，写进 `not_implemented` / `deviations` 并给出**为什么删**"
+        "（不能只是「这轮没写」）。尤其注意：整份重写某个文件时不要因为重排顺序而丢符号。",
+    ]
+    return "\n".join(lines)
+
+
+def _infer_symbols_from_changes(task: dict, changes: Any) -> list[str]:
+    """方案没声明 symbols 时，从对应 changes 的 approach / intent 里推断候选符号名。
+
+    契约只强制 id/title/target_files/acceptance，symbols 常常是空的（真机
+    20260927-015956：6 张图全空，且「重问补齐」会把方案重做、只能降级为提示），
+    但 approach 里其实写了「定义Snake类」。把它捞出来给 dev 当符号清单，各张施工图
+    才会用同一个名字 —— 否则跨文件 import 必然对不上（run 20260925-184300 的
+    「跨文件接口不一致」就是这么来的）。
+    """
+    if not isinstance(changes, list) or not isinstance(task, dict):
+        return []
+    paths = {str(p).strip() for p in (task.get("target_files") or []) if str(p).strip()}
+    if not paths:
+        return []
+    out: list[str] = []
+    for c in changes:
+        if not isinstance(c, dict) or str(c.get("path") or "").strip() not in paths:
+            continue
+        text = f"{c.get('approach') or ''} {c.get('intent') or ''}"
+        # 标识符只取 ASCII：\w 在 Python 下会连中文一起吃掉（"定义UI类" 会抓成 "UI类"）
+        for pat in (
+            r"(?:定义|实现|新增|创建)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:类|函数|方法)?",
+            r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)",
+        ):
+            for m in re.finditer(pat, text):
+                name = m.group(1)
+                if name not in out:
+                    out.append(name)
+    return out[:8]
+
+
+def task_focus_block(task: Any, changes: Any = None) -> str:
+    """**单张施工图**（按 task 分派时，dev 一次调用只做这一张）。
+
+    为什么要有它：方案里的 `tasks[]` 此前只是给 `covers_tasks` 用的**记账标签**，
+    dev 一次拿到整个方案的所有任务，靠两遍模式自己消化 —— 7B 单轮写不完就写浅、漏任务。
+    按 task 分派后，dev 的权威来源收敛成这一张图：**不再需要需求原文与 PRD**，
+    因为施工图里已经写清了要定义什么符号、对外接口是什么、依赖谁、怎么验收。
+    """
+    if not isinstance(task, dict) or not (task.get("id") or task.get("title")):
+        return ""
+
+    def _listing(value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            items = [str(x).strip() for x in value if str(x).strip()]
+        elif isinstance(value, dict):
+            items = [f"{k}: {v}" for k, v in value.items() if str(v).strip()]
+        elif value:
+            items = [str(value).strip()]
+        else:
+            items = []
+        return "\n".join(f"    · {x}" for x in items[:10]) if items else "    （未声明）"
+
+    contracts = task.get("contracts") if isinstance(task.get("contracts"), dict) else {}
+    declared_symbols = [s for s in (task.get("symbols") or []) if str(s).strip()]
+    inferred = [] if declared_symbols else _infer_symbols_from_changes(task, changes)
+    symbols_block = _listing(declared_symbols or inferred)
+    if inferred:
+        symbols_block += (
+            "\n    （方案未显式声明 symbols；以上是从 changes.approach 推断的候选名 —— "
+            "**务必按这些名字定义**，否则别的施工图 import 不到）"
+        )
+    lines = [
+        f"【本次只做这一个任务：{task.get('id') or '?'} · {task.get('title') or ''}】",
+        "只产出下面 target_files 里这些文件的 edit；**其他任务的文件一个都不要碰**"
+        "（它们由各自的施工图完成，跨任务结果由编排器合并）。",
+        f"- target_files：{', '.join(str(x) for x in (task.get('target_files') or [])) or '（未声明）'}",
+        "- 要定义的符号（漏一个都会被机械检测抓到）：",
+        symbols_block,
+        f"- 对外签名：{task.get('interface') or '（未声明）'}",
+        "- 跨文件契约 · 依赖谁：",
+        _listing(contracts.get("uses")),
+        "- 跨文件契约 · 提供什么给别人：",
+        _listing(contracts.get("exposes")),
+        f"- 数据结构：{task.get('data_model') or '（未声明）'}",
+        "- 必须遵守的约束：",
+        _listing(task.get("constraints")),
+        "- 验收标准：",
+        _listing(task.get("acceptance")),
+        f"- **验收命令（运行验证会真的跑它）**：{task.get('test_hint') or '（未声明 —— 请补一条可执行命令）'}",
+    ]
+    if task.get("depends_on"):
+        lines.append(
+            f"- 前置任务（已完成，可直接用它们的成果）："
+            f"{', '.join(str(x) for x in task['depends_on'])}"
+        )
+    return "\n".join(lines)
+
+
+def _bugfix_parts(
+    bug_report_block: str,
+    scope: Any,
+    plan: Any,
+    current_code: str | None,
+    verify: Any,
+    fixes: list[str] | None,
+    repair: list[str] | None,
+    prev_summary: str | None,
+) -> list[str]:
+    """BUG 修复轮的**裁剪视图**（对应 `parts_dev(bugfix=True)`）。
+
+    为什么必须裁：首次开发那套片段是为「从 0 到 1」设计的 —— 需求原文、PM 背景与影响面、
+    存量代码评估、完整方案、检索池。到了修缺陷这一轮它们：
+      ① 几乎零信息量（新建项目的 assessment / excerpts 恒空，且与 current_code 重复）；
+      ② 占掉 24K 上下文里的一大块，把真正要紧的失败证据挤到后面；
+      ③ **语义上把模型拉回"从需求出发重新实现一遍"** —— 与「最小改动」正面对抗。
+
+    留下的都是「不看到就会改坏」的东西：缺陷单（范围与验收口径）、现有代码正文、
+    裁决后的验收标准、失败命令证据、自检回灌、返工口径。
+    方案（`plan`）不再整份喂：跨文件接口由编排器钉在最前面的 `api_digest_block` 提供，
+    比整份方案更省也更准。
+    """
+    return [
+        bug_report_block,
+        _upstream(
+            "验收标准（PM 裁决后的终稿；只用于判断「修成什么样算对」）",
+            _scope_view(scope),
+            str_tokens=60,
+            list_items=6,
+        ),
+        _current_code_block(current_code),
+        _upstream(
+            "运行验证结果（沙箱里真跑出来的机械证据：只列失败的命令与其输出尾部）",
+            _verify_view(verify, plan, None, only_failed=True),
+            str_tokens=80,
+            list_items=6,
+        ),
+        _repair_block(repair),
+        _feedback_block("评审要求修复项（必须解决）", fixes),
+        _dev_rework_note(fixes, repair),
+        (f"【上一轮实现摘要】\n{truncate_text(prev_summary, 200)}" if prev_summary else ""),
+    ]
+
+
 def parts_dev(
     requirement: str,
     scope: Any,
@@ -1215,13 +1786,55 @@ def parts_dev(
     verify: Any = None,
     repair: list[str] | None = None,
     current_code: str | None = None,
+    bug_report_block: str = "",
+    bugfix: bool = False,
+    include_plan: bool = True,
 ) -> list[str]:
-    parts = [
-        _requirement_block(requirement),
-        _upstream("产品经理范围说明", scope, str_tokens=100, list_items=8),
-        pm_assumptions_block(scope),
-        _upstream("存量代码评估（含禁改路径）", assessment, str_tokens=120, list_items=10),
-        _upstream("架构师变更方案（务必按其 tasks 执行）", plan, str_tokens=220, list_items=16),
+    """dev 的输入片段。
+
+    `include_plan=False`：**按 task 分派时不再喂整份方案**。
+    一次只做一张施工图，却把整个方案（含别的任务的条目）也塞进来，等于同一件事给了两份 ——
+    既占预算，又把注意力引向"这次不用做"的文件。分派模式下权威就是那一张施工图。
+    """
+    """dev 的输入片段。
+
+    `bugfix=True`（返工修缺陷轮）走**裁剪视图**（见 `_bugfix_parts`）：首次开发那套
+    「需求原文 + PM 背景 + 存量评估 + 完整方案 + 检索池」对"修一个指定缺陷"几乎没有
+    信息量，却占掉 24K 上下文里的一大块，更糟的是语义上把模型拉回"从需求出发重新
+    实现一遍" —— 与「最小改动」正面对抗。裁剪只保留"不看到就会改坏"的那几样。
+    """
+    parts = _bugfix_parts(
+        bug_report_block, scope, plan, current_code, verify, fixes, repair, prev_summary
+    ) if bugfix else [
+        # **方案是开发的唯一权威**。
+        # 需求理解、边界划分、取舍决策是架构师那一层已经做完的事。把需求原文与 PM 的
+        # 范围/背景/假设一并喂给开发，等于允许它**重新做一遍架构师的判断** —— 它会在
+        # 方案与需求冲突时自行取舍、顺手加方案里没有的东西（越界改动的源头之一）。
+        # 那还要架构师出方案干什么？
+        # 所以这里只留三样上游：方案（权威）、裁决后的验收口径、禁改约束。
+        # （`requirement` 参数保留但不注入 —— 签名不动，避免牵连调用方。）
+        # 按 task 分派时不喂整份方案：权威是那一张施工图，整份方案只会分散注意力
+        (
+            _upstream(
+                "架构师变更方案（**权威**：按它的 changes 与 tasks 施工）",
+                plan,
+                str_tokens=240,
+                list_items=18,
+            )
+            if include_plan
+            else ""
+        ),
+        _upstream(
+            "验收标准（PM 裁决后的终稿；只用于判断「做成什么样算对」）",
+            # 只取 acceptance_criteria 这一个字段：PM 产物的其余部分是背景与影响面，
+            # 对"照方案施工"没有用，还会把开发的注意力拉回需求层
+            {"acceptance_criteria": (scope or {}).get("acceptance_criteria")}
+            if isinstance(scope, dict)
+            else None,
+            str_tokens=60,
+            list_items=6,
+        ),
+        _upstream("存量代码评估（**只看禁改路径**）", assessment, str_tokens=60, list_items=6),
         # 当前实现正文紧跟方案之后 —— 它是返工的主材料，且越靠前越不会被 fit_prompt 裁掉
         _current_code_block(current_code),
         # 运行验证证据排在**方案之后、代码之前**：
@@ -1241,10 +1854,21 @@ def parts_dev(
         _repair_block(repair),
         _code_block(excerpts_text),
         _feedback_block("评审要求修复项（必须解决，并在 deviations 中说明是否已解决）", fixes),
+        # 返工口径放在这里（末尾【任务】段之前）：fit_prompt 从末尾开始丢片段，
+        # 越靠前越不会被裁掉；而它必须盖住【任务】段里「按方案实现」的首次口径。
+        # 缺陷单放在返工口径**之前**：它是本轮范围的权威来源，先看到它才知道"只改哪些"
+        bug_report_block,
+        _dev_rework_note(fixes, repair),
         (f"【上一轮实现摘要】\n{truncate_text(prev_summary, 200)}" if prev_summary else ""),
     ]
-    main = longest_definition(excerpts_text)
-    has_code = bool(excerpts_text and excerpts_text.strip())
+    # 「有没有原文可锚定」的判据必须是**真实存在的代码**：检索池（excerpts_text）在新建项目里
+    # 恒空，而真实代码在 current_code（上一轮物化产物）里。先前只看检索池，于是同一份 prompt
+    # 里【当前项目已有代码】说"有"、【任务】段说"没有"，模型两边打架后折中出 `modify`+片段
+    # （真机 run 20260926-214757 四轮零进展的直接诱因）。
+    main = longest_definition(excerpts_text or current_code or "")
+    has_code = bool(
+        (excerpts_text and excerpts_text.strip()) or (current_code and current_code.strip())
+    )
     if dev_pass == 1:
         if has_code:
             parts.append("【任务】按方案实现代码改动，输出符号级 edits（补丁）。")
@@ -1329,6 +1953,24 @@ def _pass1_block(edits: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _test_repair_block(repair: list[str] | None) -> str:
+    """测试产物的**机械自检**结论：哪些命令自身不可执行（必须先修命令，不是修实现）。
+
+    与「评审要求补测项」区分开：那个说的是"少测了什么"，这个说的是"命令根本跑不起来"。
+    """
+    items = [str(x).strip() for x in (repair or []) if str(x).strip()]
+    if not items:
+        return ""
+    return (
+        "【机械自检：以下命令自身不可执行，必须修正 —— 这是**命令写错**，不是实现出错】\n"
+        "  · 判据：命令里调用的类/函数，参数个数少于【本轮已产出文件的接口】里声明的必需参数，"
+        "运行时必然 `TypeError`（属于命令质量问题，会让整轮验证拿不到可运行证据）。\n"
+        + "\n".join(f"  - {it}" for it in items[:6])
+        + "\n  ↑ 只改这些命令的**参数/写法**，用例设计与其它命令保持不动；"
+        "需要显示器/网络等外部环境的对象，改为断言不需要它们的纯逻辑。\n"
+    )
+
+
 def parts_test(
     requirement: str,
     scope: Any,
@@ -1336,15 +1978,23 @@ def parts_test(
     impl: Any,
     excerpts_text: str,
     fixes: list[str] | None = None,
+    api_digest: dict | None = None,
+    repair: list[str] | None = None,
 ) -> list[str]:
     return [
         _requirement_block(requirement),
         _upstream("产品经理验收标准", scope, str_tokens=110, list_items=8),
         pm_assumptions_block(scope),
         _upstream("架构师方案（验收依据）", plan, str_tokens=180, list_items=14),
-        _upstream("开发实现结果", impl, str_tokens=420, list_items=10),
+        # 接口摘要**必须**排在「开发实现结果」之前：新建项目里仓库为空（【存量代码片段】
+        # 整段是空占位），这份摘要就是唯一告诉测试"类/函数该怎么调"的东西。没有它，
+        # 7B 只能按类名猜构造 —— 真机 20260927-073518：5 条命令全部写成无参构造
+        # （`SnakeGame()` 而 `__init__(self, width, height)`），verify 必然 TypeError。
+        api_digest_block(api_digest or {}),
+        _upstream("开发实现结果", impl, str_tokens=700, list_items=14),
         _code_block(excerpts_text),
         _feedback_block("评审要求补测项", fixes),
+        _test_repair_block(repair),
         "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。",
     ]
 
@@ -1533,10 +2183,75 @@ def _verify_view(
         "summary": report.get("summary", ""),
         "problems": list(report.get("problems") or [])[:6],
         "notes": list(report.get("notes") or [])[:5],
+        # **归因**：哪些失败是「测试命令自身不可执行 / 拿不到可运行证据」造成的。
+        # 这是测试层缺陷 —— 开发改不动测试命令，据此要求改实现只会把对的改坏
+        # （真机 20260927-073518：dev 被要求给 snake.py 补 width/height，而实现本就正确要求了它们）。
+        "test_defects": list(report.get("test_defects") or [])[:6],
         # 机制算出来的集合事实（不是模型判断）：评审据此声明返工项归属
         "mechanical_facts": facts,
         "commands": commands,
+        # 「**没验什么**」也要与 verdict 平级交给评审：只给 verdict，pass 会被读成
+        # "该验的都验了"。覆盖率与负向对照同属这一类证据（见 verify.unverified_claims /
+        # negative_control）。
+        "unverified": list(report.get("unverified") or [])[:6],
+        "coverage": report.get("coverage") or {},
+        "negative_control": {
+            "checked": (report.get("negative_control") or {}).get("checked", 0),
+            "no_power": ((report.get("negative_control") or {}).get("no_power") or [])[:2],
+        },
     }
+
+
+#: 评审/交付里最常见的「把没验证包装成已通过」的话术 → 反驳口径。
+#: 这些句子在真机评审与人工交接里都出现过（"改动很小应该没问题""我检查过了"）。
+#: 它们不是论证，是**待验证项披了论证的皮**：列出对应反驳，等于把"什么不算证据"写进契约。
+RATIONALIZATION_REPLIES: tuple[tuple[str, str], ...] = (
+    ("改动很小 / 就改了一行", "改动大小与是否验证无关：删一行可以删掉入口、改一个常量可以改坏语义。要验证命令与输出。"),
+    ("应该没问题 / 看起来没问题", "「应该」不是证据。要么给出实测输出，要么进 residual_risks 说明为何无法验证。"),
+    ("本地测过了", "本地环境 ≠ 交付环境。要可复现的命令 + 退出码 + 关键输出三件套。"),
+    ("之前这么做没事", "幸存者偏差：没炸不等于没缺陷，也不等于这次没炸。"),
+    ("CI 过了就行", "CI 只覆盖它检查过的部分。本次改动是否落在 CI 覆盖范围内，需要单独举证。"),
+    ("用户没要求测试", "没有用例的交付无法回归，等于把风险留给下一个人；测试不是可选项。"),
+    ("这个问题不影响主流程", "要证据：给出调用方清单，证明没有调用点会走到它。"),
+    ("我检查过了", "必须附检查方式与结果（命令/文件:行），否则视为未检查。"),
+    ("先这样交付，后面再修", "除非写进 residual_risks 并说明影响面与触发条件，否则视为未完成项。"),
+)
+
+
+def rationalization_block() -> str:
+    """把「合理化红旗」负样本表摆给评审。
+
+    与 fullstack-dev 的 release-checklist「常见合理化」表同源：它逐条反驳的是
+    **交付方自我说服**的常见句式。评审手上的材料全是交付方自己写的（summary /
+    self_checks / deviations），不把这些句式标出来，评审很容易顺着它们点头。
+    """
+    lines = ["【理性化红旗（出现下列话术一律按「未验证」处理，不得作为通过依据）】"]
+    for phrase, reply in RATIONALIZATION_REPLIES:
+        lines.append(f"- 「{phrase}」→ {reply}")
+    return "\n".join(lines)
+
+
+def falsify_block() -> str:
+    """证伪门禁：治「评审自指循环」的核心契约。
+
+    真机 run 20260924-185507：attempt 7/8 的 verify 5 条命令全绿、mechanical_blockers=0，
+    评审却仍报「renderer.py 未闭合 f-string」—— 因为上一轮的 blockers 被拼进 fixes 又喂回来，
+    评审拿旧结论当锚点照抄。所以这里把三件事写成硬契约：
+      ① 提不出反例又拿不出机械证据的，**不要提**（宁可少提，也不要用猜测占满 8K 预算）；
+      ② 每条必须带判据 + 证据（文件:行 / 报错原文 / 命令输出）；
+      ③ 已被本轮机械证据证伪的旧项，必须写明「已证伪」并停止引用。
+    """
+    return (
+        "【证伪门禁（每条阻断/必改项都要过这一关）】\n"
+        "1. 提出任何一条阻断/必改项**之前**，先尝试构造一个反例去推翻它；构造不出反例、"
+        "又拿不出机械证据的，不要提。宁可少提一条，也不要用猜测占满预算。\n"
+        "2. 每条必须附：**判据**（什么条件下它算不成立）+ **证据**（文件:行、报错原文、命令输出）。\n"
+        "3. 上一轮已提出、而本轮机械证据（运行验证 / 补丁校验 / 红线检查）已证明不成立的那些，"
+        "必须写「已证伪」并**停止引用**，不得重复列为返工项 —— 重复引用会让返工永不收敛。\n"
+        "4. 反过来同样成立：机械证据判了 fail 的项，不许用「看起来没问题」放过。\n"
+        "5. 无法在本轮材料内定论的，写进 required_fixes_detail 且 scope=needs_external，"
+        "不要硬判 in_material —— 那会让开发去改一个它无权改的东西。"
+    )
 
 
 def parts_review(
@@ -1547,6 +2262,7 @@ def parts_review(
     test: Any,
     fixes: list[str] | None = None,
     verify: Any = None,
+    rules_block: str = "",
 ) -> list[str]:
     # 评审阶段上下文最紧（8K），实现产物只保留结构：文件清单 + 自检项 + 偏差，丢掉代码正文
     impl_view = None
@@ -1590,7 +2306,17 @@ def parts_review(
             list_items=6,
         ),
         _upstream("开发实现（代码正文已省略）", impl_view, str_tokens=100, list_items=8),
-        _feedback_block("上一轮已提出的修复项（检查是否真的解决了）", fixes),
+        # 红线检查的机械证据：判负理由与「什么反例能推翻它」成对给出，评审没有凑条目的空间
+        rules_block,
+        # 措辞比原来更硬：不是"检查是否解决"，而是**要么解决、要么按反例判据写明已证伪**。
+        # 上一轮的结论从此不再是锚点，机械证据与反例才是（见 falsify_block）。
+        _feedback_block(
+            "上一轮已提出的修复项（逐条核对：真的解决了吗？还是已被本轮机械证据证伪？"
+            "已被证伪的必须写明「已证伪」并停止引用）",
+            fixes,
+        ),
+        falsify_block(),
+        rationalization_block(),
         "【任务】判定交付是否可接受，输出 verdict 与必改项。",
     ]
 
@@ -1676,9 +2402,24 @@ SYSTEM_NEW: dict[str, str] = {
         "intent 说明该文件承载什么职责；approach 说明内部结构与关键设计；"
         "minimality_reason 说明**为什么这是最小可行设计**"
         "（不做过度的扩展性预留、更重的替代方案为什么不必要），「改动少」这类空话不合格；\n"
-        "  · tasks 每项 {id, title, target_files, acceptance, depends_on}：id 按 T-01、T-02… 编号"
+        "  · tasks 每项 {id, title, target_files, acceptance, depends_on, symbols, interface, "
+        "contracts, data_model, constraints, test_hint}：id 按 T-01、T-02… 编号"
         "（开发要用它填 covers_tasks，编号必须规范）；target_files 只能引用 changes 里出现过的路径；"
         "acceptance 必须可独立验收、能直接转成测试用例；depends_on 只引用本方案里已定义的 id；\n"
+        "  · **每张 task 必须是一份完整施工图**：开发按 task 分派施工，**不再回头看需求与 PRD**，"
+        "所以下面这些必须在这里写全，缺一项开发就只能猜：\n"
+        "    - symbols：本 task 要定义的顶层符号（函数/类名）清单。它是**粒度**的机械判据，"
+        "也是开发的自检清单 —— 漏定义会被符号消失检测抓到；\n"
+        "    - interface：本 task 对外暴露的签名（如 `add(amount: float, note: str) -> int`）；\n"
+        "    - contracts.uses / contracts.exposes：跨文件契约（用谁的什么、给谁用什么）。"
+        "跨文件接口靠猜必然 `AttributeError`，写在这里才能让各 task 独立施工还拼得上；\n"
+        "    - data_model：涉及的数据结构 / 表结构定义；\n"
+        "    - constraints：本 task 必须遵守的约束（只用标准库、错误走 stderr、禁改哪些文件…）；\n"
+        "    - test_hint：**一条可执行的验收命令**（如 `python -c \"import cli; cli.CLI().add(['1.5','x'])\"`）。"
+        "它直接就是运行验证要跑的命令 —— 没有它，沙箱里常常无命令可跑。\n"
+        "  · **粒度上限（机械校验，超出即判负）**：单个 task 最多 2 个 target_files、最多 4 个 symbols。"
+        "超了说明这张图一轮写不完，**必须拆成多张**；反过来也别拆太碎 —— "
+        "task 数超过 changes 文件数的 2 倍会被提示「拆过细」。\n"
         "  · rollback：说明整体回滚方式；risks 记录本次设计引入的残余风险。\n"
         "执行步骤：① 承接 PRD，梳理核心需求、目标与验收标准；② 划分模块并明确职责边界；"
         "③ 定义模块间接口与核心数据结构；④ 落成文件级 changes 并给出最小可行性理由；"
@@ -1748,6 +2489,10 @@ SYSTEM_NEW: dict[str, str] = {
         "    **命令必须能在本环境直接跑起来**：优先用 Python 标准库（`python -m unittest`）"
         "与项目自带依赖，不要声明环境里没装的第三方工具（如 `pytest`）—— "
         "声明了只会记一条「程序不可用」，既验不了东西又白占一条命令位；\n"
+        "    ⚠ **命令必须自包含、可直接执行**：命令里要构造某个类 / 调用某个函数时，参数必须"
+        "**按【本轮已产出文件的接口】写齐**（含构造参数）。`python -c \"import m; assert m.Cls().f()\"` "
+        "在 `Cls.__init__` 需要参数时**必然**报 TypeError —— 那是命令写错，会被机械自检拦下退回重写；"
+        "需要显示器 / 网络等外部环境的对象不要直接实例化，改为断言不需要它们的纯逻辑；\n"
         "  · coverage_gaps 每项给 {gap, reason, impact}：缺口是什么、为什么覆盖不了、对结论影响多大；\n"
         "    ⚠ **交付的符号必须逐个被某条用例的 target 覆盖**，否则会被机械判为漏测并直接打回。"
         "确实无需单独用例的，必须在 coverage_gaps 里写明是哪个符号、为什么不需要 —— "
@@ -1802,16 +2547,79 @@ SYSTEM_NEW: dict[str, str] = {
 }
 
 
-def system_prompt(stage: str, project_type: str = "secondary") -> str:
-    """按项目类型取系统提示词。
+#: 系统提示词的语义化版本：``{阶段: "vN"}``。
+#:
+#: **改了某阶段的系统提示词就把它加 1**（只改错别字、补注释不必动）。
+#: 版本号会写进 llm-calls.jsonl 的每条记录与运行快照，于是「同一需求换了提示词之后
+#: 返工率/问题数变了」这类问题可以归因；没有它就只能去翻 git，还可能翻错那次运行的版本。
+#: 与 ``issues.pipeline_fingerprint()`` 的哈希互补：哈希答「是不是同一份」，
+#: 版本号答「人话是哪一版」。
+PROMPT_VERSIONS: dict[str, str] = {
+    "intake": "v1",
+    "pm": "v1",
+    "architect_assess": "v1",
+    "architect_plan": "v1",
+    "dev": "v1",
+    "test": "v1",
+    "review": "v1",
+    "advice": "v1",
+}
 
-    新建项目（`new`）没有存量代码，二开那套围绕「存量代码 / 锚点补丁 / 最小侵入 / 禁改路径」
-    的纪律对它全是错位的，因此单独一套（见 SYSTEM_NEW 的说明）。
-    未覆盖的阶段（如新建项目不会跑的 architect_assess）回退到通用版本。
+
+def prompt_version(stage: str, project_type: str = "secondary") -> str:
+    """该阶段实际使用的那份提示词的版本标识，形如 ``dev.v1`` / ``dev.v1-new``。
+
+    ``-new`` 后缀是必须的：新建项目用的是另一份**独立文本**（``SYSTEM_NEW``），
+    两份各自演进，共用一个版本号会让「哪一版出的问题」无从区分。
+    """
+    version = PROMPT_VERSIONS.get(stage, "v0")
+    if project_type == "new" and stage in SYSTEM_NEW:
+        return f"{stage}.{version}-new"
+    return f"{stage}.{version}"
+
+
+#: **新建项目 + 返工修缺陷** 的专用系统提示词。
+#:
+#: 为什么必须单独一套（真机 run 20260926-214757 四轮零进展）：`SYSTEM_NEW["dev"]` 里
+#: 「全新项目一律 add + full_symbol 整份内容」是**首轮**的正确纪律，但到了返工轮它就成了
+#: 灾难 —— 已存在的文件被整份重吐会走跨轮合并的「符号并集」分支，旧块保留 + 新块叠加 =
+#: 同一符号两份定义；而返工项又说「补全 X 模块」，模型两边打架后输出 `modify` + 片段，
+#: 补丁无原文可套用 ⇒ 文件不落盘 ⇒ `import` 失败 ⇒ 判负 ⇒ 再返工。
+#:
+#: 首轮与返工是**两类任务**（输入/目标/约束/验收都不同），硬用一套提示词兼容会很脆弱，
+#: 所以这里按「任务类型」分，而不是按具体 BUG 分角色。
+SYSTEM_NEW_BUGFIX: dict[str, str] = {
+    "dev": (
+        "你是缺陷修复工程师。本轮是 **BUG 修复**，不是重新开发一遍："
+        "只修【缺陷单】指向的问题，把它修到「失败命令转绿」。\n"
+        "步骤：① 读【缺陷单】的复现命令与日志，确认失败证据；② 定位最小相关代码；"
+        "③ 生成最小补丁；④ 确认不会破坏既有符号；⑤ 输出改动说明与风险。\n"
+        "交付形态（**与首轮不同，这是本轮最关键的一条**）：\n"
+        "  · 已存在的文件：change_type 用 `modify`，patch_mode 用 `replace_span`（anchor 取"
+        "【当前项目已有代码】里的**逐字原文**）或 `insert_after`；\n"
+        "  · **禁止**对已存在的文件用 `add` 整份重吐 —— 跨轮合并会把旧块与新块叠加，"
+        "得到两份同名符号（机械会判 `new_file_duplicate_symbol`）；\n"
+        "  · 只有缺陷单指向「文件不存在 / 整份写残」时，才用 `add` + `full_symbol` 给完整内容；\n"
+        "  · **只允许**提交缺陷单范围内文件的 edit，其余文件一条都不要给（它们会被跨轮合并保留）。\n"
+        "禁止：① 重构与全文件格式化；② 修改无关代码；③ 删除或弱化测试/断言来绕过问题；"
+        "④ 扩大修复范围；⑤ 把没修的项写进 deviations 说“已解决”。\n"
+        "验收口径：缺陷单里的失败命令退出码 0，且没有引入新的符号消失。\n" + _TAIL
+    ),
+}
+
+
+def system_prompt(stage: str, project_type: str = "secondary", round_kind: str = "feature") -> str:
+    """按项目类型 + **任务类型**取系统提示词。
+
+    两维不够（真机教训）：只有 `stage × project_type` 时，「首次开发」与「返工修缺陷」
+    共用一套契约，于是首轮的「整份新建」纪律被套到返工轮，与「最小改动」正面冲突。
+    `round_kind="bugfix"` 时切到专用那套（未覆盖的阶段仍回退）。
 
     注意：操作页面的「配置」页只覆盖 SYSTEM（二开那套），暂不含 SYSTEM_NEW ——
     让页面同时管两套会让 stage 列表翻倍，收益不足。
     """
+    if project_type == "new" and round_kind == "bugfix":
+        return SYSTEM_NEW_BUGFIX.get(stage) or SYSTEM_NEW.get(stage) or SYSTEM[stage]
     if project_type == "new":
         return SYSTEM_NEW.get(stage) or SYSTEM[stage]
     return SYSTEM[stage]

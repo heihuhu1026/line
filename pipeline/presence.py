@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -262,10 +263,8 @@ class Guard:
 
     def _beat(self) -> None:
         while not self._halt.wait(self.interval):
-            try:
+            with contextlib.suppress(OSError):
                 touch(self.run_dir, self._stage)
-            except OSError:
-                pass
 
     @property
     def stage(self) -> str:
@@ -274,10 +273,8 @@ class Guard:
     @stage.setter
     def stage(self, value: Any) -> None:
         self._stage = str(value or "")
-        try:
+        with contextlib.suppress(OSError):
             touch(self.run_dir, self._stage)
-        except OSError:
-            pass
 
     def stop(self) -> None:
         self._halt.set()

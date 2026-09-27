@@ -1,11 +1,17 @@
 """阶段产物的 JSON Schema（决策 4：强制契约）与轻量校验器。
 
 不引入 jsonschema 依赖（本机未安装），实现所需的 draft-07 子集：
-type / required / properties / items / enum / minItems / maxItems / minimum / maximum。
+type / required / properties / items / enum / minItems / maxItems / minimum / maximum
+/ additionalProperties / minLength / maxLength / pattern。
 服务端用 ollama 的 format=schema 强约束，客户端再做一次校验作为兜底。
+
+对象默认按**封闭契约**校验（见 ``_close_all_objects``）：schema 未声明的字段会被判违约。
+依据是真机 41 条模型输出**零多余字段**（``format=schema`` 的 grammar 已经把形状卡死），
+所以收紧不会误判；收紧的目的是防「将来换掉 grammar 约束 / 走 mock」时契约静默漂移。
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 SEVERITY = ["high", "medium", "low"]
@@ -540,6 +546,11 @@ VERIFY_REPORT = {
         "commands": {"type": "array", "items": VERIFY_COMMAND},
         "problems": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "array", "items": {"type": "string"}},
+        # 归因（机制判定，不是模型判断）：交付物自身是否有机械证据表明有问题；
+        # test_defects 列出「命令自身不可执行 / 拿不到可运行证据」这类**测试层**缺陷
+        # —— 开发无权修改测试命令，据此让它返工只会把正确的实现改坏。
+        "impl_fail": {"type": "boolean"},
+        "test_defects": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["verdict", "commands"],
 }
@@ -665,6 +676,77 @@ PRE_SCHEMAS: dict[str, dict[str, Any]] = {
     "global_architecture_analysis": GLOBAL_ARCHITECTURE,
 }
 
+# ------------------------------------------------- 方案·接口骨架（冻结基准，非独立阶段）
+# 为什么单独一次调用（与 `architect_plan` 同 tag、**共用同一段 14B 驻留**）：
+#   真机 20260927-073518 / 082239 / 060300 的方案里 `tasks[].symbols` **连续多轮全空** ——
+#   开发没有接口准绳、只能按类名猜，跨文件必然对错配；而 verify 的跨文件契约校验
+#   （`contract_check`）核的是方案里 `interface` / `contracts`，那两项契约**只提示不强制**、
+#   通常为空 ⇒ 校验形同虚设。把「定接口」从「写方案」里拆出来单独喂一次：模型只需**枚举结构**，
+#   不写任何函数体（14B 在清单类输出上稳定得多），产出的摘要就能同时给 dev 当准绳、
+#   给覆盖审计当判据、给契约校验当基准。
+# 刻意**不登记进 STAGE_SCHEMAS**：`flow.validate()` 要求 STAGE_MODELS 与流节点**完全相等**，
+# 而这是方案阶段内部的第二次调用，不是新阶段（见 orchestrator._freeze_skeleton）。
+SKELETON = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "files": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string"},
+                    "classes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string"},
+                                "bases": {"type": "string"},
+                                "attributes": {"type": "array", "items": {"type": "string"}},
+                                "methods": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "params": {"type": "string"},
+                                        },
+                                        "required": ["name"],
+                                    },
+                                },
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "functions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string"},
+                                "params": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "constants": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["path"],
+            },
+        },
+        "entry": {"type": "string"},
+        "notes": {"type": "string"},
+    },
+    "required": ["files"],
+}
+
+
 STAGE_SCHEMAS: dict[str, dict[str, Any]] = {
     "intake": INTAKE,
     "pm": SCOPE,
@@ -676,6 +758,41 @@ STAGE_SCHEMAS: dict[str, dict[str, Any]] = {
     "review": REVIEW,
     "human_review": HUMAN_REVIEW,
 }
+
+# --------------------------------------------------------------- 对象封闭化
+def _close_objects(node: Any) -> None:
+    """递归给「声明了 properties 的对象」补上 ``additionalProperties: false``。
+
+    只处理有 ``properties`` 的节点：没有 properties 的对象语义上是自由字典，
+    关闭它会拒掉一切内容（当前 schema 里没有这种节点，这里只是留一道保险）。
+    """
+    if isinstance(node, dict):
+        if node.get("type") == "object" and node.get("properties"):
+            node.setdefault("additionalProperties", False)
+        for value in node.values():
+            _close_objects(value)
+    elif isinstance(node, list):
+        for item in node:
+            _close_objects(item)
+
+
+def _close_all_objects() -> None:
+    """把封闭化应用到全部顶层契约（按 id 去重，避免同一 schema 被走两遍）。
+
+    已实测 ollama 接受该关键字并正常生成（用 qwen3:1.7b 试过
+    additionalProperties / minLength / maxLength / pattern 三种写法，
+    均返回合规 JSON、无 grammar 构建错误）。
+    """
+    seen: set[int] = set()
+    for schema in (*STAGE_SCHEMAS.values(), *PRE_SCHEMAS.values(), ADVICE, OPEN_QUESTION):
+        if id(schema) in seen:
+            continue
+        seen.add(id(schema))
+        _close_objects(schema)
+
+
+_close_all_objects()
+
 
 # --------------------------------------------------------------- 轻量校验器
 _TYPE_MAP = {
@@ -712,12 +829,37 @@ def validate(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str
         errors.append(f"{path}: 取值 {instance!r} 不在 {schema['enum']} 内")
 
     if isinstance(instance, dict):
+        props = schema.get("properties") or {}
         for key in schema.get("required", []):
             if key not in instance:
                 errors.append(f"{path}: 缺少必填字段 {key}")
-        for key, sub in schema.get("properties", {}).items():
+        for key, sub in props.items():
             if key in instance:
                 errors.extend(validate(instance[key], sub, f"{path}.{key}"))
+        # 封闭契约：schema 未声明的字段判违约。
+        # 真机 41 条模型输出零多余字段 ⇒ 不会误判；这条是防「grammar 约束被绕过」的兜底。
+        # 只在声明了 properties 时才检查 —— 没有 properties 的对象语义上是自由字典。
+        extra_clause = schema.get("additionalProperties")
+        if extra_clause is not None and props:
+            for key in instance:
+                if key in props:
+                    continue
+                if extra_clause is False:
+                    errors.append(f"{path}: 不允许的额外字段 {key}（契约未声明）")
+                elif isinstance(extra_clause, dict):
+                    errors.extend(validate(instance[key], extra_clause, f"{path}.{key}"))
+    elif isinstance(instance, str):
+        if "minLength" in schema and len(instance) < schema["minLength"]:
+            errors.append(f"{path}: 长度 {len(instance)} 小于 minLength {schema['minLength']}")
+        if "maxLength" in schema and len(instance) > schema["maxLength"]:
+            errors.append(f"{path}: 长度 {len(instance)} 超过 maxLength {schema['maxLength']}")
+        if "pattern" in schema:
+            try:
+                matched = re.search(schema["pattern"], instance) is not None
+            except re.error:
+                matched = True  # schema 自带的正则写错了，不该算模型违约
+            if not matched:
+                errors.append(f"{path}: {instance[:60]!r} 不匹配 pattern {schema['pattern']}")
     elif isinstance(instance, list):
         if "minItems" in schema and len(instance) < schema["minItems"]:
             errors.append(f"{path}: 至少需要 {schema['minItems']} 项，实际 {len(instance)}")

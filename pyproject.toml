@@ -1,0 +1,56 @@
+[project]
+name = "line-pipeline"
+version = "0.1.0"
+description = "二次开发需求流水线：本地 Ollama 多阶段交付（流水线本体仅用标准库）"
+# 代码里用了 X | Y 这类新语法与 match 之外的新特性，按实测环境钉在 3.12。
+requires-python = ">=3.12"
+# **运行时依赖保持为空，这是刻意的设计决策**（见 CONTEXT.md：「仅用标准库」）。
+# 任何环境 clone 下来就能跑，不需要装任何包 —— 别为了少写几十行校验代码而破例。
+dependencies = []
+
+[project.optional-dependencies]
+# 只有开发态才用得上。装了才有 lint，不装完全不影响运行。
+dev = ["ruff>=0.6"]
+
+# --------------------------------------------------------------------------- ruff
+# 规则集是**实测挑出来的**，不是照抄模板：
+#   · 全量 E,W,F 命中 1698 条，其中绝大多数是 E501（行长）—— 本项目注释长且是中文，
+#     按字符数限长会把解释性注释逼成碎片，所以关掉 E501，只留 line-length 供格式化参考；
+#   · 加 RUF 后从 132 条飙到 10000+ 条，来源是 RUF001/002/003（「有歧义的 Unicode 字符」）
+#     —— 它把**中文全角标点**（，。：（））全部当成疑似笔误，对中文注释项目全是误报，故忽略；
+#   · UP（pyupgrade）与 ARG 各只剩个位数增量，但 UP 会大面积改写既有标注风格，
+#     收益低而改动面大，本阶段不引入。
+[tool.ruff]
+target-version = "py312"
+# 99% 的行在 103 字符以内；取 110 只约束新代码，不逼人回头重排既有注释
+line-length = 110
+exclude = ["runs", ".git", "__pycache__", "*.orig"]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle：语法级错误
+    "F",               # pyflakes：未使用导入 / 未定义名字 / 遮蔽
+    "B",               # flake8-bugbear：真实缺陷模式（循环变量闭包、可变默认参数…）
+    "C4",              # flake8-comprehensions
+    "SIM",             # flake8-simplify
+]
+ignore = [
+    "E501",     # 行长交给 formatter；中文注释按字符数限长会碎成多行
+    "RUF001",   # 以下三条对中文全角标点全是误报（见上）
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 冒烟脚本大量用局部 import 做隔离（先设环境变量再导入 config），E402 在此是**必要的**
+"tools/smoke_mock.py" = ["E402"]
+"tools/smoke_console.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pipeline"]
+
+# --------------------------------------------------------------------------- 类型检查
+# 刻意**不启用 mypy**：项目里大量动态结构（schema 驱动的产物、*_mod 别名导入、鸭子类型
+# 的 client），加上既有的 # type: ignore，全量跑会出几百条噪音，真正的问题会被淹掉。
+# 要用的话按文件粗筛，别接进提交钩子：
+#   python -m mypy --follow-imports=skip --ignore-missing-imports pipeline/<file>.py

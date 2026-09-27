@@ -145,10 +145,14 @@ class GateSpec:
 
 
 GATE_SPECS: list[GateSpec] = [
-    GateSpec("pm", "conditional", "PM 未决项闸门",
-             "PM 提出了未决项（已带默认取值），确认或改写 prd.md 第 6 节后再继续。"),
+    # PM 强控（2026-09-26）：判据是「产物里还有不是陈述的条目」—— 未裁决的 open_questions，
+    # 或 unknowns / clarifying_questions 这两列未明确项。裁决不完不放行，续跑时会重新判定；
+    # 不可通过环境变量 / 页面配置关闭（见 config.py 该处说明）。
+    GateSpec("pm", "conditional", "PM 未决项闸门（强控）",
+             "PM 还有未成为陈述的条目（未裁决 / 未明确）。请逐条裁决，"
+             "或把未明确项写成确定结论（清空 unknowns / clarifying_questions）后再继续。"),
     GateSpec("intake", "conditional", "需求补强闸门",
-             "以下缺失要素的默认假设需要人工确认。"),
+             "以下缺失要素还没有人工裁决，不得带进下游。"),
     GateSpec("human_review", "mandatory", "人工审核闸门"),
 ]
 
@@ -186,6 +190,22 @@ def is_linear_hop(src: str, dst: str) -> bool:
     return LINEAR_EDGES.get(src) == dst
 
 
+#: 游标 -> 处理函数名，由 ``orchestrator`` 在导入时登记（见 :func:`register_step_handlers`）。
+#: 本模块**不 import** ``orchestrator``（那会形成循环），所以走登记而不是直接引用。
+_STEP_HANDLERS: dict[str, str] = {}
+
+
+def register_step_handlers(mapping: dict[str, str]) -> None:
+    """登记「游标 -> 执行函数名」。由 ``orchestrator`` 在模块导入末尾调用一次。"""
+    _STEP_HANDLERS.clear()
+    _STEP_HANDLERS.update(mapping)
+
+
+def step_handlers() -> dict[str, str]:
+    """当前的执行函数登记表（副本，供页面/测试查看）。"""
+    return dict(_STEP_HANDLERS)
+
+
 # --------------------------------------------------------------------- 导出 / 校验
 def mermaid() -> str:
     """把拓扑渲染成 Mermaid flowchart（便于贴进文档 / 可视化）。"""
@@ -194,7 +214,7 @@ def mermaid() -> str:
     for node, table in PRE_EDGES.items():
         lines.append(f'    START((需求)) -.-> {node}["{node}<br/>入口总闸"]')
         for branch, target in table.items():
-            dst = f'MODS[["各模块 <br/>子流水线"]]' if target.startswith("@") else target
+            dst = 'MODS[["各模块 <br/>子流水线"]]' if target.startswith("@") else target
             lines.append(f"    {node} -.->|{branch}| {dst}")
     for node, target in LINEAR_EDGES.items():
         if target:
@@ -312,6 +332,23 @@ def validate() -> list[str]:
             problems.append(f"闸门 {spec.stage}（{spec.kind}）不是可暂停阶段")
     if "human_review" in PAUSABLE_NODES:
         problems.append("human_review 不应出现在可暂停阶段里（由流程自动触发）")
+
+    # 6) 执行函数覆盖：每个游标都要有处理函数。
+    #    以前阶段分发是 ``orchestrator._step`` 里的一条 if 链 —— 新增阶段时「注册表都改对了、
+    #    忘了加 if 分支」只有真机跑到那个游标才炸（报「未知编排游标」）。现在两张表都在，
+    #    这里核对它们的值集是否一致即可在启动期发现。
+    #    未登记时跳过（任何没导入 orchestrator 的场景都不该因此误报）。
+    if _STEP_HANDLERS:
+        expect_steps = {n for n in EXEC_ORDER if n != TERMINAL}
+        got_steps = set(_STEP_HANDLERS)
+        if got_steps != expect_steps:
+            problems.append(
+                f"orchestrator 的执行函数登记与 EXEC_ORDER 不一致："
+                f"缺 {sorted(expect_steps - got_steps)} / 多 {sorted(got_steps - expect_steps)}"
+            )
+        for node, fn in _STEP_HANDLERS.items():
+            if not isinstance(fn, str) or not fn.startswith("_"):
+                problems.append(f"游标 {node} 的处理函数名 {fn!r} 不像私有方法名")
 
     return problems
 

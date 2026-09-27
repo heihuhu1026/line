@@ -45,13 +45,36 @@ from typing import Any, Callable
 
 from . import flow, ga_prompt, local_config, runstore, schemas
 from .budget import estimate_tokens, fit_prompt
-from .config import MAX_REWORK_ROUNDS, RUNS_DIR, REVIEW_EVERY, STAGE_MODELS
+from .config import (
+    GA_MAX_MODULES,
+    MAX_REWORK_ROUNDS,
+    MULTI_DELIVERABLE_WORDS,
+    REVIEW_EVERY,
+    RUNS_DIR,
+    STAGE_MODELS,
+)
 
 #: 节点名取自流定义真源，避免两处硬编码漂移
 GA_NODE: str = flow.PRE_NODES[0]
 
+#: GA 这一步的留痕文件名（写在**发起运行**的目录里，与作业目录里的 ga.json 同名同构）。
+#: ``_`` 开头不是必须的：它不匹配 ``runstore.STAGE_FILE_RE``（那要求文件名以数字开头），
+#: 因此不会被当成阶段快照、也不影响产物读取。
+GA_ARTIFACT_NAME: str = "ga.json"
+
 #: 作业目录前缀。``_`` 开头 ⇒ ``runstore.list_runs`` 不会把它当运行列出来
 JOBS_DIRNAME = "_jobs"
+
+#: 作业级**统一验收**产物文件名（存作业目录，不是运行目录 —— 它审的是整组产出）。
+JOB_REVIEW_NAME: str = "human_review.json"
+
+#: 作业相位的中文名（日志与页面共用一套说法）
+JOB_PHASE_CN: dict[str, str] = {
+    "pm": "PM 前置阶段（全模块先出 PM，待人工统一确认）",
+    "deliver": "下游串行阶段（各模块从方案起跑到底）",
+    "review": "统一验收阶段（整合全部模块产出后审一次）",
+    "done": "已交付",
+}
 
 MODES = ("auto", "always", "off")
 SCALES = ("small", "large")
@@ -232,15 +255,28 @@ class Scale:
     source: str = ""  # off / forced / prejudge / gateway / degraded
 
 
-def prejudge(requirement: str, stats: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
+def prejudge(
+    requirement: str,
+    stats: dict[str, Any] | None = None,
+    project_type: str = "secondary",
+) -> tuple[bool, list[str]]:
     """**零模型调用**的规模预判：只有疑似大型才值得去调 GA（14B 一次几十秒）。
 
     这是解决「鸡生蛋」的地方 —— 要判 small/large 才决定是否调 GA，但 GA 本身最贵。
-    规则保守（宁可多调一次 GA，也不漏拆）：**强信号**命中即疑似大型，
-    否则需要**两条弱信号**。
+
+    两类项目的判据**必须分开**（2026-09-26）：
+
+    * 二次开发（有存量）：规则同前 —— 存量规模是强信号；否则需要两条弱信号
+      （跨模块字眼 / 枚举条目 / 需求较长）。
+    * **新建项目（无存量）：「需求写得详细」不是规模证据。**
+      一份把一个小成品写得很细的需求（例：贪吃蛇，1170 字 + 26 条枚举）会让"枚举条目"
+      与"字数"两条弱信号同时命中，于是白调一次 14B 还拆出 8 个模块（真机 20260926-170359），
+      而交付物始终只是那几个文件。新建项目只有在需求**明确要求多个可独立交付的子系统**
+      （前端/后端/微服务/多端/插件系统…见 ``config.MULTI_DELIVERABLE_WORDS``）时才算疑似大型。
     """
     stats = stats or {}
     reasons: list[str] = []
+    is_new = str(project_type or "") == "new"
 
     # 强信号：存量本身就大 —— 大仓库上的任何需求都值得先划边界
     top_dirs = list(stats.get("top_dirs") or [])
@@ -253,6 +289,13 @@ def prejudge(requirement: str, stats: dict[str, Any] | None = None) -> tuple[boo
         reasons.append(
             f"存量规模偏大（顶层目录 {len(top_dirs)} / 文件 {stats.get('files')} / 行 {stats.get('lines')}）"
         )
+
+    if is_new and not big_repo:
+        # 新建项目：只认「多个可独立交付的子系统」这一条硬线索
+        cues = sorted({w for w in MULTI_DELIVERABLE_WORDS if str(w) in requirement.lower() or w in requirement})
+        if not cues:
+            return False, ["新建项目且需求未指明多个可独立交付的子系统（需求详细程度不作为规模证据）"]
+        return True, [f"新建项目且需求要求多个可独立交付的子系统：{'、'.join(cues[:6])}"]
 
     # 弱信号：需求文本里的跨模块/全局性字眼
     hits = sorted({w for w in SCOPE_WORDS if w in requirement})
@@ -270,6 +313,65 @@ def prejudge(requirement: str, stats: dict[str, Any] | None = None) -> tuple[boo
 
     weak = len(reasons) - (1 if big_repo else 0)
     return (big_repo or weak >= 2), reasons
+
+
+def ga_granularity_problems(ga: dict[str, Any]) -> list[str]:
+    """GA 拆分粒度的**机械校验**：过度拆分 / 职责重叠（判定为"伪拆分"则降级 small）。
+
+    为什么要有它：GA 提示词对模块数量没有任何约束，而 ``derive_scale`` 的判据是
+    「模块数 ≥ 2 就 large」。真机 20260926-170359 把一个贪吃蛇拆成 8 个模块
+    （核心逻辑/渲染/数据存储/输入/配置/测试框架/扩展接口/性能优化），7 个都直接依赖 M-01，
+    8 条完整流水线接力改同一批文件 —— 成本 ≈ ×8，成品还是那几个文件。
+
+    三条判据（前两条判负，第三条只提示）：
+      · 模块数 > ``config.GA_MAX_MODULES``（默认 5）—— 超过上限即过度拆分；
+      · 两个模块的 ``scope_in`` 高度重叠（Jaccard ≥ 0.6）—— 职责重叠，不是两个交付边界；
+      · 「1 主干 + N 附件」（唯一无依赖模块被其余模块全部直接依赖，且附件之间无依赖）
+        —— 形状可疑，但可能真是"公共库 + 若干接入"，故只提示不判负。
+    """
+    modules = [m for m in (ga.get("modules") or []) if isinstance(m, dict)]
+    order = [str(x or "").strip() for x in (ga.get("execution_order") or [])]
+    problems: list[str] = []
+    if len(modules) > GA_MAX_MODULES:
+        problems.append(
+            f"拆出 {len(modules)} 个模块，超过粒度上限 {GA_MAX_MODULES}（疑似把功能点/横切关注点"
+            "当成了模块）"
+        )
+    keys: dict[str, set[str]] = {}
+    for module in modules:
+        mid = str(module.get("module_id") or "").strip()
+        keys[mid] = _scope_keys(module)
+    ids = [mid for mid in keys if mid]
+    for idx, left in enumerate(ids):
+        for right in ids[idx + 1 :]:
+            a, b = keys[left], keys[right]
+            if not a or not b:
+                continue
+            overlap = len(a & b) / len(a | b)
+            if overlap >= 0.6:
+                problems.append(
+                    f"{left} 与 {right} 的 scope_in 重叠度 {overlap:.0%}（不是两个交付边界）"
+                )
+    return problems
+
+
+def _scope_keys(module: dict[str, Any]) -> set[str]:
+    """把模块的 ``scope_in`` 归一成关键词集合（用于重叠判定）。
+
+    **只看 scope_in，不看 responsibility**：后者常常是套话（"职责"、""核心逻辑实现""），
+    拿它判重叠会误伤 —— 两个模块的职责描述措辞一样不代表它们真的改同一处。
+    scope_in 为空则返回空集（无从判定就不判，宁可漏判也不误判）。
+
+    只做确定性归一（按 2 字滑窗切 CJK、按词切 ASCII）：措辞不同不算重叠。
+    """
+    text = " ".join(str(x) for x in (module.get("scope_in") or []))
+    out: set[str] = set()
+    for word in re.findall(r"[A-Za-z0-9_]{3,}", text):
+        out.add(word.lower())
+    cjk = "".join(ch for ch in text if _CJK.match(ch))
+    for idx in range(len(cjk) - 1):
+        out.add(cjk[idx : idx + 2])
+    return out
 
 
 def derive_scale(ga: dict[str, Any]) -> Scale:
@@ -429,13 +531,17 @@ def audit_paths(
     from .orchestrator import Orchestrator  # 延迟导入：本模块要能被纯查询路径轻量加载
 
     stem = Orchestrator._path_stem
+    # 规则侧走 `_path_rule_stem`：只有「它真是一条路径」才参与机械判定 ——
+    # 自由文本规则（"game_logic.py中tkinter导入"）按 stem 折叠会变成整个文件禁区，
+    # 真机上让模块自己的交付物成了禁改路径（见 orchestrator._path_rule_stem）。
+    rule_stem = Orchestrator._path_rule_stem
 
     def hit(path: str, rules: Any) -> bool:
         target = stem(path)
         if not target:
             return False
         for rule in rules or []:
-            base = stem(rule)
+            base = rule_stem(rule)
             if base and (target == base or target.startswith(base + "/")):
                 return True
         return False
@@ -649,6 +755,71 @@ def _jobs_root(runs_dir: str | Path) -> Path:
     return Path(runs_dir) / JOBS_DIRNAME
 
 
+def _save_ga_artifacts(
+    run_dir: str | Path | None,
+    *,
+    ga: dict[str, Any] | None,
+    problems: list[str],
+    stats: dict[str, Any],
+    scale: str | None,
+) -> None:
+    """把 GA 这一步的**原始产物与结论**落到发起运行的目录里（没给目录就跳过）。
+
+    为什么必须留痕：GA 跑在编排器之前，它的产物不进 ``traces.jsonl`` / ``llm-calls.jsonl``。
+    真机踩过 —— 降级 small 时只剩日志里那几行「语义自检不通过：接口 IC-01 的 to_module=M-02
+    不在模块清单里」，原始 ``modules`` / ``interface_contracts`` 一份都没存，事后完全无法
+    复盘"模型到底拆成了什么样、为什么不合自检"。
+    """
+    if not run_dir:
+        return
+    base = Path(run_dir)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            base / GA_ARTIFACT_NAME,
+            {
+                # status 让页面能区分「正在判定」与「已出结论」（见 _mark_ga_running）
+                "status": "done",
+                # None = 没走到规模判定（GA 不可用 / 粒度不通过）
+                "scale": scale,
+                "problems": list(problems or []),
+                "stats": stats,
+                "ga": ga,
+            },
+        )
+    except OSError:
+        return  # 留痕失败不该拖垮流水线
+
+
+def _mark_ga_running(run_dir: str | Path | None, stats: dict[str, Any]) -> None:
+    """在调用 GA 模型**之前**写一份「正在判定」的轻量痕迹。
+
+    为什么需要：GA 跑在流水线主循环之前，这段时间既没有 ``state.json``、日志也可能还没
+    刷出来（尤其没设 ``PYTHONUNBUFFERED`` 时）。页面于是只能显示一条空运行，人看不出
+    它是在判定还是死了。这份痕迹只回答一个问题：**现在到哪一步了**。
+    """
+    if not run_dir:
+        return
+    base = Path(run_dir)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            base / GA_ARTIFACT_NAME,
+            {
+                "status": "running",
+                "stage": "gateway",
+                "started_at": _now(),
+                "stats": stats,
+            },
+        )
+    except OSError:
+        return  # 留痕失败不该拖垮流水线
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def job_dir(runs_dir: str | Path, job_id: str) -> Path:
     return _jobs_root(runs_dir) / job_id
 
@@ -706,19 +877,33 @@ def list_jobs(runs_dir: str | Path) -> list[dict[str, Any]]:
 
 
 def job_status(data: dict[str, Any]) -> str:
-    """作业级状态：blocks 优先 —— 有 blocked 就说明需要人工裁决。"""
+    """作业级状态：blocks 优先 —— 有 blocked 就说明需要人工裁决。
+
+    两个**待人工**的相位要单独报出来（页面据此显示「待你确认 PM」/「待你统一验收」）：
+      · ``awaiting_pm``     —— 有模块停在 pm 上（PM 前置阶段产出了待裁决项）；
+      · ``awaiting_review`` —— 所有模块都跑完了，等作业级统一验收。
+    """
     modules = data.get("modules") or []
     if not modules:
         return "empty"
+    phase = str(data.get("phase") or "")
+    # 相位是**权威**：人工已经通过统一验收（phase=done）时，模块行的 `paused` 只是
+    # 打回/复核留下的历史痕迹，不该把整组说成"已暂停"
+    if phase == "done":
+        return "done"
     statuses = [str(m.get("status") or "pending") for m in modules]
     if any(s == "blocked" for s in statuses):
         return "blocked"
-    if all(s in ("done", "skipped") for s in statuses):
-        return "done" if all(s == "done" for s in statuses) else "partial"
     if any(s == "running" for s in statuses):
         return "running"
+    if any(s == "pm_paused" for s in statuses):
+        return "awaiting_pm"
     if any(s == "paused" for s in statuses):
         return "paused"
+    if phase == "review":
+        return "awaiting_review"
+    if all(s in ("done", "skipped") for s in statuses):
+        return "done" if all(s == "done" for s in statuses) else "partial"
     if any(s == "pending" for s in statuses):
         return "pending"
     return "unknown"
@@ -737,6 +922,10 @@ def create_job(
     grounding: list[str] | None = None,
     notes: list[str] | None = None,
     job_id: str | None = None,
+    project_type: str = "secondary",
+    review_every: int | None = None,
+    max_rework: int | None = None,
+    pause_after: list[str] | None = None,
 ) -> dict[str, Any]:
     """把 GA 产物落成一个**作业**：模块进度表 + 子需求文本 + 概览。
 
@@ -764,7 +953,7 @@ def create_job(
     ambiguous = {d: owners for d, owners in claims.items() if len(owners) > 1}
 
     rows: list[dict[str, Any]] = []
-    for index, module in enumerate(ordered, start=1):
+    for _index, module in enumerate(ordered, start=1):
         mid = str(module.get("module_id") or "").strip()
         owned = sorted(name for name, owners in claims.items() if mid in owners)
         others = sorted(name for name, owners in claims.items() if mid not in owners)
@@ -798,6 +987,15 @@ def create_job(
         "requirement": requirement,
         "repo": str(repo) if repo else None,
         "forbidden": forbidden,
+        # 相位：新建的作业一律从 **PM 前置阶段** 开始（全模块先出 PM → 人工统一确认 → 下游）。
+        "phase": "pm",
+        # 运行参数必须**落盘**：续跑作业走的是另一条进程链（`--resume-job` 只带 job_id），
+        # 没存就只能退回代码默认值 —— 新建项目的模块会被用「二次开发」提示词重跑，
+        # max_rework 也会掉回默认（真机 job-20260926-154657：project_type 丢失、5→2）。
+        "project_type": project_type if project_type in ("new", "secondary") else "secondary",
+        "review_every": review_every,
+        "max_rework": max_rework,
+        "pause_after": list(pause_after or []),
         "stats": stats,
         "ga": ga,
         "modules": rows,
@@ -971,6 +1169,13 @@ def dispatch(
     scale_override: str | None = None,
     client: Any = None,
     forbidden: list[str] | None = None,
+    project_type: str | None = None,
+    review_every: int | None = None,
+    max_rework: int | None = None,
+    pause_after: list[str] | None = None,
+    #: 发起运行（页面那次 run）的目录：GA 的原始产物与结论写进这里留痕。
+    #: 不传则不落盘（纯 CLI 场景没有 run 目录）。
+    run_dir: str | Path | None = None,
     logger: Callable[[str], None] = print,
 ) -> Route:
     """入口总闸的**唯一决策入口**：判规模 → 调 GA（必要时）→ 建作业 / 请求直通。
@@ -995,7 +1200,7 @@ def dispatch(
     stats = repo_stats(repo)
 
     if forced != "large" and mode == "auto":
-        suspect, why = prejudge(requirement, stats)
+        suspect, why = prejudge(requirement, stats, project_type or "secondary")
         if not suspect:
             return Route(
                 "small",
@@ -1009,6 +1214,10 @@ def dispatch(
     if client is None:
         return Route("small", ["没有可用模型客户端，降级直通"], "degraded", stats=stats, forbidden=fbd)
 
+    # 调模型**之前**先落一份「正在判定」的痕迹：GA 一次几十秒到几分钟，而这段时间
+    # 没有任何 state.json（GA 跑在流水线主循环之前）—— 页面上只剩一条 0 字节日志的空运行，
+    # 人无法区分「在判定」与「卡死」（真机 20260926-154413 就卡在这个认知盲区里）。
+    _mark_ga_running(run_dir, stats)
     ga, meta, problems, grounding = analyze(
         client, requirement, repo=repo, forbidden=fbd, stats=stats, logger=logger
     )
@@ -1016,13 +1225,35 @@ def dispatch(
         logger("== 入口总闸：全局架构不可用，降级为小项目直通")
         for item in problems:
             logger(f"   - {item}")
+        _save_ga_artifacts(run_dir, ga=None, problems=problems, stats=stats, scale=None)
         return Route("small", ["GA 不可用，降级直通"], "degraded", notes=problems, stats=stats, forbidden=fbd)
+
+    # 粒度机械校验：GA 自己对模块数量没有任何约束，而「模块数 ≥ 2 就 large」——
+    # 不拦一下就会出现"一个贪吃蛇拆 8 个模块"（真机 20260926-170359）。
+    granularity = ga_granularity_problems(ga)
+    if granularity:
+        logger("== 入口总闸：GA 拆分粒度不通过，降级为小项目直通")
+        for item in granularity:
+            logger(f"   - {item}")
+        _save_ga_artifacts(run_dir, ga=ga, problems=granularity, stats=stats, scale=None)
+        return Route(
+            "small",
+            ["GA 拆分粒度不通过（伪拆分），按单模块跑"],
+            "degraded",
+            ga=ga,
+            notes=granularity,
+            stats=stats,
+            forbidden=fbd,
+        )
 
     scale = derive_scale(ga)
     notes = [f"接地提示：{x}" for x in grounding]
     if scale.scale == "small":
         logger(f"== 入口总闸：全局架构判定为单模块（{'；'.join(scale.reasons) or '无拆分理由'}），直通")
+        _save_ga_artifacts(run_dir, ga=ga, problems=[], stats=stats, scale="small")
         return Route("small", scale.reasons, "gateway", ga=ga, notes=notes, stats=stats, forbidden=fbd)
+
+    _save_ga_artifacts(run_dir, ga=ga, problems=[], stats=stats, scale="large")
 
     job = create_job(
         requirement=requirement,
@@ -1035,6 +1266,11 @@ def dispatch(
         stats=stats,
         grounding=grounding,
         notes=notes,
+        # 运行参数一并落盘：作业续跑只带 job_id，没存就只能用代码默认值
+        project_type=project_type or "secondary",
+        review_every=review_every,
+        max_rework=max_rework,
+        pause_after=pause_after,
     )
     logger(
         f"== 入口总闸：判定大型（{'；'.join(scale.reasons)}），"
@@ -1101,6 +1337,361 @@ def _skip_dependents(data: dict[str, Any], blocked: str) -> None:
                     break
 
 
+def _run_options(
+    data: dict[str, Any],
+    *,
+    repo: Any = None,
+    pause_after: Any = None,
+    review_every: Any = None,
+    max_rework: Any = None,
+    project_type: Any = None,
+) -> dict[str, Any]:
+    """合并运行参数：**显式传入 > 作业落盘值 > 代码默认**。
+
+    为什么必须有它：续跑作业是**另一条进程链**（``--resume-job`` 只带 job_id），
+    cli 的 argparse 默认值（``--project-type secondary``、review_every / max_rework 的默认）
+    会冒充"用户显式选择"，把作业原本的配置静默覆盖。真机 job-20260926-154657 就是这样
+    把「新建项目」用**二次开发**提示词重跑、max_rework 从 5 掉到 2 的 ——
+    于是开发满口「存量代码评估 / 禁改路径」并因"禁区"拒绝实现，反复返工到触顶。
+    所以这些参数一律默认 ``None``：「没传」与「传了默认值」必须能区分。
+    """
+    def pick(value: Any, key: str, fallback: Any) -> Any:
+        # 注意这里是 `is not None`（空列表也算显式）：`--no-pause` 传的就是 `[]`，
+        # 语义是「清空人工闸门」，不能被当成「没传」而退回落盘值。
+        if value is not None and value != "":
+            return value
+        stored = data.get(key)
+        return fallback if stored in (None, "", []) else stored
+
+    return {
+        "repo": pick(repo, "repo", None),
+        "pause_after": list(pick(pause_after, "pause_after", []) or []),
+        "review_every": pick(review_every, "review_every", REVIEW_EVERY),
+        "max_rework": pick(max_rework, "max_rework", MAX_REWORK_ROUNDS),
+        "project_type": pick(project_type, "project_type", "secondary"),
+    }
+
+
+def _archive_previous_run(
+    run_dir: Path, logger: Callable[[str], None], run_id: str
+) -> int:
+    """重跑一个模块前，把上一代残留的阶段快照归档到 ``superseded/``。
+
+    为什么必须做：作业被中断后 ``--resume-job`` 会用**同一个 run_id** 重跑该模块，
+    而 ``Orchestrator.run()`` 对已存在的运行目录只做 ``mkdir(exist_ok=True)``、不归档。
+    于是两代产物混在一个目录里 —— 真机 job-20260926-154657-M-01 就有 seq=3 两份
+    （上一代 architect_plan / 这一代 architect_assess）、seq=4 两份（dev / architect_plan），
+    阶段列表与检查点时间线重复且乱序，看「最新产物」极易读错。
+    归档口径复用 runstore 既有的那个（人工 ``--from`` 打回走的也是它）。
+    """
+    if not run_dir.exists():
+        return 0
+    moved = runstore.archive_stages(run_dir, list(runstore.FLOW_ORDER))
+    if moved:
+        logger(f"== 模块 {run_id}：归档上一代阶段快照 {len(moved)} 个（superseded/）")
+    return len(moved)
+
+
+def _pm_scope_of(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """从模块运行的 state.json 里取 (PM 产物, 人工裁决记录)。"""
+    state = runstore.read_state(run_dir) or {}
+    artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+    scope = artifacts.get("scope") if isinstance(artifacts, dict) else None
+    if not isinstance(scope, dict):
+        scope = state.get("scope") if isinstance(state.get("scope"), dict) else {}
+    decisions = state.get("pm_decisions") or []
+    return scope, list(decisions)
+
+
+def job_pm_blockers(runs_dir: str | Path, data: dict[str, Any]) -> dict[str, list[str]]:
+    """**PM 统一人工环节**的判据：{module_id: [还没解决的人话条目]}，空 = 可以进下游。
+
+    与模块内那套是同一份实现（``orchestrator.pm_unresolved_items``）：读该模块的 PM 产物
+    与人工裁决，列出「未裁决的 open_questions」与「未明确的 unknowns/clarifying_questions」。
+    作业层据此做到**一次人工处理全部模块**：只要还有一个模块没确认完，就不放行进下游。
+    """
+    from .orchestrator import pm_unresolved_items
+
+    out: dict[str, list[str]] = {}
+    for row in data.get("modules") or []:
+        mid = str(row.get("module_id") or "")
+        status = str(row.get("status") or "")
+        if status == "done":
+            continue  # 已交付的模块不必再确认
+        run_dir = row.get("run_dir")
+        if not run_dir or not Path(str(run_dir)).exists():
+            out[mid] = ["该模块还没跑过 PM 前置阶段（没有产物）"]
+            continue
+        scope, decisions = _pm_scope_of(Path(str(run_dir)))
+        left = pm_unresolved_items(scope, decisions)
+        items = [f"未裁决：{q}" for q in left["pending"]] + [f"未明确：{v}" for v in left["vague"]]
+        if items:
+            out[mid] = items
+    return out
+
+
+def job_pm_blockers_text(blockers: dict[str, list[str]]) -> str:
+    """把 ``job_pm_blockers`` 的结果拼成一句给人看的话（报错/日志共用）。"""
+    parts = [f"{mid}（{len(items)} 项）" for mid, items in blockers.items()]
+    return "还有模块的 PM 待确认项没解决：" + "、".join(parts) + " —— 请先在作业页逐模块确认完再继续"
+
+
+#: 交付就绪度的四道门（每门 0–2 分）。见 `job_readiness`。
+READINESS_GATES: tuple[tuple[str, str], ...] = (
+    ("functional", "功能落地"),
+    ("verified", "机械验证"),
+    ("redline", "工程红线"),
+    ("delivered", "交付成型"),
+)
+#: 可放行 / 带例外 / 禁止放行。满分为 门数×2。
+READINESS_SHIP = 2 * len(READINESS_GATES)
+READINESS_WITH_EXCEPTIONS = READINESS_SHIP - 1
+
+
+def job_readiness(runs_dir: str | Path, data: dict[str, Any]) -> dict[str, Any]:
+    """作业级**交付就绪度**（4 门 × 0–2 分，全部机械算出，不含模型自评）。
+
+    出处与裁剪：fullstack-dev `release-checklist.md` 的「6 Gate + Readiness Score」——
+    每门 0–2 分、低于阈值**禁止放行**、中间档必须写明例外与责任人。
+    这里裁到 4 门，因为另外两门（发布执行 / 上线后观测）本项目不做发布动作，
+    硬凑只会得到一排"不适用"的 0 分，反而让总分失真。
+
+    为什么要量化：人工统一验收现在拿到的只有各模块 status/verdict —— 那回答的是
+    "跑完了没有"，不是"能不能收"。换成可比的分数后，人一眼能看出该不该放行，
+    被追问时也能说出**是哪一门扣的分、扣在哪**（每门都带 evidence）。
+
+    口径一律取**最弱一环**（min）：一个模块 verify 失败，整组就不能说"验证通过"。
+    宁可保守 —— 这一层判松的代价是整组废品被收下。
+    """
+    runs_dir = Path(runs_dir)
+    rows = list(data.get("modules") or [])
+    gates: dict[str, dict[str, Any]] = {key: {"score": 2, "evidence": []} for key, _ in READINESS_GATES}
+    unverified: list[str] = []
+
+    def downgrade(key: str, score: int, note: str) -> None:
+        gate = gates[key]
+        gate["score"] = min(int(gate["score"]), score)
+        gate["evidence"].append(note)
+
+    if not rows:
+        downgrade("functional", 0, "作业里没有任何模块")
+    for row in rows:
+        mid = str(row.get("module_id") or "?")
+        status = str(row.get("status") or "")
+        verdict = str(row.get("verdict") or "")
+        run_dir = Path(row.get("run_dir") or (runs_dir / f"{data.get('job_id')}-{mid}"))
+        # 产物层：read_state 给的是整份快照，产物在 artifacts 里（读错层会**静默为空**）
+        state = runstore.artifact_view(runstore.read_state(run_dir))
+        verify = state.get("verify_report") or {}
+        delivery = state.get("delivery") or {}
+
+        if status == "done" and verdict == "pass":
+            pass
+        elif status in ("running", "pending", "paused"):
+            downgrade("functional", 1, f"{mid}：状态 {status}（还没跑完/在等人工）")
+        else:
+            downgrade("functional", 0, f"{mid}：状态 {status}，verdict {verdict or '空'}")
+
+        v_verdict = str(verify.get("verdict") or "")
+        if v_verdict == "pass":
+            pass
+        elif v_verdict in ("skipped", ""):
+            downgrade("verified", 1, f"{mid}：运行验证未执行（{verify.get('summary') or '无结果'}）")
+        else:
+            problems = [str(p) for p in (verify.get("problems") or [])][:2]
+            downgrade("verified", 0, f"{mid}：运行验证 {v_verdict} —— {'；'.join(problems) or '见 report'}")
+        for item in verify.get("unverified") or []:
+            unverified.append(f"{mid}：{item}")
+
+        findings = state.get("rule_findings") or []
+        blk = [f for f in findings if f.get("severity") == "blocker" and not f.get("note")]
+        wrn = [f for f in findings if f.get("severity") == "warn" and not f.get("note")]
+        if blk:
+            downgrade("redline", 0, f"{mid}：{len(blk)} 条红线阻断（例：{blk[0].get('title')} @ {blk[0].get('path')}）")
+        elif wrn:
+            downgrade("redline", 1, f"{mid}：{len(wrn)} 条提示级红线（例：{wrn[0].get('title')}）")
+
+        if delivery.get("delivered") and not delivery.get("wrote_nothing"):
+            pass
+        elif delivery.get("delivered"):
+            downgrade("delivered", 1, f"{mid}：交付记录存在但没写出任何文件")
+        else:
+            downgrade("delivered", 0, f"{mid}：未交付（{delivery.get('reason') or delivery.get('error') or '无交付记录'}）")
+        if state.get("duplicate_stage_seqs"):
+            downgrade("redline", 1, f"{mid}：同一 seq 多份产物（两代混存）")
+
+    total = sum(g["score"] for g in gates.values())
+    if total >= READINESS_SHIP:
+        decision = "可放行"
+    elif total >= READINESS_WITH_EXCEPTIONS:
+        decision = "带例外放行：必须在验收备注里写明例外项与责任人"
+    else:
+        decision = "禁止放行：先返工（按各门 evidence 指到的问题逐条处理）"
+    return {
+        "score": total,
+        "max": READINESS_SHIP,
+        "decision": decision,
+        "gates": [
+            {"key": key, "label": label, **gates[key]} for key, label in READINESS_GATES
+        ],
+        # 未验证项**原样带出来**：验收最有价值的不是"哪里绿了"，而是"哪里根本没验"。
+        "unverified": unverified,
+    }
+
+
+def job_evidence_md(runs_dir: str | Path, data: dict[str, Any]) -> str:
+    """把各模块的**交付证据**合并成一份作业级材料（人审只看这一份）。
+
+    为什么要合并：逐模块各审一次早就被判定没有意义（真正要人看的是整组交付物），
+    而"整组"的证据此前只有各模块的 status/verdict —— 那回答的是"跑完了没有"。
+    验收标准、用例、真实执行结果、红线、未验证项合到一起，人才有判断"能不能收"的材料。
+
+    合并口径：验收标准按模块加 `[M-0x]` 前缀（合并后必须还看得出它属于谁），
+    其余（用例/命令/未验证项）直接汇总。匹配仍是启发式，标注沿用单模块那份说明。
+    """
+    from . import evidence as evidence_mod  # 延迟导入：本模块要能被纯查询路径轻量加载
+
+    runs_dir = Path(runs_dir)
+    criteria: list[str] = []
+    requirements: list[Any] = []
+    cases: list[Any] = []
+    commands: list[Any] = []
+    unverified: list[str] = []
+    no_power: list[str] = []
+    coverage: list[str] = []
+    findings: list[dict[str, Any]] = []
+    for row in data.get("modules") or []:
+        mid = str(row.get("module_id") or "?")
+        run_dir = Path(row.get("run_dir") or (runs_dir / f"{data.get('job_id')}-{mid}"))
+        state = runstore.artifact_view(runstore.read_state(run_dir))
+        scope = state.get("scope") or {}
+        criteria += [f"[{mid}] {c}" for c in (scope.get("acceptance_criteria") or [])]
+        requirements += list(scope.get("functional_requirements") or [])
+        cases += list((state.get("test_report") or {}).get("cases") or [])
+        verify = state.get("verify_report") or {}
+        commands += list(verify.get("commands") or [])
+        unverified += [f"{mid}：{x}" for x in (verify.get("unverified") or [])]
+        no_power += [
+            f"{mid}：{x}" for x in ((verify.get("negative_control") or {}).get("no_power") or [])
+        ]
+        pct = (verify.get("coverage") or {}).get("percent")
+        if pct is not None:
+            coverage.append(f"{mid} {float(pct):g}%")
+        findings += [f for f in (state.get("rule_findings") or []) if isinstance(f, dict)]
+    ev = evidence_mod.delivery_evidence(
+        {"acceptance_criteria": criteria, "functional_requirements": requirements},
+        {"cases": cases},
+        {
+            "commands": commands,
+            "unverified": unverified,
+            "negative_control": {"no_power": no_power},
+        },
+        findings,
+    )
+    body = evidence_mod.render_markdown(ev)
+    if coverage:
+        body = "### 各模块实测覆盖率\n- " + "；".join(coverage) + "\n\n" + body
+    return body
+
+
+def _open_job_review(base: Path, data: dict[str, Any], logger: Callable[[str], None]) -> None:
+    """全部模块跑完 → 打开**作业级统一验收**（材料是所有模块产出的整合）。"""
+    # 模块运行落在 runs/<job_id>-<mid>/（不是 runs/_jobs/ 下），所以先按已有模块行反推，
+    # 反推不到再按目录结构上跳两级（base = runs/_jobs/<job_id>）。
+    runs_root = base.parent.parent
+    for m in data.get("modules") or []:
+        if m.get("run_dir"):
+            runs_root = Path(str(m["run_dir"])).parent
+            break
+    readiness = job_readiness(runs_root, data)
+    if not (base / JOB_REVIEW_NAME).exists():
+        _write_json(
+            base / JOB_REVIEW_NAME,
+            {
+                "verdict": "",
+                "notes": "",
+                "reviewer": "",
+                "_placeholder": True,
+                "_instruction": (
+                    "作业统一验收：这是**所有模块跑完之后**的一次性人工验收（不是逐模块各审一次）。"
+                    "请对照模块清单、各模块 verdict 与集成校验点核对**整体**交付；"
+                    "approve = 整组交付完成；reject = 把 notes 里的问题分发到各模块开发阶段重跑。"
+                ),
+                "modules": [
+                    {
+                        "module_id": m.get("module_id"),
+                        "status": m.get("status"),
+                        "verdict": m.get("verdict"),
+                    }
+                    for m in (data.get("modules") or [])
+                ],
+                # 交付就绪度（机械算出的 4 门打分）：回答"能不能收"，与"跑完了没有"是两件事
+                "readiness": readiness,
+                # 交付证据表：验收标准 ↔ 用例 ↔ 真实执行 ↔ 红线/未验证项（见 evidence.py）
+                "evidence_md": job_evidence_md(runs_root, data),
+            },
+        )
+        logger(
+            f"== 作业 {data.get('job_id')}：全部模块已跑完，等待**统一验收**"
+            "（一次，材料为全组产出；见作业页的验收卡片）"
+        )
+        logger(
+            f"   交付就绪度 {readiness['score']}/{readiness['max']} → {readiness['decision']}"
+        )
+        for gate in readiness["gates"]:
+            if gate["score"] < 2:
+                logger(f"     - {gate['label']} {gate['score']}/2："
+                       + "；".join(str(x) for x in gate["evidence"][:2]))
+        if readiness["unverified"]:
+            logger(f"     - 未验证项 {len(readiness['unverified'])} 条（pass ≠ 该验的都验了）")
+    data["phase"] = "review"
+
+
+def finish_job_review(
+    runs_dir: str | Path,
+    job_id: str,
+    *,
+    verdict: str,
+    notes: str = "",
+    reviewer: str = "",
+) -> dict[str, Any]:
+    """人工提交**作业级统一验收**。
+
+    · ``approve`` ⇒ 整组交付完成（phase=done）；
+    · ``reject``  ⇒ 把意见分发到**各模块的开发阶段**（phase 回到 deliver，逐模块
+      ``--from dev`` + 人工意见重跑）—— 统一验收打回是"整组返工"，不是只改某一个模块。
+    """
+    data = read_job(runs_dir, job_id)
+    if not data:
+        raise GatewayError(f"找不到作业 {job_id}")
+    base = job_dir(runs_dir, job_id)
+    art = _read_json(base / JOB_REVIEW_NAME)
+    if not isinstance(art, dict):
+        raise GatewayError("该作业还没有统一验收记录（模块还没全部跑完）")
+    if verdict not in ("approve", "reject"):
+        raise GatewayError(f"未知 verdict：{verdict}")
+    art["verdict"] = verdict
+    art["notes"] = notes
+    art["reviewer"] = reviewer
+    art["_placeholder"] = False
+    _write_json(base / JOB_REVIEW_NAME, art)
+    if verdict == "approve":
+        data["phase"] = "done"
+    else:
+        data["phase"] = "deliver"
+        for row in data.get("modules") or []:
+            if not row.get("run_dir"):
+                continue
+            row["status"] = "paused"           # 让 deliver 阶段重新捡起来
+            row["rework_from"] = "dev"         # 从开发阶段重跑（走既有的打回语义）
+            row["rework_feedback"] = f"[统一验收打回] {notes or '（未填写具体问题）'}"
+            row["issues"] = list(row.get("issues") or []) + [
+                f"统一验收打回：{notes or '（未填写具体问题）'}"
+            ]
+    write_job(runs_dir, data)
+    return data
+
+
 def run_job(
     job_id: str,
     *,
@@ -1110,39 +1701,92 @@ def run_job(
     pause_after: list[str] | None = None,
     review_every: int | None = None,
     max_rework: int | None = None,
-    project_type: str = "secondary",
+    project_type: str | None = None,
     pause_on_open_questions: bool | None = None,
+    phase: str | None = None,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
-    """按 ``execution_order`` **串行**执行作业的各模块子流水线。
+    """作业执行 —— **分三阶段**（2026-09-26 起）。串行是硬约束（单卡 + 单驻留模型）。
 
-    串行是硬约束（``OLLAMA_MAX_LOADED_MODELS=1`` + 单卡）：并行只会导致反复换模，
-    比串行更慢。这一点与既有 ``ensure_exclusive`` 的设计前提一致。
+    ``job.json.phase``：
 
-    每个模块都是一次**独立的、原封不动的** ``Orchestrator.run()`` —— 角色逻辑零改动。
+    * ``pm``（先跑）——**每个模块各自跑到 pm 结束就停**，把待裁决项一次性摆出来；
+      人工环节只在 PM 集中处理**一次**，而不是每个模块各停一次。
+    * ``deliver`` —— 人工把**全部**模块的待确认项解决完之后，各模块从下游继续串行跑完；
+      模块级人工审核**延后**（``defer_human_review``），不在每个模块各停一次。
+    * ``review`` —— 全部跑完后**统一验收一次**：材料是所有模块产出的**整合**
+      （见 ``_open_job_review`` 与作业页的验收卡片），不是逐模块各审一遍。
+
+    每个模块仍是一次独立的、原封不动的 ``Orchestrator`` 流水线 —— 角色逻辑零改动。
     """
     from .orchestrator import Orchestrator
 
     data = read_job(runs_dir, job_id)
     if not data:
         raise GatewayError(f"找不到作业 {job_id}")
+    opts = _run_options(
+        data, repo=repo, pause_after=pause_after, review_every=review_every,
+        max_rework=max_rework, project_type=project_type,
+    )
+    repo = opts["repo"]
+    review_every = opts["review_every"]
+    max_rework = opts["max_rework"]
+    project_type = opts["project_type"]
     rows = data.get("modules") or []
     by_id = {str(row.get("module_id")): row for row in rows}
     order = [str(x) for x in (data.get("execution_order") or [])]
 
+    phase = str(phase or data.get("phase") or "pm").strip() or "pm"
+    if phase not in ("pm", "deliver"):
+        # review / done：没有可推进的模块（统一验收由人工在作业页提交，见 finish_job_review）
+        logger(f"== 作业 {job_id} 处于 {JOB_PHASE_CN.get(phase, phase)}，没有需要推进的模块")
+        return data
+    if phase == "deliver":
+        # 进下游前必须确认**所有**模块的 PM 都解决了 —— 这是"统一人工环节"的闸门
+        blockers = job_pm_blockers(runs_dir, data)
+        if blockers:
+            raise GatewayError(job_pm_blockers_text(blockers))
+    data["phase"] = phase
+    write_job(runs_dir, data)
+    logger(
+        f"== 作业运行参数：项目类型={project_type}  review_every={review_every} "
+        f"max_rework={max_rework} repo={repo or '未提供'}"
+        "（显式传入 > 作业落盘 > 代码默认）"
+    )
+    logger(f"== 作业 {job_id} 阶段：{JOB_PHASE_CN.get(phase, phase)}")
+    if phase == "deliver":
+        # 人工环节只有两处（PM 统一确认 / 统一验收），模块内部的闸门统一关闭 ——
+        # 否则每个模块各停一次，人工被拖进来 N 次，正是这次要改掉的
+        logger("  （模块级人工闸门统一关闭：人工只处理 PM 一次与最终验收一次）")
+
     for index, mid in enumerate(order):
         row = by_id.get(mid)
-        if not row or row.get("status") in ("done", "blocked", "skipped"):
+        if not row:
             continue
-        unmet = [
-            dep for dep in (row.get("depends_on") or [])
-            if (by_id.get(dep) or {}).get("status") != "done"
-        ]
-        if unmet:
-            row["status"] = "skipped"
-            row["issues"] = list(row.get("issues") or []) + [f"前置模块未完成：{unmet}"]
-            write_job(runs_dir, data)
-            continue
+        if phase == "pm":
+            # PM 前置阶段：**不看依赖**（PM 只依赖需求与全局契约，与别的模块产物无关），
+            # 已产出过 PM 的模块也不重跑 —— 人工可能已经裁决，重跑会把裁决结果冲掉。
+            if row.get("run_dir") and row.get("status") in ("pm_paused", "paused", "done", "blocked"):
+                continue
+        else:
+            # 终态只有 done 与 blocked。`skipped` 是**派生状态**（前置模块本轮没完成），
+            # 不能被当成终态：模块失败后下游会被跳过，等失败原因修好再续跑时必须能重新评估 ——
+            # 否则一次失败就把整组永久冻住（真机 job-20260926-154657）。blocked 才是真终态。
+            if row.get("status") in ("done", "blocked"):
+                continue
+            unmet = [
+                dep for dep in (row.get("depends_on") or [])
+                if (by_id.get(dep) or {}).get("status") != "done"
+            ]
+            if unmet:
+                row["status"] = "skipped"
+                note = f"前置模块未完成：{unmet}"
+                issues = list(row.get("issues") or [])
+                if note not in issues:  # 幂等：反复续跑不该把这句说明堆成好几条
+                    issues.append(note)
+                row["issues"] = issues
+                write_job(runs_dir, data)
+                continue
 
         refresh_module_requirements(runs_dir, data)
         base = job_dir(runs_dir, job_id)
@@ -1153,23 +1797,36 @@ def run_job(
         write_job(runs_dir, data)
         logger(f"\n===== 作业 {job_id} · 模块 {mid}（{index + 1}/{len(order)}）开始 =====")
 
-        last = index == len(order) - 1
-        orch_kwargs: dict[str, Any] = dict(
-            client=client,
-            repo=repo,
-            runs_dir=runs_dir,
-            max_rework=max_rework if max_rework is not None else MAX_REWORK_ROUNDS,
-            unload_at_end=False,  # 中途不卸载，整组跑完再卸（省下反复加载）
-            log=logger,
-            review_every=review_every if review_every is not None else REVIEW_EVERY,
-            pause_after=pause_after or [],
-            project_type=project_type,
-        )
+        # 参数已在 `_run_options` 里合并好（显式传入 > 作业落盘 > 代码默认），此处直接用
+        orch_kwargs: dict[str, Any] = {
+            "client": client,
+            "repo": repo,
+            "runs_dir": runs_dir,
+            "max_rework": max_rework,
+            "unload_at_end": False,  # 中途不卸载，整组跑完再卸（省下反复加载）
+            "log": logger,
+            "review_every": review_every,
+            "pause_after": ["pm"] if phase == "pm" else [],
+            "project_type": project_type,
+            # 模块级人工审核延后到**作业统一验收**（两个阶段都这样：pm 阶段到不了那一步）
+            "defer_human_review": True,
+        }
         if pause_on_open_questions is not None:
             orch_kwargs["pause_on_open_questions"] = pause_on_open_questions
         orch = Orchestrator(**orch_kwargs)
+        run_id = f"{job_id}-{mid}"
+        run_dir = Path(str(row.get("run_dir") or (Path(runs_dir) / run_id)))
         try:
-            result = orch.run(requirement, run_id=f"{job_id}-{mid}")
+            if phase == "pm":
+                _archive_previous_run(Path(runs_dir) / run_id, logger, run_id)
+                result = orch.run(requirement, run_id=run_id)
+            else:
+                # 统一验收打回：从开发阶段重跑（走既有的 --from 语义 + 人工意见）
+                rework_from = str(row.pop("rework_from", "") or "") or None
+                feedback = str(row.pop("rework_feedback", "") or "") or None
+                result = orch.resume(
+                    run_dir, from_stage=rework_from, feedback=feedback, pause_after=[]
+                )
         except Exception as exc:  # noqa: BLE001 - 单个模块失败不该毁掉整组
             row["status"] = "failed"
             row["issues"] = list(row.get("issues") or []) + [
@@ -1185,6 +1842,13 @@ def run_job(
         row["paused"] = bool(result.paused)
         row["paused_after"] = result.paused_after
         row["verdict"] = (result.summary or {}).get("verdict")
+        if phase == "pm":
+            # PM 前置阶段：正常就是"停在 pm"（显式闸门）—— 状态单列，页面据此显示"待确认"
+            row["status"] = "pm_paused" if result.paused else "done"
+            write_job(runs_dir, data)
+            logger(f"        模块 {mid} 的 PM 已产出（{'待人工确认' if result.paused else '无待确认项'}）")
+            continue
+
         row["status"] = "paused" if result.paused else "done"
         audit = audit_module_run(
             result.run_dir,
@@ -1208,14 +1872,21 @@ def run_job(
             logger(f"== 模块 {mid} 审计不通过，标记 blocked：{row['issues']}")
             _skip_dependents(data, mid)
         write_job(runs_dir, data)
-
-        if last and result.paused:
-            logger(f"== 作业 {job_id}：末个模块停在人工闸门 {result.paused_after}，待人工处理")
         if result.paused:
-            logger(f"== 作业 {job_id}：模块 {mid} 暂停，后续模块本轮不再推进（先处理人工闸门）")
+            logger(f"== 作业 {job_id}：模块 {mid} 暂停，后续模块本轮不再推进（先处理闸门）")
             break
-        if row["status"] != "done":
-            continue
+
+    if phase == "pm":
+        blockers = job_pm_blockers(runs_dir, data)
+        total = sum(len(v) for v in blockers.values())
+        logger(
+            f"\n== 作业 {job_id}：PM 前置阶段结束 —— {len(blockers)} 个模块共 {total} 条待人工确认。"
+            "请在作业页逐模块确认（未明确项要写成确定结论），全部确认完再点「进入下游」。"
+        )
+    elif phase == "deliver" and job_status(data) in ("done", "partial"):
+        # 全部模块跑完 → 打开作业级**统一验收**（下一相位）
+        _open_job_review(job_dir(runs_dir, job_id), data, logger)
+        write_job(runs_dir, data)
 
     report = write_report(runs_dir, data)
     logger(f"\n== 作业 {job_id} 收尾：状态 {job_status(data)}，报告 {report}")
@@ -1229,13 +1900,42 @@ def resume_job(
     client: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """续跑作业：先把已暂停的模块各自续跑完，再往下推进未开始的模块。"""
+    """续跑作业 —— 按 ``job.json.phase`` 决定该推哪一段。
+
+    * 还在 ``pm`` 阶段（各模块都停在 PM 上等人工）：**先核对全部模块的 PM 是否都确认完**，
+      没确认完直接报错不放行；确认完就切到 ``deliver``，从下游串行跑完。
+    * 已是 ``deliver`` 阶段：把停在闸门上的模块各自续跑完（模块级人工审核已延后，
+      不会每模块停一次）。
+    * ``review`` / ``done``：没有可推的模块（统一验收由作业页提交）。
+    """
     from .orchestrator import Orchestrator
 
     data = read_job(runs_dir, job_id)
     if not data:
         raise GatewayError(f"找不到作业 {job_id}")
     logger = kwargs.pop("logger", print)
+    # 运行参数：显式传入 > 作业落盘 > 代码默认。续跑这条链只带 job_id，
+    # 落盘值就是唯一能还原「原配置」的地方（见 `_run_options` 的说明）。
+    opts = _run_options(
+        data,
+        repo=kwargs.pop("repo", None),
+        pause_after=kwargs.pop("pause_after", None),
+        review_every=kwargs.pop("review_every", None),
+        max_rework=kwargs.pop("max_rework", None),
+        project_type=kwargs.pop("project_type", None),
+    )
+
+    phase = str(data.get("phase") or "pm").strip() or "pm"
+    if phase == "pm":
+        blockers = job_pm_blockers(runs_dir, data)
+        if blockers:
+            # 统一人工环节没做完就不放行（这是"人工只需要处理一次"的前提：
+            # 处理完再一次放行，而不是每模块各停一次）
+            raise GatewayError(job_pm_blockers_text(blockers))
+        logger("== 作业：PM 待确认项已全部解决 → 进入下游串行流转")
+        return run_job(
+            job_id, runs_dir=runs_dir, client=client, logger=logger, phase="deliver", **opts
+        )
 
     for row in data.get("modules") or []:
         if row.get("status") != "paused" or not row.get("run_dir"):
@@ -1243,12 +1943,16 @@ def resume_job(
         logger(f"\n===== 作业 {job_id} · 续跑模块 {row['module_id']} =====")
         orch = Orchestrator(
             client=client,
-            repo=data.get("repo"),
+            repo=opts["repo"],
             runs_dir=runs_dir,
             unload_at_end=False,
             log=logger,
-            review_every=kwargs.get("review_every") or 1,
-            pause_after=kwargs.get("pause_after") or [],
+            review_every=opts["review_every"],
+            pause_after=opts["pause_after"],
+            # 续跑沿用该 run 自己的项目类型（_restore 还会再按 state 校正一次）
+            project_type=opts["project_type"],
+            # 模块级人工审核延后到作业统一验收
+            defer_human_review=True,
         )
         try:
             result = orch.resume(Path(row["run_dir"]))
@@ -1276,10 +1980,14 @@ def resume_job(
         if row["status"] == "paused":
             return data  # 还是停着，等人工再处理
 
-    payload = {
-        k: v for k, v in kwargs.items() if k in ("pause_after", "review_every", "max_rework", "project_type")
-    }
-    return run_job(job_id, runs_dir=runs_dir, client=client, logger=logger, **payload)
+    return run_job(
+        job_id,
+        runs_dir=runs_dir,
+        client=client,
+        logger=logger,
+        # 合并后的值继续往下传（run_job 内的 `_run_options` 会再合并一次，幂等）
+        **opts,
+    )
 
 
 def link_run(
@@ -1302,7 +2010,7 @@ def link_run(
     if not base.exists():
         return
     _write_json(
-        base / "gateway.json",
+        base / runstore.GATEWAY_LINK_NAME,
         {
             "job_id": job_id,
             "scale": "large",
@@ -1315,7 +2023,7 @@ def link_run(
 
 
 def read_link(runs_dir: str | Path, run_id: str) -> dict[str, Any] | None:
-    payload = _read_json(Path(runs_dir) / run_id / "gateway.json")
+    payload = _read_json(Path(runs_dir) / run_id / runstore.GATEWAY_LINK_NAME)
     return payload if isinstance(payload, dict) else None
 
 
@@ -1334,7 +2042,17 @@ def job_view(runs_dir: str | Path, job_id: str) -> dict[str, Any] | None:
     report = base / "report.md"
     view = dict(data)
     view["status"] = job_status(data)
+    view["phase"] = str(data.get("phase") or "pm")
+    view["phase_cn"] = JOB_PHASE_CN.get(view["phase"], view["phase"])
     view["module_requirements"] = files
     view["report"] = report.read_text(encoding="utf-8") if report.exists() else ""
     view["dir"] = str(base)
+    # PM 统一人工环节：每个模块还差几条待确认（空 = 可以进下游；页面据此显示与放行）
+    try:
+        view["pm_blockers"] = job_pm_blockers(runs_dir, data)
+    except Exception:  # noqa: BLE001 - 视图查询不该因为一个坏模块整体失败
+        view["pm_blockers"] = {}
+    # 作业级**统一验收**产物（全部模块跑完后才有）
+    review = _read_json(base / JOB_REVIEW_NAME)
+    view["human_review"] = review if isinstance(review, dict) else None
     return view

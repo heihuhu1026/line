@@ -26,6 +26,7 @@ ast **能**找到 ``h = make_game(); h.move(2)`` 这种「间接实例」调用 
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import queue
@@ -174,10 +175,8 @@ class _Session:
         except (OSError, ValueError):
             pass
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 proc.kill()
-            except OSError:
-                pass
             self.proc = None
 
     # ---------------------------------------------------------------- 收发
