@@ -270,7 +270,29 @@ def main() -> int:
     # 返工轮同样不含需求原文
     bug = P.parts_dev(req, scope, {}, plan, "", ["修 bug"], verify={"commands": []},
                       current_code="def f(): pass", bug_report_block="【缺陷单】", bugfix=True)
-    check("写一个命令行记账工具" not in "\n".join(bug), "返工轮同样不含需求原文")
+    joined_bug = "\n".join(bug)
+    check("写一个命令行记账工具" not in joined_bug, "返工轮同样不含需求原文")
+    check("PM 背景" not in joined_bug and "impact_areas" not in joined_bug,
+          "返工轮的验收标准只取 acceptance_criteria（不把 PM 背景/影响面带回来）")
+    # **方案必须在场** —— 这是此前修错的一处：早先版本把 plan 整份去掉了，理由是
+    # "跨文件接口由 api_digest_block 提供"，那是把**接口摘要**当成了**施工图**。
+    # 返工比首轮更离不开施工图：不按 task 分派时连 task_focus_block 也不在场，
+    # 就变成"无图纸按缺陷单改"。
+    marked = {"strategy": "策略标记", "changes": [{"path": "cli.py", "intent": "意图标记"}],
+              "tasks": [{"id": "T-01", "title": "标题标记", "target_files": ["cli.py"]}]}
+    bug2 = P.parts_dev(req, scope, {}, marked, "", ["修 bug"], verify={"commands": []},
+                       current_code="def f(): pass", bug_report_block="【缺陷单】", bugfix=True)
+    joined_bug2 = "\n".join(bug2)
+    check("策略标记" in joined_bug2 and "意图标记" in joined_bug2 and "标题标记" in joined_bug2,
+          "**返工轮带方案**（施工图）：strategy / changes / tasks 都在")
+    check(joined_bug2.startswith("【架构师变更方案"),
+          "方案排在**最前面**（顺序即优先级；首轮也是这么排的）", joined_bug2[:36])
+    bug3 = P.parts_dev(req, scope, {}, marked, "", ["修 bug"], verify={"commands": []},
+                       current_code="def f(): pass", bug_report_block="【缺陷单】", bugfix=True,
+                       include_plan=False)
+    check("策略标记" not in "\n".join(bug3),
+          "按 task 分派时返工轮同样**不重复**喂整份方案（施工图已单独给出）")
+    check("【缺陷单】" in joined_bug2, "缺陷单仍然在场（本轮范围的权威）")
 
     print("== ⑪ 方案粒度与契约字段的机械判据（真机 20260927-002903 复现） ==")
     # 真机形态：3 个文件拆成 5 张图，cli.py 独占 3 张，且字段全空
@@ -550,6 +572,44 @@ def main() -> int:
           f"编译结果：单文件图数 ≤ {MAX_TASKS_PER_FILE}", str(per_file))
     check(len(compiled) <= MAX_TASKS_PER_FILE, "5 个符号 ⇒ 不超过 2 张图（切分大小被放宽）",
           str(len(compiled)))
+
+    print("== ⑳ 定位失败的补丁不进累积实现（真机 20260927-221511 的恒定判负） ==")
+    # 真机链：dev 重问把 anchor 写成 `self.db.add_entry(amount, note)`，而实际代码是
+    # `self.db.add_entry(args.amount)` —— **凭记忆改写的近似行**。`apply_all` 只收
+    # status=="ok"，这条永远进不了沙箱，却一直挂在实现里当"交付物不完整"的阻断项，
+    # 且下一轮只会再写一条同样对不上的 ⇒ 一个修不掉的门永远挂在流水线前面。
+    from pipeline import patches as PT
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        (Path(td) / "cli.py").write_text(
+            "class CLI:\n    def add(self):\n        self.db.add_entry(args.amount)\n",
+            encoding="utf-8",
+        )
+        impl = {"edits": [
+            {"path": "cli.py", "change_type": "modify", "patch_mode": "replace_span",
+             "target_symbol": "CLI", "anchor": "self.db.add_entry(amount, note)", "patch": "x"},
+            {"path": "new.py", "change_type": "add", "patch_mode": "full_symbol",
+             "target_symbol": "G", "anchor": "", "patch": "def g():\n    pass\n"},
+        ]}
+        audit = PT.analyze_all(td, impl)
+        check(audit["problems"] == 1 and audit["ok"] == 1,
+              "近似 anchor 判 anchor_not_found（判定本身是对的）", str(audit["problem_detail"]))
+        rep = PT.prune_unappliable(td, impl)
+        check(rep["dropped"] == 1 and len(impl["edits"]) == 1,
+              "**定位失败的那条被移除**，能套用的保留", str(rep["detail"]))
+        check(PT.analyze_all(td, impl)["problems"] == 0,
+              "裁剪后审计干净（不再有每轮都复现的恒定阻断项）")
+        check("cli.py" in rep["detail"][0] and "anchor" in rep["detail"][0],
+              "裁剪记录带路径与原因（不静默）", rep["detail"][0])
+        # `unchecked`（文件不在仓库）**不许裁** —— 那是 §26 的"文件始终没落盘"，
+        # 必须继续当阻断项暴露出来。
+        impl2 = {"edits": [{"path": "ghost.py", "change_type": "modify", "patch_mode": "replace_span",
+                            "target_symbol": "G", "anchor": "def g():", "patch": "x"}]}
+        rep2 = PT.prune_unappliable(td, impl2)
+        check(rep2["dropped"] == 0 and len(impl2["edits"]) == 1,
+              "`unchecked`（目标文件不在仓库）**不许裁**：那是必须继续阻断的真问题", str(rep2))
+        check(PT.prune_unappliable(None, {"edits": []})["dropped"] == 0, "空实现不崩")
 
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0

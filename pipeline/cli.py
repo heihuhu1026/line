@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -303,6 +304,13 @@ def _print_flow() -> int:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # **stdout 改行缓冲**：进程被重定向到文件时 Python 默认块缓冲（4–8KB），于是
+    # 运行中途被杀死/卡住时，**尾部日志全部留在缓冲区里丢掉** —— 真机 `20260928-110402`
+    # 就是这样：`_r2b.out.log` 停在 11:20（dev 第 1 轮），而进程实际活到 11:40。
+    # 排查"卡在哪一步"时最需要的那几行恰好不见了。行缓冲的代价可以忽略（日志量很小）。
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):  # 非 io 流（被替换过）时保持原样
+            stream.reconfigure(line_buffering=True)  # type: ignore[union-attr]
     # --show-flow 是纯查询：不受「必须给需求」的互斥组约束，也不加载任何模型
     if "--show-flow" in argv:
         return _print_flow()

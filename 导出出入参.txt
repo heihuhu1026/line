@@ -1,0 +1,11 @@
+python tools/export_io.py 20260927-192001                    # 导出到 runs/<id>/io/
+python tools/export_io.py 20260927-192001 --stage dev        # 只看 dev（前缀匹配，支持 dev-T-02）
+python tools/export_io.py 20260927-192001 --last 3           # 只看最后 3 次调用
+python tools/export_io.py 20260927-192001 --no-raw           # 只要输入不要输出
+python tools/export_io.py 20260927-192001 --out D:\tmp\io    # 自定义目录
+
+
+python tools/export_io.py 20260927-221511 --out C:\Users\Administrator\Desktop\新建文件夹 
+
+   
+20260927-221511

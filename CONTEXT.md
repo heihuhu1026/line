@@ -1370,14 +1370,28 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 - 续跑/打回：`POST /api/runs/20260924-185507/resume`（body 可选 `from`/`feedback`/`max_rework`/`pause_after`），
   或直接命令行 `cd D:\AI\line && python -m pipeline.cli --resume 20260924-185507`。
 - 关键位置（**2026-09-27 已核对；行号会漂移，优先按符号名找**）：
-  评审提示词 `prompts.py:2264 parts_review`；fix 列表拼装 `orchestrator.py:4269 self.fixes = fixes`；
+  评审提示词 `prompts.py:2407 parts_review`；fix 列表拼装 `orchestrator.py:4901 self.fixes = fixes`；
   运行态相位 `console.html:842 runPhase`、续跑按钮 `console.html:1262 btn-resume`；
   入口探测 `verify.py:502 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
-  跨文件契约比对 `verify.py:1020 contract_check`；跨轮合并 `orchestrator.py:1582 _merge_impl_across_rounds`；
-  缺陷单 `tasktype.py:90 bug_report_from_state`；施工图字段强制 `orchestrator.py:1244 _plan_contract_gaps`；
-  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:3078 _task_drawing_is_thin`；
-  确定性拆任务 `taskcompiler.compile_tasks` / `taskcompiler.plan_needs_compile`；
-  fix 列表拼装 `orchestrator.py:4365 self.fixes = fixes`。
+  跨文件契约比对 `verify.py:1020 contract_check`；跨轮合并 `orchestrator.py:1805 _merge_impl_across_rounds`；
+  缺陷单 `tasktype.py:204 bug_report_from_state`；施工图字段强制 `orchestrator.py:1435 _plan_contract_gaps`；
+  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:3347 _task_drawing_is_thin`；
+  确定性拆任务 `taskcompiler.py:49 compile_tasks` / `taskcompiler.py:200 plan_needs_compile`；
+  **编译层**：Plan IR 归一 `planir.py:186 normalize_plan`、最长匹配 `planir.py:108 drop_parent_symbols`、
+  相对名剥离 `planir.py:138 _relative_name`、编译器指纹 `planir.py:449 fingerprint`；
+  符号解析 `symbols.py:239 resolve`、调用写法归一 `symbols.py:199 clean_symbol`、
+  文件限定切分 `symbols.py:224 _split_file_hint`、索引 `symbols.py:112 build_index`、
+  摘要解析 `symbols.py:63 digest_symbols`；单张施工图 `prompts.py:1736 task_focus_block`；
+  定位失败补丁裁剪 `patches.py:1092 prune_unappliable`；符号逐字原文 `patches.py:816 symbol_excerpt`；
+  **修复项与归因** `tasktype.py:383 defect_items`（方案漏项判据 `tasktype.py:349 plan_gap_files`、
+  逐项验收 `tasktype.py:537 defect_verdicts`、分组视图 `tasktype.py:622 by_task_attribution`、
+  渲染 `tasktype.py:696 format_bug_report`、路径收敛 `tasktype.py:319 _match_known`、
+  缺陷单入口 `tasktype.py:204 bug_report_from_state`）；
+  当前代码取源 `orchestrator.py:1984 _current_candidates`（按文件 `orchestrator.py:2025 _current_sources`）；
+  方案漏项回流 `orchestrator.py:3953 _plan_uncovered_defects`；
+  **输出截断处理**：抬高上限一次数 `ollama_client.py:40 _MAX_ESCALATIONS`、
+  逐张调用组装 `orchestrator.py:3394 _dev_task_call`、
+  截断自动拆半 `orchestrator.py:3437 _dev_split_retry`。
   复检脚本：`python tools/check_refs.py`（抽 CONTEXT.md 里所有 `文件:行号` 并比对当前代码；
   含"该行附近是否还有文档声称的符号名"这一层，能抓出"行号还在但内容已换"的漂移）。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。
@@ -1818,3 +1832,985 @@ def system_prompt(stage: str, project_type: str = "secondary") -> str:
 **一个教训**：要求字段前先确认 **schema 允许**它产出。此前提示词一直要求 `symbols`/`interface`/…
 而 schema 没声明且 `additionalProperties` 被关成 false —— ollama 的 `format` 是语法约束，
 模型**结构上不可能**产出这些字段（另一会话已补上 schema 声明）。契约要求与 schema 允许不一致 = 该字段不存在。
+
+## §27 Planning Compiler（编译层）落地 —— P0-0 / P0-1 / P0-2
+
+> 前两轮讨论解决的是「Architect 输出是否足够好」；这一轮解决的是
+> **「即使 Architect 输出不稳定，系统能不能把它编译成稳定执行计划」**。
+
+分层（本轮落地）：
+
+```
+raw_plan.json  --normalize_plan()-->  compiler_ir.json  --compile_tasks()-->  tasks[]
+```
+
+Compiler 自此**不再读** `changes` / `tasks` / `approach`，只读 `compiler_ir`。
+不分层，`compile_tasks` 迟早长成"第二个 orchestrator"；而且架构师提示词、task schema、
+编译器规则三者纠缠在一起 —— 指标一动，**说不清是谁变的**（实验失去可比性）。
+
+### 27.1 P0-0：先量填充率，再决定要不要冻结 —— 结论是「契约没要求」
+
+43 次真机方案的统计（`tools` 里一条离线命令即可复现）：
+
+| 字段 | 契约里有没有写 | 填充率 |
+|---|---|---|
+| `changes[].symbols` | ❌ **`prompts.py` 的 changes 契约从没提过它**（`schemas.py` 早已声明，注释还写着"这是 Task Compiler 的输入"） | **0 / 43 = 0%** |
+| `tasks[].symbols / interface / contracts / test_hint` | ✅（§26 才补进 task 契约） | **5 / 5 = 100%**（内容也是施工图级的） |
+
+⇒ **不是 14B 做不到，是契约没要求。一加就 100%。**
+
+动作：`schemas.py` 的 `changes.required` 加 `symbols`；`prompts.py` 的 changes 契约明写
+"不填就等于没划边界，编译器只能按整文件拆图"。
+
+**冻结时机的判断（与提案不同）**：`compiler_input_version` 本轮只**记录**（=1），
+**不承诺冻结接口**。理由：双源（changes + draft_tasks）目前是**过渡形态**，
+它存在的原因正是"架构师没把边界填实"；在接口内容定型前冻结，只会把
+"架构师不填边界"这个缺陷固化进 v1，以后还得升 v2。
+先让 `changes[].symbols` 填充率稳定，双源退化成单源，**那时再冻结**。
+
+### 27.2 P0-1：`normalize_plan` 独立成阶段
+
+`pipeline/planir.py`。职责边界：
+
+| 谁 | 负责 |
+|---|---|
+| `normalize_plan` | **合并 / 清洗 / 冲突解决 / 推导** |
+| `compile_tasks` | **拆分 / 编号**（确定性，逐行可预测） |
+
+输出 IR：`{compiler_input_version, plan_sources, units[], conflicts[], warnings[]}`；
+每个 unit 带 `{file, symbols, intent[{text,source}], acceptance[{text,source}], change,
+interface, contracts{uses,exposes}, uses_resolved[], unresolved[], externals[],
+data_model, constraints, test_hint, depends_on[], depends_on_files[], stable_id,
+source_task_ids[]}`。
+
+冲突规则（全部显式规定，不留"看情况"）：
+
+1. **symbols 最长匹配**：`CLI` 与 `CLI.add` 并存 ⇒ 删父节点，并**记录删了什么、被谁覆盖**。
+   比较是**按点分段**的：`add` 不是 `add_all` 的前缀（字面 `startswith` 会误删）。
+2. **多张 draft 图改同一文件 ⇒ 合并成一个 unit，但来源必须保留**
+   （`intent` / `acceptance` 都带 `{text, source}`）—— 出问题要能回答"这是谁提的要求"。
+3. **稳定排序**：draft task id → change.order → 符号字母序。
+   IR 必须**逐字节可复现**：同一输入（哪怕 dict 顺序不同）必得同一 IR，
+   否则"实验可比"是空话。
+
+### 27.3 P0-2：Symbol Resolver（依赖图的硬前提）
+
+`pipeline/symbols.py`。**真机反例（不接受"猜"）**：
+
+```
+架构师写的：contracts.uses = ["database.insert_record", "models.format_amount", ...]
+骨架里实际：database.py 定义的是 `Database.save_record`
+```
+
+`insert_record` **在产物里根本不存在**。按符号名硬连 ⇒ 连到虚节点；
+按"取叶子名兜底"（我们代码里到处是 `s.rsplit(".", 1)[-1]`）⇒ `save_record` 与
+`insert_record` 被当成两回事，**悄悄漏掉、没有告警**。
+
+⇒ **必须显式解析；解析不唯一时必须暴露，不许猜。**
+
+**点号语义（此前从未定义过，这正是 `CLI.add` 与 `db.insert` 被当成同一类的原因）**：
+
+- `database.insert_record` → **模块.符号**（第一段命中文件名 / 模块名）
+- `CLI.add` → **类.方法**（第一段命中接口基准里的类名）
+
+真机里实际出现了**四种**书写，全部支持（每一种都有真机样本）：
+
+| 书写 | 真机样本 | 处理 |
+|---|---|---|
+| 模块.符号 | `database.insert_record`（192001 等） | 模块索引 + **成员存在性核对** |
+| **文件:符号** | `main.py:Game`（134222 **六个文件全用这种**） | 文件限定 |
+| **文件.符号** | `game.py.Game`（150931） | 用已知文件清单试**最长前缀**（`partition(".")` 只切第一个点，拿 head 判断不成立） |
+| **纯文件路径** | `game.py`（150931 的 uses 全是它） | **文件级依赖**：按文件建边，但没有成员名可核 |
+
+两条**降噪**规则（误报率是关键指标，见 §25）：
+
+- **外部依赖**：`tkinter` / `sqlite3` 这类标准库进 `externals`，**不算虚依赖** ——
+  把标准库报成"契约对不上"只会稀释真正要修的那几条。
+- **垃圾符号**：`contracts.uses = [","]`（173023 的真实输出）直接判非法，不进依赖图。
+
+解析不唯一（同名符号多处定义）⇒ **不建边、不猜**，返回 `reason="多个候选（不唯一，拒绝猜测）"`。
+基准里没有该文件的成员信息时（骨架缺失）**不算错**，否则全是假警报。
+
+### 27.4 真机回放：编译层暴露了什么（关键证据）
+
+对**历史真机方案**离线回放（配上该运行真实的接口骨架摘要）：
+
+| 真机运行 | changes | 带 symbols | units | **虚依赖** | 外部依赖 | 冲突/合并 |
+|---|---|---|---|---|---|---|
+| 20260927-123032 | 5 | 0 | 5 | 4 | 3 | - |
+| 20260927-134222 | 6 | 0 | 6 | **0** | 0 | ambiguous 4 / merge 3 / longest 1 |
+| 20260927-150931 | 6 | 0 | 7 | **0**（修前 7） | 2 | task_file_not_in_changes 1 |
+| 20260927-173023 | 6 | 0 | 6 | 6 | 0 | - |
+| 20260927-192001 | 5 | 0 | 5 | **12** | 1 | ambiguous 7 / merge 2 |
+
+读法：
+
+- **`192001` 的 12 条虚依赖**是"跨文件接口对不上"的**直接量化**，此前被"静默解析成功"掩盖着；
+- `134222` 的 0 说明**文件限定书写一旦被正确识别，依赖图是真的建得出来**；
+- `150931` 从 7 → 0 说明**降噪规则有效**：那 7 条里 5 条是"纯文件路径"被误判、2 条是标准库；
+- `173023` 的 6 条全是模型吐的 `,` —— 这是**真实的输入质量问题**，应当暴露而不是被兜底吞掉。
+
+### 27.5 顺带修掉的两个真问题
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | 依赖翻译出现**自引用** | 多张原图合并进同一 unit 时（T-02/T-03 都改 `cli.py`，T-03 声明依赖 T-02），合并后天然"依赖自己" ⇒ 拓扑排序退化、"前置任务"变噪音 | 翻译后滤掉 `task["id"]` |
+| 2 | 符号前缀剥离不正确 | `a.run` 应归一为 `run`；但 `CLI.add` 的**类点号必须保留**（区分同名方法、也是锚点依据） | `planir._relative_name`：按"前缀是否等于该文件的路径/模块名"判断，**不猜** |
+
+### 27.6 编译层指纹（可归因）
+
+`issues.pipeline_fingerprint()` 新增 `compiler_hash`（`planir.py` + `taskcompiler.py` +
+`symbols.py` 源码哈希 + 输入契约版本）并**计入 `pipeline_hash`**；`env.json` 里可查。
+
+理由：编译器规则改一次，等于"同一份方案被解释的方式"变了。不进指纹的话，
+跨运行看到"任务拆得更细 / 依赖更整齐"会被**误归因到架构师头上** ——
+而它的输出一个字都没变。顺带把 `SYSTEM_NEW_BUGFIX` 也纳入 `prompts_blob`（此前只算了 SYSTEM 与 SYSTEM_NEW）。
+
+### 27.7 尚未做（诚实说明）
+
+| 项 | 状态 |
+|---|---|
+| **P0-0 的真机确认** | ❌ 未做：`changes[].symbols` 填充率是否真的上去了，需要**一次真机运行**才能确认（本轮只完成契约与 schema 的改动） |
+| P0-3 跨轮继承 | 部分：`diff_units`（added/removed/kept）已实现并进 IR；`rework_dev` 继承 / `rework_architect` 重编译的判据是 `round_kind`；**`_rewind` 后 `compiler_ir` 是否保住未验证** |
+| P0-4 依赖图 | ❌ 未做：`depends_on_files` 已算出（IR 里），但还没有拓扑调度与"按依赖顺序分派" |
+| P0-5 `must_not_break` | ❌ 未做，且有一个**逻辑死结要先解**：提案里 `applies_to.files` 指的是**我们流水线自己的**文件（`patches.py`），而 `task.target_files` 是**产物文件**（`command.py`），两者永不交集 ⇒ 相关性过滤永远匹配不上。必须先定清"这条不变量在保护谁的代码"，产物侧要用**模式**（`*/db.py`、`*config*`）；另外不变量套件只能绑**纯断言型**（`smoke_console`/`smoke_ui` 会写真实 runs 目录，会污染） |
+| P1 typed verification / cohesion / risk 两档 | ❌ 未做 |
+| P2 IR 冻结 / Digest / rejected_options | ❌ 未做 |
+
+### 27.8 回归
+
+`smoke_planir 49/49`（新）· `smoke_merge 105/105` · `smoke_bugfix 23/23` ·
+`smoke_imports 11/11` · `smoke_rules 94/94` · `smoke_mock 650/650` ·
+`smoke_console 150/150` · `smoke_ui 29/29` · `check_refs` 全部一致（45 条引用）。
+
+### 27.9 真机验证（2026-09-27 夜，三次运行）
+
+**P0-0 确认**：`changes[].symbols` 填充率 **4/4、3/3、2/2 全部 100%**（改契约前是 0/43）。
+「填不出来」确实是契约没要求，不是模型能力。
+
+编译层在真机上跑起来了，日志可见 `[Plan IR]`（冲突/合并 + 虚依赖暴露）、
+`[Task Compiler]`（不合格则接管重编）、`[按 task 分派]`（逐张施工）、
+`[施工图自检]`（漏声明符号则**只重做那一张**）、`[补丁裁剪]`。
+
+**失败模式在逐轮"变具体"，这是好信号**：
+
+| 运行 | 机械层做了什么 | 卡在哪 |
+|---|---|---|
+| `20260926-214757`（编译层之前） | 无 | 4 轮零进展：沙箱只物化 1 个文件，`import cli` 恒失败，触顶 |
+| `20260927-214253` | IR 归一 + 编译器接管（4 张图） | 首轮即停人工：**4 条 `anchor_not_found`** |
+| `20260927-224002` | 上述 + **补丁裁剪** | 卡在 **6 条 `new_file_syntax_error`**（写残）—— 内容质量问题 |
+
+#### 27.9.1 真机暴露的三个新问题（均已修，附证据）
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | **解析器不认「文件限定」写法** | `134222` 六个文件全用 `main.py:Game`；`150931` 用 `game.py.Game` 与纯路径 `game.py` | `resolve` 先处理 `path:symbol` / 点号式 / 纯文件路径三种；点号式用"已知文件清单试最长前缀" |
+| 2 | **标准库被误报成虚依赖** | `tkinter` / `sqlite3` 进了 unresolved，稀释信号 | 新增 `kind="external"`：算解析成功、进 `externals`、**不进** unresolved |
+| 3 | **虚引用被喂给 dev 当契约** | `214253`：dev 重出时把 anchor 写成 `DBManager.insert()` 这种**调用表达式**（`contracts.uses` 的原样照抄） | IR 把 `contracts.uses` 拆成 resolved / `unresolved_uses`；施工图加**禁止项**"以下引用不要去理" |
+
+#### 27.9.2 恒定判负的真正生成器（已修）
+
+`221511` 实测链：
+
+1. dev 重问把 anchor 写成 `self.db.add_entry(amount, note)`，实际代码是
+   `self.db.add_entry(args.amount)` —— **凭记忆改写的近似行**；
+2. `apply_all` 只收 `status == "ok"` ⇒ 这条补丁**永远进不了沙箱**；
+3. 但它**一直挂在累积实现里**，被 `_patch_blockers` 与 verify 当成"交付物不完整"的阻断项；
+4. 下一轮 dev 只会再写一条**同样对不上**的新 anchor ⇒ **一个修不掉的门永远挂在流水线前面**。
+
+修法：`patches.prune_unappliable`（`patches.py:1053`）在审计前把 `UNLOCATABLE`
+（`anchor_not_found` / `anchor_ambiguous` / `patch_span_mismatch` / `already_applied` /
+`patch_no_effect`）的补丁从实现里移除，**留痕**（日志 + `state.pruned_patches` + handoff 段落）。
+`unchecked`（文件不在仓库）**不裁** —— 那是 §26 的"文件始终没落盘"，必须继续阻断。
+mock 下不生效（合成的占位 modify 每条都定位不到，裁了就把流程测试基线一起裁了 ——
+与 `_orphan_modify_files` 同一条约定）。
+
+真机回放 `221511` 的实现：裁剪前 `ok=3 / problems=4` → 裁剪后 `ok=3 / problems=0`。
+
+#### 27.9.3 操作备忘：PM 强控闸门可以用脚本过
+
+`ref` 必须**逐字**等于 `open_questions[].question` 或 `unknowns[]/clarifying_questions[]`
+的条目文本；差一个字就是"接口说已保存、闸门不放行"（§26.4b 记过这个现象）。
+`runs/_gate.py <run_id>` 直接从产物取原文当 `ref`，三次运行均一次通过（13 / 8 条裁决）。
+
+#### 27.9.4 仍在观察 / 未做
+
+- **`new_file_syntax_error`（写残）是当前主要卡点** —— 属模型输出质量，
+  机械层已能精确判定并回灌，但**没有**"重问就修好"的证据（`[自检] 重问无进展` 说明改不动）。
+- `clean_symbol` 的**尾部标点剥离**（架构师把 uses 写成 `sqlite3.connect():`，
+  尾部冒号被误当"文件:符号"分隔符）已修 + 离线断言，**尚未在真机验证**。
+- P0-3 跨轮继承（`_rewind` 后 `compiler_ir` 是否保住）、P0-4 依赖图调度、
+  P0-5 `must_not_break`（`applies_to` 死结 + 只绑纯断言套件）、P1/P2 全部未做。
+
+### 27.10 更正：dev 返工轮的**方案被整份去掉**了（本轮修回）
+
+**自查发现的自身缺陷**（用户问"返工修复的提示词里，直接追加的方案变更，原版没有去掉吧？"）：
+
+| 通道 | 原版方案在不在 |
+|---|---|
+| **方案阶段返工**（`rework_architect`，`parts_plan`） | ✅ 在。有专门的「上一版方案（**必须在此基础上做差分修改**：未被返工项指出的 changes / tasks、文件划分与 task 编号一律保持原样）」块，返工项是**追加**的 |
+| **dev 阶段返工**（`rework_dev`，`_bugfix_parts`） | ❌ **被整份去掉了**。片段清单里根本没有 `plan`（只在 `_verify_view(verify, plan, …)` 里当参数用来算机械事实，不渲染） |
+
+MARKER 实测（同一份 plan）：
+
+| 内容 | 首轮 | 返工（修前） |
+|---|---|---|
+| `strategy` / `risks` | ✅ | ❌ |
+| `changes[].intent` / `approach` | ✅ | ❌ |
+| `tasks[].title` / `change` / `acceptance` | ✅ | ❌ |
+| 合计字符 | 737 | **256** |
+
+**这是本会话早先认下的失误**：当时说"裁剪只保留修缺陷必需的"，把 `plan` 也一起丢了，
+理由是"跨文件接口由 `api_digest_block` 提供" —— 那是把**接口摘要**当成**施工图**。
+用户当时指出"该丢的是需求/PM，不是方案"，我记下了但**没改**，直到这次自查。
+
+**为什么这处比看上去严重**：返工轮"要素"有两条兜底通道（按 task 分派时的
+`task_focus_block`、编排器钉在最前的 `api_digest_block` / `skeleton_block`），但
+**不按 task 分派时**（任务数 < 2，或施工图太薄回退整份方案）连施工图也不在场
+⇒ 返工轮的 dev 会变成「**无图纸按缺陷单改**」。没到达的还有 `strategy`、`risks` /
+`rollback`、以及未被返工项指到的其他 changes / tasks 全貌。
+
+修法（`prompts._bugfix_parts`）：
+- **方案补回并放在最前面**（顺序即优先级，`fit_prompt` 从末尾丢；首轮也是这么排的），
+  标题写成「按它的 changes / tasks 施工。本轮**只改**缺陷单与返工项指到的部分，
+  其余 changes / tasks 与文件划分一律不动」—— 既给图纸，又压住"重做整份方案"的倾向；
+- 与首轮共用 `include_plan` 语义：**按 task 分派时不重复喂整份方案**；
+- 顺带修一处同源不一致：返工视图的验收标准原先用 `_scope_view(scope)`，
+  把 PM 的**背景 / 影响面 / out_of_scope** 也带了回来（等于变相把需求物料带回来），
+  现已与首轮分支统一为**只取 `acceptance_criteria`**。
+
+修后 MARKER 复测：首轮 626 字（方案在、需求/PM 不在）；**返工 1224 字（方案在最前，
+需求原文 / PM 背景 / 影响面都不在）**；返工 + 按 task 分派 759 字（不喂整份方案）。
+
+断言已锁进 `tools/smoke_merge.py` ⑩（含"方案必须排在最前面"「返工轮带方案」
+「按 task 分派不重复喂」「验收只取 acceptance_criteria」）。
+
+**未在真机验证**：本改动只影响后续运行的提示词，需要用一次真机运行确认
+（观察返工轮 dev 是否按图改、`required_fixes` 走势是否收敛）。
+
+### 27.11 返工要**指明哪个 task、什么具体问题**（本轮加）
+
+**诉求**（用户提的）："返工应该指明哪个 task 的具体什么问题吧"。
+
+**此前的问题**：返工提示词给的是一串**无主的问题** —— "anchor 在原文里找不到：CLI"、
+"有 4 条补丁未能套用"、"新增文件的内容本身有语法错误"。读到它的人（评审、dev、人工）
+得自己去做「文件 ↔ 施工图」的映射，才知道该重做哪张图。而这份映射**本来就是机械可得的**：
+
+- 每条补丁自带 `covers_tasks`（编译期写进去的）；
+- 每张施工图自带 `target_files`。
+
+**归因来源，按可靠性排序**（能机械定的绝不让模型猜）：
+
+1. 补丁审计行自带的 `tasks` —— 最可靠，补丁自己声明的；
+2. 评审返工项的「`[文件 X]`」前缀 → 覆盖该文件的施工图（`target_files` 反查）；
+3. `implementation_audit.missing` —— 方案任务一条补丁都没覆盖，它**直接就是** task id。
+
+**落地（4 处）**：
+
+| 位置 | 改动 |
+|---|---|
+| `patches.py`（审计） | 每行加 `tasks`（来自 `covers_tasks`）；`problem_detail` 前缀带上施工图号：`［T-03］CLI：anchor 在原文里找不到` |
+| `tasktype.py` | 新增 `by_task_attribution`（`tasktype.py:176`），缺陷单新增 `by_task` 字段；`format_bug_report` 渲染「**按施工图归因**（哪个 task、什么具体问题；没被点到的图本轮不要碰）」，并去掉冗余的 `[文件 X]` 前缀 |
+| `prompts.task_focus_block` | 新增「⚠ **本张施工图上一轮的具体问题**（N 条，逐条解决）」。按 task 分派时这次调用只做这一张，必须把"这张图错在哪"直接摊在它面前 |
+| `orchestrator` | `_patch_blockers` 的阻断项点名施工图；`_dev_by_tasks` 给每张图挂上它自己的问题（浅拷贝，不改 state） |
+
+**渲染实测**（合成 state）：
+
+```
+- **按施工图归因**（哪个 task、什么具体问题；没被点到的图本轮不要碰）：
+    · T-03（cli.py）：
+        - 新增文件的内容本身有语法错误（写残/未闭合）：CLI（第 2 行：字符串未闭合）
+        - 评审要求：修参数解析
+    · T-05（main.py）：
+        - anchor 在原文里找不到：App
+        - 本轮**没有任何补丁**覆盖这张图（等于这张图没做）
+```
+
+以及施工图里的：
+
+```
+- ⚠ **本张施工图上一轮的具体问题**（2 条，逐条解决）：
+    · 新增文件的内容本身有语法错误（写残/未闭合）：CLI（第 2 行：字符串未闭合）
+    · 评审要求：修参数解析
+    只改这些；本张图之外的文件一条 edit 都不要提交。
+```
+
+**不扩大范围**：没有证据的施工图**不**被点名（断言锁死）。
+**续跑安全**：`plan` / `patch_audit` 都在 state.json 的 `artifacts` 层里（已核对，
+`compiler_ir` 也在），所以 `--resume` 之后归因仍然成立。
+
+断言锁进 `tools/smoke_bugfix.py`（新增 11 条）。
+
+**未在真机验证**：本轮改动只影响后续运行。
+
+### 27.12 根治：返工按「修复项」走，不再挂在方案的 task 上
+
+**起因**（用户提问）："BUG 修复师这个角色有无必要？基于方案给出的明确任务可以直接按要求开发，
+但测试或评审打回时应该是**基于已开发的代码**进行**具体问题描述**后修复，和接方案的任务处理机制是不同的。"
+
+**结论**：角色不必新增（每个阶段一次 LLM 调用，本地单模型驻留，切换有真实成本；已有
+`round_kind` 这一维，再加角色只会让两套契约漂移）。但**"处理机制不同"这一条我们只做了一半** ——
+契约分家了（`SYSTEM_NEW_BUGFIX` / 裁剪视图 / 范围判据），**任务来源仍是方案正向派发**。
+
+#### 27.12.1 半在哪里（两条根，都是实测级）
+
+**根 A：缺陷不属于任何施工图 ⇒ 没有任务可派 ⇒ 退回整批重做**
+
+返工任务此前只能来自 `plan.tasks`（`影响面 ∩ target_files`）。`affected` 为空或全部落在方案
+之外时，`_tasks_for_bugfix()` 返回空 ⇒ `per_task` 为空 ⇒ 调度落到「两遍模式整批重做」，
+**最小改动整个丢掉**。真机 `20260927-192001` 的 `state.bug_report.affected` **就是空的**。
+
+**根 B：只说"哪里错了"，没说"那处现在逐字长什么样"**
+
+真机 `20260927-221511`：dev 把 anchor 写成 `self.db.add_entry(amount, note)`，实际代码是
+`self.db.add_entry(args.amount)` —— 凭记忆改写的近似行 ⇒ 永远套用不上 ⇒ 被累积成恒定判负项。
+`prune_unappliable` 治的是症状；**根因是缺陷描述里没有可逐字对齐的原文**。
+
+#### 27.12.2 落地
+
+| 件 | 内容 |
+|---|---|
+| `patches.symbol_excerpt`（`patches.py:816`） | 从原文取某符号的**逐字原文 + 行号**。**复用既有的** `symbol_span`（行级、多语言，`analyze_edit` 一直在用），不另起一套 |
+| `tasktype.defect_items`（`tasktype.py:252`） | **修复项**：`{位置, 问题, 当前逐字原文, 验收口径, 归属施工图}`。来源：① 补丁审计非 ok 行；② verify 失败命令的 **traceback 行号**（`File "…", line N` → 取那几行原文）；③ 评审返工项的 `[文件 X]`；④ 整张图没做 |
+| `tasktype.plan_gap_files`（`tasktype.py:218`） | 修复项指向、但**方案没有任何 task 覆盖**的文件（**方案漏项**） |
+| `orchestrator._plan_uncovered_defects`（`orchestrator.py:3647`） | 判出方案漏项后**由机制强制 `rework_architect`**（判 `rework_dev` 开发也改不动 —— 它受方案白名单约束，**无权创建方案里没有的文件**）。排除测试文件（`test_*.py`），mock 下不生效 |
+| `orchestrator._current_candidates`（`orchestrator.py:1804`） | 把「当前代码从哪来」抽成**唯一一份实现**：`_current_code_text`（喂 dev 的正文）与 `_current_sources`（缺陷单摘原文）**同源** —— 不同源的话，缺陷单给的原文与 dev 看到的正文对不上，照着抄也没用 |
+
+缺陷单渲染实测（合成 state）：
+
+```
+- **修复项**（按施工图分组；没被点到的图本轮不要碰）：
+    · T-03（cli.py）：
+        - [cli.py:8] 运行验证失败：`python cli.py add 1 x` 崩在这里（退出码 1）
+          当前原文（**逐字对齐，不要凭记忆改写**）：
+             8|     def add(self, args):
+             9|         self.db.add_entry(args.amount)
+          验收：命令 `python cli.py add 1 x` 退出码 0
+    · （**不属于任何施工图**：extra.py）：      ← 这类会被机制判回方案补规划
+        - [extra.py] 评审要求补个 helper
+          验收：评审点到的这个问题必须消失
+```
+
+**踩到并修掉的自伤**：我先写的 `symbol_span` **同名覆盖**了既有的多语言行级定位器，
+`analyze_edit` 当场炸在 `ast.parse` 上（mock 回归 exit=1）。现已改为**复用**既有实现。
+教训与 §27.11 一致：**新增前先查同名**。
+
+#### 27.12.3 真机进展（`20260927-232040`）
+
+- `[补丁裁剪] 3 条定位失败已移除`；
+- **`[补丁校验] 可套用 5 条 / 有问题 0 条`** —— 历次运行里**第一次 0 问题**；
+- 新暴露一条：`[覆盖审计] 引用了不存在的任务 id: ['T-05']`（dev 编造 task id），待查；
+- 本轮改动（修复项 + 方案漏项回流）**未在真机验证** —— 需要在一次运行里走到返工轮观察。
+
+### 27.13 真机验收（`20260928-000351`）：三样新机制都生效，但抓出一个误报
+
+**生效的部分**（日志 + `state.json` 双证据）：
+
+```
+[缺陷修复模式] 缺陷单已生成：3 条复现命令、范围 2 个文件（db.py、importlib.py）
+[按 task 分派] 共 2 张施工图，逐张施工          ← 返工只重做受影响的图（最小改动由调度保证）
+[补丁裁剪] 3 条定位失败已移除
+[补丁校验] 可套用 10 条 / 有问题 0 条           ← 连续第二次 0 问题
+[逐项验收] 3 条修复项：转绿 1 / 仍失败 2 / 无从核对 0
+```
+
+`state.artifacts.bug_report.items` 的每条都带 `where / task / source / what / check`
+（`db.py → T-02`、`cli.py → T-04`），`defect_verdicts` 三类状态都真实出现
+（含一条 **green**：`py_compile cli.py db.py main.py → ok`）。
+
+**没覆盖到的一条（诚实说明）**：这一轮的 3 条修复项都来自"命令未通过（无 traceback 定位）"
+与"整张图没做"，**都没有符号或行号** ⇒ 没有触发"逐字原文"。该能力只有离线断言背书。
+
+#### 27.13.1 误报：标准库路径被当成"方案漏规划的文件"
+
+```
+[机制] 缺陷指向方案未规划的文件（importlib.py）→ 强制 rework_architect（判 dev 它也改不动）
+```
+
+根因：verify 的导入自检命令形如 `python -c "import importlib, sys; …"`，被
+`tasktype._paths_from_command` 反推成 `importlib.py` ⇒ 变成一条"缺陷" ⇒ 进 `affected`
+⇒ 既污染 `allowed_scope`，又触发**方案漏项回流**，白烧一轮架构师。
+
+修法（三处，都有断言）：
+1. `_paths_from_command` **排除标准库 / 内置模块**（`sys.stdlib_module_names`）；
+2. `_match_known` 不认 `<frozen …>` / `site-packages` / `…/lib/python…`，
+   且**沙箱外的绝对路径一律不认**（收敛不到已知文件就不猜）；
+3. 顺带修掉一个更隐蔽的缺陷：`_IMPORT_MODULE` 正则**只抓逗号列表的第一个模块**，
+   而 verify 的导入自检正是 `import a, b, c` 形式 ⇒ `affected` 偏窄、`allowed_scope`
+   被无谓缩小。现在 `from X import …` 取 `X`、裸 `import a, b` 逐个取（各取顶层包名）。
+
+#### 27.13.2 新瓶颈：dev 单张图的输出被截断
+
+```
+[按 task 分派] T-02 本次调用失败（OllamaError：输出连续被截断…当前上限 12288 tok）
+[按 task 分派] T-05 本次调用失败（连续 3 次未通过契约校验：撞 num_predict=1536 上限）
+```
+
+逻辑没问题（单张图失败被隔离，其余继续施工），但**粒度或输出上限**成了新瓶颈：
+7B 在一张图上写较长代码时会被截断。待定方向：再收小 task 粒度（`symbols ≤ 3`？）、
+提高该阶段 `num_predict`、或对"大图"恢复分片写入。
+
+#### 27.13.3 另一条待查（关联）
+
+裁剪里包含 `patch 与原文完全相同（等于没改）`（`patch_no_effect`）。它与 `already_applied`
+（幂等命中，**良性**）语义不同：前者意味着"dev 声称改了、其实一个字符没变"，
+把它们一起裁掉会**丢掉这条信号**（底层缺陷仍在，verify 会再抓到，但评审看不到了）。
+列入待查：`UNLOCATABLE` 是否应只保留 `already_applied`。
+
+### 27.14 根治「单张施工图的输出被截断」（2026-09-28）
+
+**现象**（真机 `20260928-000351`）：
+
+```
+[按 task 分派] T-04 本次调用失败（OllamaError：输出连续被截断，已抬高上限 1 次仍不完整（当前上限 12288 tok / num_ctx=24576））
+[按 task 分派] T-02 本次调用失败（同上，当前上限 12288）
+[按 task 分派] T-05 本次调用失败（连续 3 次未通过契约校验：撞 num_predict=1536 上限）
+```
+
+**为什么产生的（三条，逐条有据）**：
+
+1. **"抬高上限"只允许一次**：`_MAX_ESCALATIONS = 1` ⇒ 6144 → 12288 → 再截断即放弃。
+   而这个值来自一次**重复循环**的真机观察（`20260927-134222`：6144→12288→20161 连撞三次
+   仍失败、白烧 38k token）—— 那是**退化**路径，现在已由 `_looks_degenerate` 分流处理，
+   却一直在吃非退化截断的预算。
+   **真正的限制不是上下文**：`num_ctx=24576`、prompt 才 4016 tok，可用余量约 20k。
+
+2. **退化分支会把上限压低，且可以反复压**：`limit = max(_MIN_PREDICT, limit // 2)`。
+   我第一版的"只压一次"判据写成 `escalations == 0` —— 而**压低不增加 `escalations`**
+   ⇒ 6144→3072→1536→…→512，**越压越写不完**。报错里那个 `num_predict=1536`
+   （= 6144 // 4）就是"压了两次"的产物。
+
+3. **失败即跳过，没有任何补救**：`OllamaError` 的原文自己就在说"让产物更短
+   （**拆分任务**、减少条目）"，但那是**写给人看的建议** —— 结果是这张图本轮干脆没产出。
+
+**修法（三处）**：
+
+| 位置 | 改动 |
+|---|---|
+| `ollama_client.py` | `_MAX_ESCALATIONS` 1 → **3**；非退化截断**按上下文余量继续抬高**（`room <= limit` 才是硬闸），并在报错里带上 `可用余量` |
+| `ollama_client.py` | 退化路径**单独计数** `lowered`，**只压一次**；其后转为抬高（"越压越短"是必然写不完的） |
+| `orchestrator.py` | 截断失败 → **机械拆半重试**（`_dev_split_retry`）：把该图的 `symbols` 对半、逐半调用，两半都不越原图范围。抽出的 `_dev_task_call` 让**主路径与拆半路径共用同一份组装**（两处各写一份迟早漂移） |
+
+**注意一条纪律**：改报错文案时把「输出被截断」「num_ctx」两处字样改没了，
+`smoke_mock` 的断言当场抓住（它用这两个词识别这一类失败）—— **文案也是契约**，
+已改回并在源码注释里写明。
+
+**断言**：`smoke_mock` 新增 4 条 —— 连续两次截断仍继续抬高（`[4096, 8192, 16384]`）、
+上限逐次抬高、退化时先压低、**退化只压一次**（其后转为抬高）。
+
+**未在真机验证**：需一次新运行才能确认（本次运行 `20260928-000351` 是改动前启动的）。
+
+
+## §28 角色隔离：三类任务各自一套契约 + 机械失败归因（2026-09-28）
+
+### 28.1 起点：一个"看起来已经解决"的问题
+
+`dev` 早就分了两套系统提示词（`SYSTEM_NEW_BUGFIX`，真机 `20260926-214757` 四轮零进展的直接产物）。
+实测之后发现**只分了 dev 这一层**：
+
+| 漏点 | 实测事实 | 后果 |
+|---|---|---|
+| **test / review 没分** | `system_prompt("test","new","bugfix")` 与 feature **逐字相同**（2029 字）；`review` 同为 1702 字；`parts_test` / `parts_review` 里 `bugfix` / `round_kind` 出现 **0 次** | 返工轮里 test 仍要求"为全新项目补新功能测试"、review 仍重提首轮取舍；而 dev 受机械约束（`allowed_scope` / 方案白名单）**只被授权改缺陷单范围** ⇒ 两条口径对撞、白烧一轮 |
+| **方案返工轮被当成修缺陷** | `round_kind` 由「`fixes` 有没有」派生；`_step_review` 赋 `self.fixes` 后走 `_begin_round("architect_plan")`，没人清它 | 架构师刚重做方案（可能新增文件与符号），dev 却拿到"只改缺陷单指到的部分、**其余文件划分一律不动**"⇒ 与"按新方案施工"正面对抗 |
+| **bugfix 视图尾部拼首轮任务段** | `parts_dev` 在 `_bugfix_parts(...)` 之后**无条件**继续走 `if dev_pass == 1:`，拼上"【任务】按方案实现代码改动" | 靠 `_dev_rework_note` 去"盖住"它 —— **顺序压制**而非视图互斥，顺序一变或被 `fit_prompt` 裁掉就漏回来 |
+
+结论：这不是措辞问题，是**任务边界**问题（见 `tasktype.py` 顶部那段"角色按能力分"的说明）。
+dev 无权动方案外的文件，而其它角色按首轮口径提要求 ⇒ 要求落在它无权执行的地方。
+
+### 28.2 落地
+
+| 文件 | 改了什么 |
+|---|---|
+| `pipeline/diagnose.py`（新） | **机械失败归因**：`classify` 一次确定性产出「为什么没修好（`type`）」与「下一跳去哪（`recover_stage`）」；`ledger` 跨轮缺陷台账；`render` / `ledger_line` 统一留痕文案。纯函数：不碰 `self`、不调模型、不写 state |
+| `pipeline/tasktype.py` | 新增 `PLAN_REWORK` + `ROUND_KINDS` + `round_kind_label`（任务类型两值 → **三值**） |
+| `pipeline/prompts.py` | `SYSTEM_NEW_BUGFIX` 补 `test` / `review`；新增 `SYSTEM_NEW_PLANREWORK`（dev）与 `SYSTEM_NEW_ROUND`；`system_prompt` 三值查表 + 未覆盖阶段回退；`prompt_version` 带任务类型后缀；`parts_dev` 三视图 + **尾部任务段按任务类型互斥** |
+| `pipeline/orchestrator.py` | `round_kind` 不再派生：由**路由决策点**写入（`_mark_next_round`）、`_begin_round` 消费并落到 dev 轮、持久化进 state（续跑 / `--from dev` 可恢复）；`_step_review` 的**七层 if 链换成一次 `diagnose.classify`**，逐轮落 `state.failure` + `failure_history` + 轮次记录里的 `failure`；接入缺陷台账；机械证据只取一次（轮次记录与归因共用同一份） |
+| `pipeline/issues.py` | 指纹纳入**按任务类型分的全部提示词**（漏一套 = "改了返工口径却声称可比"）；`system_prompts()` 让元优化也看得到返工那几套 |
+| `tools/smoke_prompts.py`（新） | 角色隔离契约：三值 ↔ 提示词表一一对应、三类任务文本互不相同、三种视图互斥（含"返工轮不再拼首轮任务段"）、老调用点兼容、版本标识能区分返工 |
+| `tools/smoke_diagnose.py`（新） | 归因优先序（根因优先于症状）、**去向与历史 `_step_review` 完全一致**、重复信号只记录不改路由、台账跨轮守恒 + 回归 |
+| `tools/smoke_bugfix.py` | 那条**锁住缺陷**的断言（"test 返工轮与首轮相同"）改成锁住修正 |
+| `tools/smoke_all.py` | 登记三套（`smoke_prompts` / `smoke_planir` / `smoke_diagnose`）—— `smoke_planir` 此前也**漏登记**，汇总跑不到它 |
+
+### 28.3 纪律：先观测、再改行为（这一节是刻意留白，不是没做完）
+
+- **归因与去向分离**：`owner`（谁能改）与 `recover_stage`（本轮实际去哪）**允许不一致**，
+  并显式标 `owner_mismatch`。契约虚依赖归因指向方案层，但**路由暂不动它** ——
+  改路由是改行为，要有基线数据；不标出来的话这份数据会被误读成"机制已经这么做了"。
+- **重复只记录**：同型归因连续 N 轮 → `repeat` / `escalate_suggested`，
+  日志里说"建议升级去向（本轮仅记录）"。先看真机分布，再决定阈值与升级目标。
+- **台账不替人下结论**：`dropped`（上轮仍开、这轮不再出现）**不自动判为已修复**
+  （也可能是漏报），并单独标 `regressions`（上轮转绿又红）—— 那才是台账最有价值的一条信号。
+
+### 28.4 回归
+
+`smoke_all` **13 套全绿**（`smoke_mock` 650+ 条端到端在内）；`smoke_ui` 29/29（真浏览器）；
+`check_refs` 一致（有效 70 条 / 带符号 35 条）；`flow.assert_valid()` 通过；
+`issues.pipeline_fingerprint()` 正常（`compiler_hash` + `compiler_input_version=1`）。
+新增断言：`smoke_prompts` 31 条、`smoke_diagnose` 29 条。
+
+### 28.5 顺手修的两处陈旧断言（**不是本轮引入**）
+
+- `tools/smoke_client.py` 4 条：上一节改 `ollama_client.py`（`_MAX_ESCALATIONS` 1→3、
+  退化路径 `lowered` 单独计数"只压一次"）时**没同步更新测试**。本轮按已记录的新口径改：
+  普通截断 `原值 → ×2 → ×2`（且被上下文余量夹住，抬不出 `num_ctx`）；
+  退化 `原值 → ÷2 → ×2`，且"你在重复"的提示**只在被判定重复的那一次**重试里出现
+  （之前只断言"最后一次"，会把这条机制测成空转）。
+- `CONTEXT.md` **17 处行号漂移**：本轮插行导致，已按符号真实位置回填（`check_refs` 复检一致）。
+
+### 28.6 未做 / 未验证
+
+- **未跑真机**。需要一次真机确认三件事：① 返工轮的 test/review 是否真的不再提首轮级要求；
+  ② `round_kind` 三值是否落到**正确的轮次**（尤其"方案返工后 dev 的口径"）；
+  ③ 归因台账在真实返工链路上的读数是否符合预期。
+- 按上一轮的排序，仍待做：**恒编译择优**、**去线性依赖图**、**机械 Design/Code Gate**、
+  **`check_contracts`（Schema Guardian，三方契约比对）**、**typed verification**（三条语义先定）。
+- 明确否决（理由见 §27）：为这些判定**新增 LLM 角色**。可行时优先"契约角色 (a)"（同一阶段换契约）
+  或"服务角色 (c)"（纯函数），只在"独立输入 + 独立判据 + 独立去向 + 独立产物"四条同时成立时才开阶段 (b)。
+
+
+## §29 真机跟进（run 20260928-095848）：§28 的验证 + 三个真 bug（2026-09-28）
+
+### 29.1 §28 的验证结论：**新机制在真机上全部生效**
+
+| 验证点 | 真机证据 |
+|---|---|
+| 三值任务类型落到正确轮次 | `== 迭代 1: … （本轮口径：首次开发）` → `round_kind=feature`；`== 迭代 2: 开发 -> 测试（本轮跳过评审）（本轮口径：缺陷修复）` → `round_kind=bugfix`，且**持久化进 state**（`_snapshot` 把整个 state 存进 `artifacts`，`_restore` 整份读回）|
+| 返工轮真的换了契约 | 埋点：首轮 `dev.v1-new`、返工轮 `dev.v1-new-bugfix`；`[缺陷修复模式] 缺陷单已生成：2 条复现命令、范围 3 个文件` |
+| 机械归因落盘可用 | `评审判定: rework_dev（材料内可改 4 项 / 方案层 0 项 / 需外部确认 0 项）` → `[归因] 沙箱跑不通（owner=dev）`，`state.failure` 里 evidence 逐条点名（`from cli import CLI，但 cli.py 并没有定义 CLI` …），`failure_history` 逐轮累积 |
+| 缺陷台账 | `[缺陷台账] 第 1 轮：仍开 0 条（本轮新增 0） / 转绿 0 条 / 不再出现 0 条`（首轮无逐项验收 ⇒ 如实为空，不编数字）|
+| P0-0 再确认 | `changes[].symbols` **4/4 = 100%**（历史基线 0/43）|
+| 归因指向是否正确（人工复核）| 归因判 `verify_failed / owner=dev` **是对的**：验证失败是 dev 自己发明了方案没声明的跨文件引用（`logic.delete_entry` / `generate_entry_list` / `get_all_entries`），不是方案漏项。`plan_unresolved` 是另一件事（见 29.4）|
+
+### 29.2 抓到并修掉的真 bug
+
+**（a）跨函数引用局部变量 → "补漏符号"整条机制空转（5/5 张图）**
+
+`_dev_by_tasks` 的补漏重试引用了 `_dev_task_call` 里的局部变量 `focus` ⇒ 每次补漏抛
+`NameError`，被兜底吞掉（单张图失败不该拖垮整轮，这是对的），日志里只有一行
+"补符号这次调用失败"，**机制已死而没人知道**。后果可以一路追到验证失败：
+T-02 漏 `create_table/add_entry/get_all_entries`、T-05 漏 `CLI()` → `verify` 报
+`main.py 里 from cli import CLI，但 cli.py 并没有定义 CLI`。
+
+修法：抽出 `_task_focus`（主路径 / 拆半 / 补漏**三处共用一份**），并把补漏的
+`only_paths` / `current_code` 与主路径对齐（此前补漏会看到**全量代码**，容易顺手改别的文件）。
+
+**（b）闸门缺口：配了 ruff 却没人跑 —— 这类 bug 本该在离线拦住**
+
+`ruff` 的 `F821` 一行就定位到 `orchestrator.py:3356`。项目 `pyproject.toml` 里的规则集是
+实测挑过的（关 E501/RUF00x，留 E4/E7/E9/F/B/C4/SIM），**只是没接进回归**。
+新增 `tools/check_lint.py` 并登记进 `smoke_all`（排在最便宜的位置）：
+· **阻断** `F821` 未定义名 / `F811` 重复定义 / `F402` 循环变量遮蔽导入（都会在运行时致损）；
+· **非阻断** 其余（当前 27 条 F841/SIM/C4…）**只登记欠账**，否则闸门长期发红、
+  人会习惯性忽略它（比没有闸门更糟）。
+顺手修掉唯一那条阻断项：`pm_unresolved_items` 的循环变量 `field` 遮蔽了
+`dataclasses.field`（今天不炸，但只要有人在该循环之后再定义 dataclass 就会撞上难查的 TypeError）。
+
+**（c）收尾没兜底 → Ollama 瞬断时整个运行带 traceback 退出**
+
+真机现场：第 2 轮 3 张图跑完 → 自检发现问题 2 处 → **带问题重问 dev**（阶段级调用）
+→ 此刻 Ollama 瞬时拒绝连接（`WinError 10061`），而它没走模型输出的重试路径。
+`_execute` 的兜底正确接住（`status=paused` + `needs_human=True` + **cursor 不前移**，
+续跑从 dev 重进）；**但 `_finish` 里"卸载模型释放显存"的 `client.ps()` 没有兜底**，
+同一个拒连把它也打挂 → 异常从 `resume()` 冒到 `cli` 顶层：**summary 没写、handoff 未更新、
+交付没尝试**，进程带 traceback 退出（`state.json` 还停在 paused，页面看着像"还在跑"）。
+
+修法：给该收尾动作加兜底，只记一行 `[收尾] 卸载模型失败（不影响本次结论）`。
+纪律与 `_execute` 那条"任何阶段异常都不许让运行隐身死掉"是同一条 —— 当时只护住了阶段循环。
+
+**（d）埋点误标**：`dev-T-01` 这类逐图调用被一律写成 `+skeleton`（真机 6 条 dev 调用全中），
+"骨架调用"与"逐图调用"在埋点里分不开 —— 而本轮返工口径归因正是靠这个字段。
+改成 `+{artifact_stage}`（`architect_plan.v2-new+architect_skeleton`、`dev.v1-new+dev-T-01`）。
+
+### 29.3 新工具
+
+`tools/fix_refs.py`：把 `CONTEXT.md` 里 `file:line symbol` 的行号按符号真实位置回填
+（与 `check_refs` 同一套解析与判定窗口）。**每次在引用点之上插行都会漂移**，这是必然的，
+做成常驻工具比每次手改可靠。它**不进** `smoke_all`（那是检查，这是改文档的动作）。
+
+### 29.4 观测到但**尚未行动**的三件事（都是"先记录、再决定"）
+
+1. **IR 白算 —— "恒编译"的直接证据**：这次 `plan_conflicts=[multi_task_same_file]`
+   （`main.py` 被 `T-01` / `T-05` 两张图覆盖，IR 已合并为一个 unit），但
+   `plan_compiled_reasons=[]` ⇒ `compile_tasks` **没跑** ⇒ dev 仍按架构师的 5 张图分派
+   （`main.py` 被施工两次）。即：**归一层的结论没有传导到执行**。→ P0-3（恒编译择优）。
+2. **方案与骨架互相矛盾**：`plan_unresolved = ['logic.add','logic.remove','logic.list_entries']`
+   —— 方案声明 `contracts.uses` 引用这些符号，而**骨架那次调用**（另一份提示词）给出的
+   `logic.py` 接口里没有它们。解析器如实暴露（不猜），但两次调用"各说各话"本身值得治。
+3. **瞬时传输错误不重试**：一次连接拒绝就中止该阶段。与"模型输出不合格要重试"是两回事，
+   建议给传输层加短退避重试（次数/退避/异常集合需先定，未做）。
+
+### 29.5 环境事实（影响后续排期）
+
+这次运行 14B 阶段的 **prefill 只有 5.0 / 8.5 / 13.2 t/s**（代码里的基线是 150），
+`vram_ratio` 全为 1.0（都在显存）：一次评审 prompt 4859 tok → **1036s**；
+同一台机器上 7B 的 prefill 是 160–500 t/s。⇒ **14B 阶段的 prompt 长度直接决定墙钟**，
+这给"给 14B 阶段裁上下文"（P1 Context Manager）提供了可量化的理由。
+另：全程 CPU/显存之外还有 IDE 自身在抢（CodeBuddy 三进程累计约 1900s CPU）。
+
+### 29.6 回归
+
+`smoke_all` **14 套全绿**（新增 `check_lint`）· `check_refs` 一致 · `flow.assert_valid()` 通过。
+`state.json` 的读法注意：阶段产物与新增状态键（`plan` / `compiler_ir` / `round_kind` /
+`failure` / `defect_ledger`）都在 **`state["artifacts"]`** 下，不在顶层。
+
+
+## §30 内容审查优先：喂给 LLM 的东西本身不合理（2026-09-28，真机 095848 / 110402）
+
+**这一轮的纪律**：先看"实际喂进去的内容"，再谈推导 —— 因为这一轮找到的问题**全是内容问题**，
+没有一条能靠"换个更强的模型"解决。工具：`tools/show_prompt.py`（`--list` / `--stage` /
+`--outline` 段落骨架 / `--out DIR`），数据源是 `traces.jsonl` 里完整的 system + user。
+
+### 30.1 根因级内容 bug：骨架调用**看不到方案声明的符号**
+
+`parts_skeleton` 只喂 `path` + `intent`，把 `changes[].symbols` **丢了**（理由写在文档里是
+"不喂实现细节，免得模型去复述实现"—— 但 `symbols` **不是实现细节，它就是接口声明**）。
+后果是**两次调用各写一套名字**：
+
+    骨架这次调用（看不到 symbols）→ `class App` / `def main(args)`
+    施工图（来自 plan.tasks[].symbols）→ `main()` / `CLI()`
+
+两份要求**同时**喂给 dev，且都注明"必须逐字一致" ⇒ dev 无论怎么写都被自检判"漏了声明过的符号"
+（真机 `095848`：5/5 张图全中），随后 verify 必然报跨文件接口不一致。
+修法：`parts_skeleton` 带上"要定的符号（方案已声明，逐个落实）"。
+**验证**（真机 `110402`）：`skeleton_gaps` 为 None、`plan_unresolved` 从 3 条降到 **0** 条。
+
+### 30.2 字符串被当可迭代对象：约束字段被逐字拆开
+
+真机 dev 收到的是：
+
+    - 必须遵守的约束：
+        · 必 / 须 / 使 / 用 / 标 / 准 / 库 / ，…
+
+`planir` 里 `constraints` / `depends_on` / `contracts.uses` / `symbols` 四处都写成了
+`for x in (field or [])` —— 字符串是可迭代的，于是**逐字**产出十几个"条目"，约束字段彻底失效。
+当时只有 `acceptance` 有 `isinstance(str)` 的保护。修法：新增 `_as_list()` 统一入口
+（字符串 → 单项、dict → values、**生成器也要收**），四处全走它。
+
+⚠ 踩坑记录：`_as_list` 第一版只认 `list/tuple`，于是 `_dedup(x for x in ...)` 传进去的
+**生成器被当成空** —— 符号清单整个变空且**不报错**。是"回放真机方案对比"时才看出来的。
+
+### 30.3 同一符号两种书写并存
+
+`changes[].symbols` 真机写成 `main()`（带调用括号），而 task 那一路已过 resolver 的
+`clean_symbol` ⇒ 裸名 `main`。IR 定稿后清单里**两项并存**，提示词里就成了"要定义两个东西"。
+修法：`changes` 入口也做 `clean_symbol`，并在定稿处再兜底归一一次（幂等）。
+验证（回放 `110402` 的方案）：`main.py` 从 `['main','run_command','main()','parse_args()',…]`
+变成 `['main','parse_args','run_command','handle_list','handle_remove']`。
+
+### 30.4 缺陷单里的"复现步骤"是坏命令
+
+`tasktype._short(command, 200)` 把 `\n` 压成空格 —— 而 verify 的导入自检命令是一段**多行
+Python 脚本**（`python -c "import importlib, sys\nbad = []…"`），压平后语法作废、还带个 `…`。
+而且它**不是用户行为**（harness 自造），让模型去"修一条它造不出来的命令"纯属噪声。
+修法：`_cmd_text()` 保形（保留换行、首尾各留一半），并把机械自检命令与真复现步骤**分开**
+（`repro_steps` / `mechanical_checks`），缺陷单里明写"别改它本身"。
+
+### 30.5 闸门缺口：配了 ruff 却没人跑（与 §29 同源，这里补上工具）
+
+`tools/check_lint.py` 已进 `smoke_all`：阻断 `F821/F811/F402`，其余只登记欠账。
+
+### 30.6 顺带做成常驻工具的两个
+
+- `tools/pm_decide.py`：PM 强控闸门的人工裁决（**必须显式给答案**，不自动猜 —— 裁决会写成
+  下游可见的"陈述"，机器编的假设伪装成人工结论比不裁决更糟）。`--list` / `--set N=答案` /
+  `--answers-file`，提交后**复算闸门**。
+- `tools/fix_refs.py`：`CONTEXT.md` 行号回填（见 §29）。
+
+### 30.7 真机 `110402` 的验证读数
+
+| 观测 | 结果 |
+|---|---|
+| 编译器是否真跑 | **跑了**：`plan_compiled_reasons=['main.py 被 3 张图覆盖，超过上限 2']` → 生成 6 张施工图（`095848` 那次 IR 把 main.py 合并了却因"无需编译"被**白算**） |
+| 骨架输入 | `要定的符号（方案已声明，逐个落实）: [main(), parse_args(), run_command()]` |
+| 声明 vs 基准 | `skeleton_gaps=None`、`plan_unresolved=[]` |
+| 补漏重试 | `dev-T-0X-repair` 在 **5/6** 张图上真的执行（`095848`：5/5 全靠 `NameError` 空转）；`dev_task_failures: null` |
+| 自检 | `[自检·导入] 所有模块全部 import 通过` |
+
+### 30.8 审出但**未改**的三处（留待下轮，避免一次改太多无法归因）
+
+1. **test 阶段 63% 的预算给"实现全文"**：`【开发实现结果】15970 字`（prompt 9106 tok / ctx 24576），
+   而它要产出的是"用例 + 命令"。给全文会把注意力拉去读实现；对 14B 阶段更是直接决定墙钟
+   （见 §29.5：prefill 5–13 t/s）。
+2. **验收命令可能不可执行**：真机见到 `python main.py add … && sqlite3 ledger.db 'SELECT …'`
+   —— `sqlite3` CLI 本机没有，且 `&&` 会被 verify 的"含 shell 语法不执行"规则拒掉。
+   需要确认"程序不可用"是否已触发 test 重写（目前看只记录）。
+3. **审查记录**：评审 prompt 的机械证据是 **pin** 住的（`fit_prompt` 把 pinned 拼在末尾），
+   所以"裁剪丢证据"的怀疑**核实后不成立** —— 记在这里，省得下次再怀疑一遍。
+
+
+## §31 内容审查（第二轮）：占位说明污染判据 + 首轮口径冲突（2026-09-28）
+
+工具：`tools/show_prompt.py`（新增 `--outline`：打印**段落骨架 + 各段字数 + 预算**，
+比读全文更快定位"缺段 / 某段吃掉预算 / 顺序不对"）。
+
+### 31.1 根因：一句"占位说明"把判据污染成恒真
+
+`retrieval.render_excerpts([])` 在**空池**时返回的是一句占位说明（`（未提供存量代码；…）`）——
+看着无害，实际被当成"有没有可锚定的原文"的判据：
+
+    has_code = bool(excerpts_text.strip() or current_code.strip())   # 恒为真
+
+后果（真机 `20260928-110402` 与 `095848`，**首轮 6/6 张施工图全部命中**）：
+每张图的 user 走的是「输出**符号级 edits（补丁）**」分支（暗示用 anchor 定位），
+而同一份 prompt 里**没有任何可锚定的代码**（`【当前项目已有代码】` 一次都没出现），
+system 又写着「全新项目一律 `add` + `full_symbol`、anchor 留空」——
+三句话互相矛盾，模型折中出 `modify` + 近似 anchor ⇒ 补丁套用不上
+（真机 `095848` 的 `[补丁裁剪] 4 条定位失败的补丁（anchor 在原文里找不到）`）。
+
+**修法（数据层）**：`render_excerpts([])` 返回**空串** —— 占位说明属于**呈现层**，
+数据层只该如实回答"有没有"。并给 `parts_dev` 加**结构化判据** `code_available`
+（编排层按"池里有真片段 或 当前实现里有真代码"算），字符串检查仅作兜底。
+
+**连带修复**：`orchestrator` 的两遍模式开关 `DEV_TWO_PASS and (code.strip() or current.strip())`
+**也在依赖那句占位说明**（池空时条件恒真）。占位去掉后新建项目会被**静默降级为单遍** ——
+那是行为变更，而两遍模式本就是为"没有可锚定材料"设计的（见 `parts_dev` 的「第一遍·脚手架」）。
+已显式化为 `elif DEV_TWO_PASS:` 并写明原委。`smoke_mock` 的 8 次调用基线因此保持不变
+（它先挂在 7 次 —— 这条断言正好证明了开关的隐式依赖是真的存在）。
+
+### 31.2 首次自检重问里注入了"跨轮返工口径"
+
+首轮的 system 契约是「一律 `add` + `full_symbol`」，而 `_dev_rework_note` 注入的是
+【返工口径·锁基准/定范围/最小改】，其中第 1 条写着"必须基于**下面给出的**当前产物修改"
+—— 而首轮**根本没有当前产物**（`【当前项目已有代码】` 不存在）。同一次调用里两句话正面冲突。
+
+修法：口径按 `round_kind` 分三档（首轮自检重问 / 方案返工后施工 / 跨轮最小改），
+两条通道（`fixes` 评审返工、`repair` 自检问题）都看，选哪档由本轮任务类型决定。
+
+### 31.3 逐图调用看不到别的图产出的代码（**核实后判定为设计如此**）
+
+首轮 `dev-T-02..T-06` 的 prompt 里也没有 `【当前项目已有代码】`：因为 `_dev_by_tasks` 的累积实现
+存在**局部变量**里，尚未写回 `state`，而 `_current_code_text` 读的是 state。任务之间靠
+**接口基准 + 已产出接口摘要**对齐（那两块都在 prompt 最前面），所以这是刻意设计，不是漏洞。
+记在这里，省得下次再怀疑一遍。
+
+### 31.4 审查记录：评审的机械证据是 pin 住的
+
+`fit_prompt(parts, budget, pin)` 把 pinned 段拼在**末尾**且永不丢弃，评审的
+【实现覆盖审计】【补丁机械校验】【测试覆盖审计】【影响面扫描】【语义检查】全在 pin 里
+（真机 `review` 的 9/9 段都在）。所以"裁剪把机械证据丢了"的怀疑**不成立**，
+`截断=True` 只说明末尾某段被截短。
+
+### 31.5 仍未改（下轮）：test 的预算结构
+
+真机 `test`：user **34438 字**，其中 `【开发实现结果】22664 字`（**66%**），
+prompt 11794 tok / ctx 24576，且 `【任务】` 段已被裁掉。test 需要的是"接口 + 要测的行为"，
+不是几百行实现正文；对 14B 阶段更是直接决定墙钟（§29.5：prefill 5–13 t/s）。
+
+### 31.6 回归
+
+`smoke_all` **13 套全绿**（含 `smoke_mock` 的 8 次调用基线）· `check_refs` 一致 ·
+`ruff` 阻断类规则 0 条 · `flow.validate()` 通过。
+新增断言：`smoke_prompts` 43 条（含 3b/3c/3d 三节：骨架输入、`has_code` 判据、三档返工口径）。
+
+
+## §32 「跑不下去」的四个真原因（真机 20260928-110402，2026-09-28）
+
+起因：dev 阶段看起来跑了 1900+ 秒、页面显示"已运行 2000 秒"，运行被人工杀掉。
+
+### 32.1 先说测量方法（第一版测错了）
+
+用 `llm-calls.jsonl` 的 `prompt_s + gen_s` 求和得"总模型时间 342s"，与体感差一个数量级。
+**原因是那份记录里 `gen_s` 恒为 0**（`gen_tps` 有值）—— 照它算等于把生成时间整段丢掉。
+改用**产物文件 mtime** 重建时间线（每个阶段收尾都写一份 `NN-<stage>.json`，mtime 即完成时刻）：
+
+| 段 | 墙钟 | 构成 |
+|---|---|---|
+| architect_plan + skeleton | 181s | 14B 两次调用（含骨架冻结） |
+| **dev 第 1 轮** | **512s** | 6 张施工图 220s + **6 次补漏 168s** + **3 次阶段级重问 168s** |
+| test | 210s | prompt 11794 tok（其中实现正文 22664 字 = **66%**） |
+| verify | 2s | 机械 |
+| review | 161s | 14B，5018 tok |
+
+⇒ 一轮 21.5 分钟，其中 dev 占 40%。**所以"dev 慢"是真的，但不是模型慢，是调用次数多 + 卡死不可见。**
+
+### 32.2 四个真 bug
+
+**① 单次请求超时 1800s ⇒ 卡死可静默 30 分钟（最致命）**
+调用期间**不写产物、不写 trace、不写日志**，而在场心跳照常刷新（独立线程）——运维上无法区分
+"正在生成"与"已卡死"。真机现场：11:26:38 之后**除了心跳什么都没写**，到 11:40 被我杀掉，
+13 分钟里零调用、零产物。修：`REQUEST_TIMEOUT` 1800 → **600**（实测单次 12–210s，3 倍余量），
+真卡住时抛 `OllamaError` → 阶段异常 → 暂停且**游标不前移**，续跑从同一阶段重进（可恢复且有证据）。
+
+**② `presence.started_at` 被当成"阶段时长"（这就是"2000 秒"的来源）**
+`console.html` 的 `elapsedSec()` 直接用**进程**启动时间，而页面标题写着当前阶段名 ⇒
+读成"dev 已经跑了 1900 秒"。修：在场标记新增 `stage_started_at`（换阶段时重置、同阶段保持），
+页面**并列显示**"<阶段>已用 Xs · 进程共 Ys" —— 判"卡没卡"看前者，看总开销看后者。
+
+**③ 重定向日志丢尾部（块缓冲）**
+Python 写文件时默认块缓冲，进程被强杀 ⇒ 缓冲区里那几行**恰好是最需要的那几行**丢了。
+真机证据：`_r2b.out.log` 停在 11:20（dev 第 1 轮），而进程活到 11:40，第 2 轮 dev 一个字都没留下。
+修：CLI 启动时 `stream.reconfigure(line_buffering=True)`。
+
+**④ 自检重问的"无进展"判据太窄：只在"问题一字不差"时才停**
+真机走势 **4 → 6 → 12**（`补丁校验 12 个问题、物理套不上 8 个`），第三轮才因"完全相同"停下。
+**越修越多**说明这一版模型在自检这条路上改不动，多问一轮只是重复烧预算（该运行在阶段级重问上
+花了 168s，其中两次是净损失）。修：判据改为**问题条数没有下降就停**；机械补 import 后条数若真的
+下降仍会放行（那是真进展）。
+
+### 32.3 一条**纠正**：别去关"补漏"
+
+`_task_symbol_gaps` 触发了 6/6，看着像浪费 —— 但它修的是**真漏**（T-01 确实没写 `parse_args()`），
+28 秒换掉一整轮 5 分钟是**划算**的。它自己的文档早就写明了这个取舍。记在这里，免得下次又想去关掉它。
+
+### 32.4 回归
+
+`smoke_all` **14 套全绿** · `smoke_ui` 29/29（真浏览器，页面无 console 错误）· `ruff` 阻断类 0 条 ·
+`check_refs` 一致。新增断言（`smoke_recovery`）：在场标记必须同时有两种计时、同阶段刷新不重置、
+换阶段重置、进程时间不随阶段变；以及 `REQUEST_TIMEOUT` 的上界（≤900）与下界（≥300）。
+
+### 32.5 仍未做（下一条最大的时间项）
+
+`test` 的 prompt 里 **66% 是实现正文**（22664 字，prompt 11794 tok）→ 210s/轮。
+test 要的是"接口 + 要测的行为"，不是几百行代码；裁掉正文预计降到 ~70s。
+
+## §33 遗留待优化清单（2026-09-28，本轮「跑不下去」收尾）
+
+### 本轮已落地（根因修复，非遮盖）
+- **失败尝试全程留痕**：`ollama_client.chat_json` 每一次被丢弃的尝试（截断 / JSON 坏 / 契约不符）
+  都经 `on_attempt` 上报；`orchestrator._record_attempt` 写进 `llm-calls.jsonl` +
+  `state.call_attempt_failures` + 日志一行。最后一次尝试带 `gave_up` 与整次总耗时 `wall_total_s`。
+  smoke_client ⑥⑦ + 端到端探针已验证（3 次失败 = 3 行账，含 `prefill_tps` / `done_reason` / 原文尾部）。
+- **重试前先探退化**：`_pre_retry` 在逐请求退化时先 `perfguard.guard` 再发，避免硬重试再烧几分钟。
+- **展示口径分开**：在场标记 `stage_started_at` 与 `started_at` 分开，页面并列显示「<阶段>已用 / 进程共」，
+  不再把整条进程的用时读成「当前阶段跑了 1900 秒」（这是你看到的「DEV 2000 秒」的真正来源）。
+
+> 说明：把「单请求超时 1800→600」**不是**修法，只是把「卡 30 分钟」变成「卡 10 分钟」。
+> 真因是「失败的调用零留痕 + 退化时硬重试」—— 上面三条才是修法。见 §32。
+
+### 遗留待优化（按优先级）
+
+**P0 — 直接决定「能不能看出卡 / 还能不能省几百秒」**
+1. **调用非流式 ⇒ 生成中完全不可观测**：`ollama_client` 用 `stream=False` + `urllib.urlopen(timeout)`，
+   整个响应一次性返回，生成期间零产物 / 零日志。即便失败现在留痕，一次超长「成功」生成进行中仍像卡死
+   （真机那 13 分钟里服务端其实在跑 6 次请求）。→ 改 `stream=True` + 生成速率看门狗，长生成也能心跳/进度可见。
+2. **退化只在调用前探一次、生成中不拦截**：逐请求退化约 1/6（实测 prefill 掉到 1/12~1/30），
+   且 P(退化 | 上请求健康)=0.22 ⇒ 探针通过也不保险。→ 生成中监测速率，低于基线/10 持续 N 秒即中止并换请求/重试，
+   省下几百秒白等。
+
+**P1 — 算力账与可观测性**
+3. **test 阶段 prompt 过长**：实现正文 22664 字占 test prompt 66%，210s/轮，预计可压到 ~70s。
+   §30 已定位，需把「实现全文」换成「接口摘要」。
+4. **重试预算按次数而非算力**：`attempts=3` 固定次数，退化时三次都是几分钟。→ 改累计算力预算（如 3×单阶健康上限）。
+5. **页面未把失败/退化明细可视化**：`llm-calls` 已有 `attempt_failed` 行与 `prefill_tps`，但 console 页面
+   还没把「本轮几次失败 / 几次退化 / 每次墙钟与吞吐」展示出来。前端要跟上埋点。
+
+**P2 — 更深层，单轮改不动**
+6. **dev 任务粒度 / 补漏敏感度**：第 2 轮 6/6 张图全触发补漏、512s。补漏本身划算（真漏），但全触发说明
+   任务切得偏碎或「完整性」判据过敏，可优化粒度 / 阈值。（注：**勿去关补漏本身** —— §32 已记其取舍。）
+7. **自检重问的「模型改不动」早退**：问题 4→6→12 越修越多已靠「条数不降则停」拦截，但更理想是检测到模型
+   在该任务反复改不动时更早交人工，而非耗完重问预算。
+8. **整次调用总预算未显式化**：单请求 600s × 3 尝试 = 最坏 1800s 仍可能静默（现每次尝试已留痕，但总预算无上限约束）。
+   可对整次调用设总墙钟预算。
+
+### 验证状态
+- `smoke_all` 14 套全绿；`check_refs` 全部一致；`ruff` 阻断类 0 条。
+- 新增 / 加固断言：smoke_client ⑥（失败尝试进账：每条带 `attempt_failed` / 序号 / `gave_up` / 总耗时 /
+  `prefill_tps` / 原文尾部）、⑦（成功不重复上报）；smoke_recovery（在场两口径分开、同阶段不重置、
+  换阶段重置、单请求超时上界 ≤900 且 ≥300）。
+
+## §34 架构级改造裁决与落地方案（2026-09-28，对「加 6 个 Agent」提案的逐条 adjudication）
+
+> 来源：对一份「从代码生成器 → 软件工程团队（新增 6 个 LLM 角色）」提案的逐条裁决。
+> 核心结论：**提案把「缺一层机械控制」误诊成「缺几个 Agent」**。单驻留下新增 6 个模型角色
+> ≈ 每轮多 6 次 prefill，而它要解决的问题 90% 是确定性的。正确药方是「抽纯函数 + 台账」，不是「加 Agent」。
+
+### 0. 先纠正三处事实（提案建立在错假设上）
+1. **「状态机只有正向、没有恢复路径」不成立**。已有能力：
+   - 回到任意阶段重跑：`_rewind(from_stage)` + `resume(--from)`；
+   - 阶段异常不隐身死掉：`_execute` 捕获 → `state.stage_errors` + `status=paused`，cursor 不前移，续跑从同一阶段重进；
+   - 条件闸门续跑复核：`_execute` 开头 `_conditional_gate` 重判（人工不能「什么都不裁决就继续」）；
+   - 人工介入后不被预算锁死：`_extend_budget_for_human`（单调抬高 max_rework，累计 ≤3 次）；
+   - 不收敛就停：`_guard_stop_reason` = 预算（墙钟/token）或 停滞（3 轮无净下降）；
+   - 未通过也有东西可交：`_deliver_preview`（人工闸门预览物化）、`_deliver_last_good`；
+   - 语义矛盾不硬走：`escalated_ambiguous` → `needs_human`。
+2. **「8 轮返工失败」的规模已被收口**：`PIPELINE_MAX_REWORK` 默认 **2**（不再是 8），外加停滞 3 轮 + 预算护栏。
+   所以现在剩的问题不是「轮次太多」，而是「这一轮为什么没修好」＝**归因**。这恰好支持 Failure Analyzer，不支持「再多跑几轮」。
+3. **「缺 Bug Resolver / Failure Analyzer」—— 能力在，缺的是「机械约束 + 台账」**。已在的：
+   `tasktype.bug_report_from_state`（缺陷单）、`_tasks_for_bugfix`（按影响面最小派发）、`round_kind==BUGFIX`、
+   `defect_verdicts`（逐条：转绿/仍失败/无从核对）、`scope_violations`/`allowed_scope`/`_bugfix_scope_blockers`（越范围检测）、
+   `_patch_blockers`/`_mechanical_blockers`（补丁与运行级阻断）、`_normalize_review`（三档 + 7 条机制兜底）。
+
+⇒ **真实缺口**：这些判断散在 `_step_review` 的 if 链里，没有统一成一个可断言、可归因的输出（＝ orchestrator 职责过重的病灶）。
+药方是**抽纯函数**，不是加 Agent。
+
+### 1. 逐条裁决（提案项 / 现有对应 / 裁决 / 关键改造）
+| 提案项 | 现有对应 | 裁决 | 关键改造 |
+|---|---|---|---|
+| TaskCompiler always compile | `normalize_plan` 已无条件跑；`compile_tasks` 仅命中时执行 | 采纳（半完成） | normalize 恒跑；compile 恒跑，但「是否覆盖架构师 tasks」改**确定性择优**（不能无条件覆盖——会丢质量更好的架构师任务） |
+| 双源 normalize（changes ∪ draft_tasks） | `planir.normalize_plan` 已实现（最长匹配 / 来源追溯 / 稳定排序） | 已完成 | 只差把 `draft_tasks` 从契约真正收进来（现仍以 `tasks` 为准） |
+| Dependency Graph（去线性） | `planir` 已算出每 unit 的 `depends_on_files`；`compile_tasks` 仍一律线性挂链 | 采纳 | 基础设施已就绪，工作量小：按 contract ∪ symbol 建边 + 拓扑调度 |
+| Impact Analyzer | 仅粗版 `plan_gap_files` | 采纳（纯函数） | IR 的 `depends_on_files` + `contracts.uses` 做反向闭包（二开加 import graph）。零模型调用 |
+| Failure Analyzer | `_patch_blockers` / `_mechanical_blockers` / `_normalize_review` 三段散落 | 采纳能力，**否决新 Agent** | 收敛成 `diagnose.py`：`classify(...)` → `{type, owner, recover_stage, evidence}`，确定性，路由只读它 |
+| Bug Resolver | 缺陷单 + 最小派发 + 越范围检测已有 | 改造 | 缺**缺陷台账**：跨轮守恒 + 可 CLOSED（现值每轮重算，没有「这条已关闭」的账） |
+| Code Review Gate | `scope_violations` / `tasktype.allowed_scope` | 采纳为机械门 | 超范围 / 触禁改文件 / 违反 contract，全部机械可判。不加模型 |
+| Design Reviewer | 无（但有 `_plan_contract_gaps`、`_plan_missing_entry`、`_languages_of`） | 改造：机械先行 | 覆盖/入口/语言/contracts 可解析/符号填充率全机械；只有「覆盖语义」才上模型，且复用 review 模型 |
+| Recovery State Machine | 见 0 节（已有） | 改造为字段化 | `state.failure = {type, owner, recover_stage, attempt, evidence}`，`stage_errors`/`guard_stop` 并入 |
+| Typed Verification | `verify_report` 已是结构化 + `unverified` | 采纳（P1） | 三条语义先定：runtime_check 超时算 pass 还是 inconclusive、required 禁 manual_review、聚合去重且只绑纯断言型套件 |
+| Schema Guardian | `flow.validate()`（六类一致性） | 采纳（**最该做的一条**） | 0/43 → 100% 的教训正是「契约与 schema 漂移」。扩成 `check_contracts`：提示词契约字段集 ↔ `schemas.STAGE_SCHEMAS` ↔ 编译层读取字段集 三方一致 |
+| Context Manager | 已有「按图裁剪当前代码 + 补丁裁剪 + 聚焦块」 | 采纳窄版 | 先只做预算断言（必含段清单 + 上限，超了**报警**而非静默截断） |
+| Memory Manager | `CONTEXT.md`（人类记忆） | 采纳窄版 | 从 runs 挖失败模式存 JSON（如符号书写形态表、虚依赖模式），DEV 前注入约束行而非散文 |
+| Runtime Optimizer | 风险两档已达成共识 | 采纳窄版 | low → 机械 review，不调模型 |
+| Artifact 因果链 | artifact 已是 seq 快照 | 采纳（P2） | 加 `caused_by` |
+| stages/ + services/ 目录重构 | orchestrator 大单文件 | **反对物理搬家** | 阶段方法与 self 的共享状态强耦合；且 `flow.py` 是单真源 + `validate()` 六项校验。正确做法是抽纯逻辑成模块（本轮已做：symbols/planir/taskcompiler），目标是「决策 if 链条数下降」，不是「行数下降」 |
+
+### 2. 落地方案（按依赖顺序）
+**3.1 `pipeline/diagnose.py` —— 机械 Failure Analyzer（P0，最大杠杆）**
+- 输入全是已有产物，**零模型调用**：`classify(*, verify, review, rounds, patches, defects) -> dict`
+- 返回 `{type, owner, recover_stage, evidence, blocking}`
+- 分类判据（全部来自现有函数，只做收敛与定名）：
+
+  | type | 判据（现有来源） | owner / recover_stage |
+  |---|---|---|
+  | `patch_unappliable` | `_patch_blockers` 的 anchor/符号对不上 | dev（只重派该图） |
+  | `import_broken` / `syntax_broken` | dev 自检①③ + `patches.unavailable_imports` | dev |
+  | `verify_failed` | `_mechanical_blockers` 的 verify 失败 | dev |
+  | `plan_gap` | `_plan_uncovered_defects`（缺陷指向方案未覆盖文件） | architect_plan |
+  | `missing_entry` | `_plan_missing_entry` + `_verify_missing_entry` | architect_plan |
+  | `scope_conflict` | `tasktype.scope_violations` | architect_plan |
+  | `external_unverifiable` | `needs_external` 全档 | needs_human |
+  | `ambiguous` | `escalated_ambiguous` | needs_human |
+
+- 收益：`_step_review` 里那条 7 层 if 链变成 `d = diagnose.classify(...)` 一次调用；每轮写 `state.failure`，
+  于是「这轮为什么没修好」变成可查询数据（现在是散落日志）。
+
+**3.2 缺陷台账 defect ledger（Bug Resolver 的真缺口）**
+- 现在：`defect_verdicts` 每轮从 verify 重算，没有跨轮身份 → 「这条修好了」和「这条又冒出来」分不清。
+- 改：补丁/缺陷用 `planir.stable_id` + 缺陷指纹（file + symbol + 归一后的失败类型）做主键，落 `state.defect_ledger`，
+  新增/关闭都留痕 → 才能回答「8 轮里到底修好了几条」。
+- 机械硬约束（「不能改设计/不能扩范围」）：`_bugfix_scope_blockers` + `allowed_scope` 已有，补一条**越范围即拒收该补丁**（现在是提醒）。
+
+**3.3 `compile_tasks`：恒编译 + 去线性依赖（P0）**
+- normalize 恒跑（已）；compile 恒跑，覆盖判据从「命中 reasons」改为**确定性择优**：
+  契约缺口数（compile 后） < 契约缺口数（架构师原版） 才覆盖，并始终把两者 hash 与差异记进 state
+  （这才叫 always compile：可比性在记录，不在覆盖）。
+- 依赖：unit 的 `depends_on_files` → 拓扑层，`compile_tasks` 只保底挂链；`_dev_by_tasks` 按拓扑序派发。
+
+**3.4 两道机械门（不加模型）**
+- Design Gate（architect_plan 之后，0 调用）：`_plan_contract_gaps` 为空 + `changes[].symbols` 填充率 = 100%
+  + `plan_unresolved` 为空或已裁决 + 入口存在 + 语言一致。
+- Code Gate（verify 之后，0 调用）：`scope_violations` 为空 + 无禁改文件 + contract 比对无虚依赖。
+
+**3.5 `tools/check_contracts.py`（Schema Guardian）**
+- 启动期与 CI 都跑：把 prompts.py 里写的字段集、`schemas.STAGE_SCHEMAS` 的 required 集、
+  编译层/tasktype 真正读取的字段集做三方比对。
+- 一次性堵「契约声明了但没人读」和「有人读但契约没写」两类漂移——本轮 0/43 就是这个坑。
+
+### 3. 优先级（与提案的差异）
+- **P0**：`diagnose.py` 机械归因 + `state.failure` 字段化（采纳，但**不**新增 Agent）；缺陷台账（跨轮守恒 + 可 CLOSED）；
+  恒编译（择优覆盖 + 差异留痕）；去线性依赖图（拓扑调度）。
+- **P1**：机械 Design/Code Gate（先机械，语义覆盖才上模型）；`check_contracts`（Schema Guardian，优先级已上调）；
+  typed verification（三条语义先定）；Impact Analyzer（纯函数）、风险两档。
+- **P2**：Context 预算断言、Memory 窄版、Artifact 因果链。
+- **否/暂缓**：目录物理拆分、6 个新 LLM 角色、独立 Design Reviewer 模型（单驻留成本 + 纯逻辑不该调模型）。
+
+### 4. 验收方式（每条都要有）
+- 新增 `tools/smoke_diagnose.py` / `smoke_defects.py`；
+- 回放历史真机方案对照（如 `192001` 的 12 条虚依赖、`214253` 的 4/4 填充）作为回归基线；
+- 改动后跑 `smoke_planir` / `smoke_merge` / `smoke_bugfix` / `smoke_rules` / `smoke_mock` /
+  `smoke_console` / `smoke_ui` / `check_refs` 全绿；
+- 结论写进 CONTEXT.md 新一节（即本节）。
+
+### 5. 一句话
+「从 AI 代码生成器 → AI 软件工程团队」同意，但组织结构的价值不来自角色数量，而来自每个角色的输出是确定性的。
+这份建议里真正能立刻收敛缺陷的是 **Failure Analyzer 的机械版 + 缺陷台账 + Schema Guardian** 三件；
+而「再加 6 个 Agent」在单驻留 14B 上会先撞预算、再撞归因——那正是现在最难查的故障类型。

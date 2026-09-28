@@ -719,11 +719,27 @@ def pipeline_fingerprint() -> dict:
     )
     # 两套提示词都要进指纹：只算 SYSTEM 的话，改了 SYSTEM_NEW（新建项目那套）指纹不变，
     # 跨运行对比时「问题变多变少」就无法归因到它。
+    # `SYSTEM_NEW_BUGFIX`（返工修缺陷那套）同样必须进 —— 它是第三维契约，漏了它
+    # 就等于"改了返工口径却声称可比"。
     prompts_blob = json.dumps(
-        {"secondary": prompts.SYSTEM, "new": prompts.SYSTEM_NEW},
+        {
+            "secondary": prompts.SYSTEM,
+            "new": prompts.SYSTEM_NEW,
+            # 按**任务类型**分的那几套（bugfix / plan_rework）逐套入账：它们是独立契约，
+            # 漏一套就等于"改了返工口径却声称可比"。这一轮改了返工口径 ⇒ 哈希本来就该变
+            # （"能查到是哪一变"正是指纹的用处，不是要它保持不变）。
+            "rounds": dict(getattr(prompts, "SYSTEM_NEW_ROUND", {}) or {}),
+        },
         ensure_ascii=False,
         sort_keys=True,
     )
+    # **编译器指纹**：编译链（planir / taskcompiler / symbols）的源码哈希 + 输入契约版本。
+    # 编译器规则改一次，等于"同一份方案被解释的方式"变了 —— 不进指纹的话，
+    # 跨运行看到「任务拆得更细 / 依赖更整齐」会被**误归因到架构师头上**，
+    # 而事实上它的输出一个字都没变（这正是本轮要解决的可归因性问题）。
+    from . import planir  # 局部导入，避免环
+
+    compiler_blob = json.dumps(planir.fingerprint(), ensure_ascii=False, sort_keys=True)
     # 检索策略同样决定模型看到什么，必须进指纹（真机教训：改了取片策略后"问题变少"必须能归因到它）
     retrieval_blob = json.dumps(
         {
@@ -737,10 +753,15 @@ def pipeline_fingerprint() -> dict:
         sort_keys=True,
     )
     return {
-        "pipeline_hash": hashlib.sha1((config_blob + prompts_blob + retrieval_blob).encode("utf-8")).hexdigest()[:12],
+        "pipeline_hash": hashlib.sha1(
+            (config_blob + prompts_blob + retrieval_blob + compiler_blob).encode("utf-8")
+        ).hexdigest()[:12],
         "prompts_hash": hashlib.sha1(prompts_blob.encode("utf-8")).hexdigest()[:12],
         "config_hash": hashlib.sha1(config_blob.encode("utf-8")).hexdigest()[:12],
         "retrieval_hash": hashlib.sha1(retrieval_blob.encode("utf-8")).hexdigest()[:12],
+        # 编译层单独可归因：`compiler_hash` 变 ⇒ 是"解释方式"变了；不变 ⇒ 是输入变了
+        "compiler_hash": planir.fingerprint().get("compiler_hash"),
+        "compiler_input_version": planir.COMPILER_INPUT_VERSION,
         "models": {name: spec.tag for name, spec in STAGE_MODELS.items()},
         "review_every": REVIEW_EVERY,
         "max_rework": MAX_REWORK_ROUNDS,
@@ -769,6 +790,10 @@ def system_prompts() -> dict[str, str]:
 
     out = dict(prompts.SYSTEM)
     out.update({f"{stage}@new": text for stage, text in prompts.SYSTEM_NEW.items()})
+    # 按任务类型分的那几套也要能被元优化看见：返工口径的问题（例如"首轮话套到返工轮"）
+    # 只在返工场景暴露，不单独列出来就永远沉淀不下来。
+    for kind, table in (getattr(prompts, "SYSTEM_NEW_ROUND", {}) or {}).items():
+        out.update({f"{stage}@new-{kind}": text for stage, text in table.items()})
     return out
 
 

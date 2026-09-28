@@ -69,7 +69,23 @@ def _env_bool(name: str, default: bool) -> bool:
 
 # 阶段驻留期内的 keep_alive，切换模型时显式卸载
 KEEP_ALIVE = os.getenv("PIPELINE_KEEP_ALIVE", "10m")
-REQUEST_TIMEOUT = _env_int("PIPELINE_TIMEOUT", 1800)
+
+#: **单次 HTTP 请求**的超时（秒），即 `chat_json` 里**一次尝试**的上限（不是整次调用的上限：
+#: 一次调用最多 3 次尝试，所以一次调用最坏 ≈ 3 × 本值）。
+#:
+#: 1800 → 600 的**真实理由**（别把它当成"卡死"的修法 —— 它不是）：
+#: 本机健康调用 12–210 秒（最慢一次 314s 是退化时），600 秒是 2 倍余量。而 1800 秒的坏处是
+#: **一次真卡住能静默半小时**：调用期间不写产物、不写 trace、不写日志，在场心跳照常刷新，
+#: 运维上分不清"正在生成"与"已卡死"。
+#:
+#: 但 20260928-110402 的"13 分钟无响应"**不是**超时造成的，把它调小也不是修法：
+#: Ollama 服务端日志显示那段时间其实**在正常服务**（6 次请求首尾相接，8.8s / 172s / 314s /
+#: 153s，全部 200），只是全被 `chat_json` 的契约重试丢掉了，而失败路径原先不留痕 ⇒ 外部读成
+#: "卡死"。真正的修法在两处，都已落地：
+#:   ① 失败尝试即时进账（`orchestrator._record_attempt` → 日志 + llm-calls + state）；
+#:   ② 重试前先探退化（`ollama_client.chat_json` 的 `_pre_retry` → `perfguard.guard`）——
+#:      同一 prompt 8.8s vs 314s 是**逐请求退化**，硬重试只会再烧一遍。
+REQUEST_TIMEOUT = _env_int("PIPELINE_TIMEOUT", 600)
 
 # 回流上限：达到上限仍未 pass 则标记 needs_human 并保留全部中间产物
 MAX_REWORK_ROUNDS = _env_int("PIPELINE_MAX_REWORK", 2)

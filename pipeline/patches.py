@@ -555,6 +555,10 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
             row["notes"].append(
                 "没有提供仓库路径，无法核对（新建项目请把生成目录作为 --repo 传入）"
             )
+        # **归因到施工图**：`covers_tasks` 是这条补丁自己声明的"服务于哪张图"。
+        # 把它带进行里，判负文案才能说清"是哪一张图的问题"，而不是让人以为整批都要重做 ——
+        # 返工要指明「哪个 task、什么具体问题」是**机械可得**的，不该让评审和开发去猜。
+        row["tasks"] = [str(t).strip() for t in (edit.get("covers_tasks") or []) if str(t).strip()]
         audit["edits"].append(row)
 
     # 新增文件的**内容**校验：不依赖原文，只看补丁本身 —— 所以单独跑一遍而不是塞进
@@ -635,8 +639,14 @@ def analyze_all(repo: str | Path | None, impl: dict | None) -> dict:
             audit["problems"] += 1
             detail = STATUS_CN.get(row["status"], row["status"])
             note = "；".join(str(x) for x in (row.get("notes") or [])[:1])
+            # 前缀带上施工图号：`［T-03］CLI：anchor 在原文里找不到`。
+            # 这句话会原样进评审与 dev 的缺陷单 —— 「哪个 task 出了什么问题」必须在文案里，
+            # 否则读的人只能自己去对文件与施工图的映射。
+            tids = [str(t) for t in (row.get("tasks") or []) if str(t).strip()]
             audit["problem_detail"].append(
-                f"{row['symbol'] or row['path']}：{detail}" + (f"（{note}）" if note else "")
+                (f"［{'、'.join(tids[:2])}］" if tids else "")
+                + f"{row['symbol'] or row['path']}：{detail}"
+                + (f"（{note}）" if note else "")
             )
     return audit
 
@@ -801,6 +811,35 @@ def _symbol_text(source: str, symbol: str, *, whole: bool) -> str | None:
     end = min(max(end, start), len(lines))
     text = "\n".join(lines[start - 1 : end]).rstrip()
     return text or None
+
+
+def symbol_excerpt(source: str, symbol: str, *, context: int = 0) -> dict | None:
+    """某符号的**逐字原文 + 行号范围（1-based）**：缺陷单用，让修复方不必凭记忆改写。
+
+    为什么要它（真机 20260927-221511 的根因）：dev 把 anchor 写成
+    `self.db.add_entry(amount, note)`，而实际代码是 `self.db.add_entry(args.amount)`
+    —— **凭记忆改写的近似行**，永远匹配不上。缺陷单此前只说"哪里错了"，
+    **没说"那处现在逐字长什么样"**；而原文是机械可得的（本函数就是）。
+
+    定位**复用已有的** :func:`symbol_span`（行级、多语言的块定位，`analyze_edit` 一直在用它），
+    不另起一套 —— "同一个概念两份实现"正是本项目反复踩的坑（也正因如此，先前误把同名函数
+    覆盖掉，`analyze_edit` 当场炸在 `ast.parse` 上）。取不到 / 不唯一 ⇒ None（**不猜**）。
+    """
+    name = str(symbol or "").strip()
+    if not name or not source:
+        return None
+    lines = str(source).splitlines()
+    # `CLI.add` 这类限定名取叶子：`symbol_span` 只认定义名
+    span = symbol_span(lines, name.rsplit(".", 1)[-1])
+    if not span:
+        return None
+    start0, end0 = int(span[0]), int(span[1])  # 0-based 含端点
+    if start0 < 0 or start0 >= len(lines):
+        return None
+    ctx = max(0, int(context))
+    lo = max(0, start0 - ctx)
+    hi = min(len(lines) - 1, max(end0, start0) + ctx)
+    return {"start": lo + 1, "end": hi + 1, "text": "\n".join(lines[lo : hi + 1])}
 
 
 def _importable_module(name: str) -> bool:
@@ -1041,6 +1080,67 @@ def is_already_applied(source_lines: list[str], edit: dict) -> bool:
     同一个方法在文件里出现两份（``def mul`` 出现 2 次）。
     """
     return bool(find_anchor("\n".join(source_lines), str(edit.get("patch") or "")))
+
+
+#: 「**定位失败**」类状态：模型把 anchor / 位置**凭记忆改写**了，物理上套用不了。
+#: 与「内容有问题」不同（那种再写一次能好），这一类是"它看不到逐字原文"导致的，
+#: 重问大概率产出**同样对不上**的新 anchor（真机实测：连续两次重问，问题集一字未变）。
+UNLOCATABLE = ("anchor_not_found", "anchor_ambiguous", "patch_span_mismatch",
+               "already_applied", "patch_no_effect")
+
+
+def prune_unappliable(repo: str | Path | None, impl: dict | None) -> dict:
+    """丢掉**定位失败**的补丁（原地修改 impl），返回 ``{dropped, detail}``。
+
+    为什么必须丢（真机 20260927-221511 的实测链）：
+
+      1) dev 重问时把 anchor 写成 ``self.db.add_entry(amount, note)``，
+         而实际代码是 ``self.db.add_entry(args.amount)`` —— **凭记忆改写的近似行**；
+      2) ``analyze_all`` 判 ``anchor_not_found`` ⇒ ``apply_all`` 只收 ``status == "ok"``，
+         这条补丁**永远进不了沙箱**；
+      3) 但它一直挂在累积实现里，被 ``_patch_blockers`` 与 verify 当成
+         「交付物不完整」的**阻断项**；
+      4) 于是它每轮都判负，而**任何"再改一次"都救不了它**（下一轮只会再写一条
+         同样对不上的新 anchor）⇒ 一个修不掉的门永远挂在流水线前面，即"恒定判负"。
+
+    丢掉它之后：沙箱拿到的是**能真正物化的那部分**，流水线不再被这个门拦住；
+    而"有 N 条补丁没能落地"这条事实由调用方记进 ``grounding_warnings`` / state，
+    评审与人工照样看得到（**不静默**）。
+
+    注意：**只丢"定位失败"这一类**。``unchecked``（文件不在仓库）与
+    ``patch_symbol_missing`` / ``patch_incomplete`` 属于"内容问题"，重问能修、
+    也必须继续当阻断项（§26 的"文件始终没落盘"正是靠它们暴露的）。
+    """
+    rows = (analyze_all(repo, impl).get("edits") or []) if isinstance(impl, dict) else []
+    edits = impl.get("edits") if isinstance(impl, dict) else None
+    if not isinstance(edits, list) or not rows:
+        return {"dropped": 0, "detail": []}
+    # rows 与 dict 型 edits **同序**（analyze_all 也先按 isinstance(e, dict) 过滤）
+    dict_edits = [e for e in edits if isinstance(e, dict)]
+    keep: list[Any] = []
+    detail: list[str] = []
+    dropped_ids: set[int] = set()
+    for idx, edit in enumerate(dict_edits):
+        row = rows[idx] if idx < len(rows) else {}
+        if str(row.get("status") or "") in UNLOCATABLE:
+            dropped_ids.add(idx)
+            detail.append(
+                f"{edit.get('path')}::{edit.get('target_symbol') or '?'}"
+                f"（{STATUS_CN.get(str(row.get('status')), row.get('status'))}）"
+            )
+    if not detail:
+        return {"dropped": 0, "detail": []}
+    counter = -1
+    for edit in edits:
+        if not isinstance(edit, dict):
+            keep.append(edit)
+            continue
+        counter += 1
+        if counter in dropped_ids:
+            continue
+        keep.append(edit)
+    impl["edits"] = keep
+    return {"dropped": len(detail), "detail": detail}
 
 
 def apply_all(repo: str | Path, impl: dict | None, audit: dict, in_place: bool = False,

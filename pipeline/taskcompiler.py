@@ -46,60 +46,155 @@ def _chunk(items: list[str], size: int) -> list[list[str]]:
     return [items[i: i + size] for i in range(0, len(items), size)] or [[]]
 
 
-def compile_tasks(plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK) -> list[dict]:
-    """从方案的 `changes[]`（变更边界）**确定性**生成 tasks。
+def compile_tasks(
+    plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK, ir: Any = None
+) -> list[dict]:
+    """从 **compiler_ir** 确定性生成 tasks。
+
+    优先读 IR（`planir.normalize_plan` 的产物）—— 合并 / 清洗 / 冲突解决**已经做完**，
+    这里只做**拆分与编号**。没有 IR 时退回直接读 `plan["changes"]`（兼容旧调用点与单测）。
 
     规则（全部可预测、可断言）：
-      ① 每个 change 至少一张图；没声明 symbols 时整文件一张；
+      ① 每个 unit 至少一张图；没声明 symbols 时整文件一张；
       ② 符号数超过 `max_symbols` 就切分，保证单轮写得完；
       ③ 单文件天然只由它自己的图覆盖（不会触发"同一文件被多张图覆盖"的告警）；
-      ④ 线性 `depends_on`：后一张依赖前一张，保证跨文件接口先建后引用；
-      ⑤ `test_hint` 机械生成（Python 项目即 `python -c "import <module>"`），
-         不再指望模型填 —— 它**从来没填过**。
+      ④ 依赖优先用方案声明的 `depends_on`（按 unit 翻译成新编号）；没有声明的挂到
+         前一张图 ⇒ 保住"先建文件、后引用接口"的线性次序；
+      ⑤ `test_hint` 优先用 IR 里那条（方案阶段补的施工图字段），否则机械生成
+         `python -c "import <module>"` —— 不再指望模型填，它**从来没填过**。
     """
+    units = [
+        u for u in ((ir or {}).get("units") or []) if isinstance(u, dict) and _norm(u.get("file"))
+    ]
+    if units:
+        return _compile_from_units(units, max_symbols=max_symbols)
+    return _compile_from_changes(plan, max_symbols=max_symbols)
+
+
+def _dedup(items: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in (items or []):
+        key = str(it or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _split_groups(symbols: list[str], max_symbols: int) -> list[list[str]]:
+    """切分大小同时受两个上限约束：单张不超过 `max_symbols`（写得完），
+    且**同一文件的图数不超过 `MAX_TASKS_PER_FILE`**（避免同一文件被反复改动）。
+    后者优先：真机 192001 里 `command.py` 被 3 张图覆盖，直接引发合并 / anchor 冲突。
+    """
+    if not symbols:
+        return [[]]
+    size = max(max_symbols, -(-len(symbols) // MAX_TASKS_PER_FILE))
+    return _chunk(symbols, size)
+
+
+def _acceptance_text(raw: Any, path: str, group: list[str]) -> str:
+    """IR 的 `acceptance` 是 `[{text, source}]`（**带来源追溯**）—— 取文本并保留来源。
+
+    来源要留下：多张 draft 图合并到同一文件后，出问题时必须能回答"这是谁提的要求"。
+    """
+    parts: list[str] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            source = str(item.get("source") or "").strip()
+            if text:
+                parts.append(f"{text}（来源 {source}）" if source else text)
+        elif str(item or "").strip():
+            parts.append(str(item).strip())
+    if parts:
+        return "；".join(parts)
+    if group:
+        return "；".join(f"{s} 定义完整且可被导入调用" for s in group)
+    return f"{path} 可被导入，且承载 intent 描述的能力"
+
+
+def _compile_from_units(units: list[dict], *, max_symbols: int) -> list[dict]:
+    tasks: list[dict] = []
+    seq = 0
+    id_map: dict[str, list[str]] = {}
+    pending: list[tuple[dict, list[str]]] = []
+    for unit in units:
+        path = _norm(unit.get("file"))
+        symbols = [str(s).strip() for s in (unit.get("symbols") or []) if str(s).strip()]
+        change_text = str(unit.get("change") or "").strip() or f"按设计实现 {path}"
+        # 施工图字段**原样传给 dev**：这些是方案阶段好不容易补上的信息，
+        # 编译器不得丢失（丢了 dev 就只能猜，跨文件接口必然对不上）
+        hints = {
+            key: unit.get(key)
+            for key in ("interface", "contracts", "data_model", "constraints", "unresolved_uses")
+            if unit.get(key) not in (None, "", [], {})
+        }
+        new_ids: list[str] = []
+        for group in _split_groups(symbols, max_symbols):
+            seq += 1
+            tid = f"T-{seq:02d}"
+            new_ids.append(tid)
+            task: dict[str, Any] = {
+                "id": tid,
+                "title": f"实现 {path} 的 {'、'.join(group)}" if group else f"实现 {path}",
+                "change": change_text,
+                "target_files": [path],
+                "acceptance": _acceptance_text(unit.get("acceptance"), path, group),
+                "symbols": list(group),
+                "depends_on": [],
+                # 跨轮**稳定身份**：task id 会被重编号（方案一重做就变），
+                # 「哪些图没变」与归因必须建在不随编号漂移的东西上（见 planir.stable_id）
+                "stable_id": f"{path}::{sorted(group)[0]}" if group else f"{path}::<whole-file>",
+            }
+            if unit.get("test_hint"):
+                task["test_hint"] = str(unit["test_hint"])
+            elif path.endswith(".py"):
+                task["test_hint"] = f'python -c "import {_module_of(path)}"'
+            for key, val in hints.items():
+                task.setdefault(key, val)
+            tasks.append(task)
+            pending.append((task, _dedup(unit.get("depends_on"))))
+        for key in _dedup([*(unit.get("source_task_ids") or []), str(unit.get("stable_id") or "")]):
+            id_map.setdefault(key, []).extend(new_ids)
+    # 依赖翻译：原 draft id → 新编号（挂到该 unit 的**全部**图上，即"整个 unit 完成"）
+    for task, deps in pending:
+        mapped: list[str] = []
+        for dep in deps:
+            mapped.extend(id_map.get(dep, []))
+        # **必须滤掉自引用**：多张原图合并进同一 unit 时，合并后的图天然会"依赖自己"
+        # （真机形态：T-02 与 T-03 都改 cli.py，T-03 声明依赖 T-02，两者合成一张图后
+        # 就变成 T-03 → T-03）。自引用会让拓扑排序退化、也让"前置任务"这句话变成噪音。
+        task["depends_on"] = [d for d in _dedup(mapped) if d != task["id"]]
+    prev = ""
+    for task in tasks:
+        if not task["depends_on"] and prev:
+            task["depends_on"] = [prev]
+        prev = task["id"]
+    return tasks
+
+
+def _compile_from_changes(plan: Any, *, max_symbols: int) -> list[dict]:
+    """**兼容路径**：没有 IR 时直接读 `changes[]`（旧调用点与单测走这里）。"""
     plan = plan if isinstance(plan, dict) else {}
     changes = [c for c in (plan.get("changes") or []) if isinstance(c, dict) and c.get("path")]
     if not changes:
         return []
-    tasks: list[dict] = []
-    seq = 0
-    prev_id = ""
+    units: list[dict] = []
     for change in changes:
         path = _norm(change.get("path"))
-        symbols = [str(s).strip() for s in (change.get("symbols") or []) if str(s).strip()]
-        if symbols:
-            # 切分大小同时受两个上限约束：单张不超过 max_symbols（写得完），
-            # 且**同一文件的图数不超过 MAX_TASKS_PER_FILE**（避免同一文件被反复改动）。
-            # 后者优先：真机 192001 里 command.py 被 3 张图覆盖，直接引发合并/anchor 冲突。
-            size = max(max_symbols, -(-len(symbols) // MAX_TASKS_PER_FILE))
-            groups = _chunk(symbols, size)
-        else:
-            groups = [[]]
-        for group in groups:
-            seq += 1
-            tid = f"T-{seq:02d}"
-            if group:
-                title = f"实现 {path} 的 {'、'.join(group)}"
-                acceptance = "；".join(f"{s} 定义完整且可被导入调用" for s in group)
-            else:
-                title = f"实现 {path}"
-                acceptance = f"{path} 可被导入，且承载 intent 描述的能力"
-            task: dict[str, Any] = {
-                "id": tid,
-                "title": title,
-                # 「改什么」：优先用架构师写好的 approach，退回 intent
-                "change": str(change.get("approach") or change.get("intent") or "").strip()
-                or f"按设计实现 {path}",
-                "target_files": [path],
-                "acceptance": acceptance,
-                "symbols": list(group),
-                "depends_on": [prev_id] if prev_id else [],
+        units.append(
+            {
+                "file": path,
+                "symbols": [str(s).strip() for s in (change.get("symbols") or []) if str(s).strip()],
+                "change": str(change.get("approach") or change.get("intent") or "").strip(),
+                "acceptance": [],
+                "depends_on": [],
+                "source_task_ids": [],
+                "stable_id": f"{path}::<whole-file>",
             }
-            if path.endswith(".py"):
-                task["test_hint"] = f'python -c "import {_module_of(path)}"'
-            tasks.append(task)
-            prev_id = tid
-    return tasks
+        )
+    return _compile_from_units(units, max_symbols=max_symbols)
 
 
 def plan_needs_compile(plan: Any, *, max_tasks: int = 5, max_files_per_task: int = 2) -> list[str]:

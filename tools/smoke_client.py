@@ -8,9 +8,13 @@
 而且两次跑到这里共约 30 分钟 —— 全是纯白等，最后照样失败。抬高上限只对「内容合法、
 只是写长了」有意义；对重复循环是**纯粹的放大**。
 
-锁定两条口径：
-  ① 普通截断：至多抬高 **1** 次上限（不再 6144→12288→20161 连抬两次）；
-  ② 重复循环：**不抬高，反而压低**上限并明确叫停（换条件重试才有意义）；
+锁定三条口径（**2026-09-28 校准**：原先的"普通截断只准抬 1 次"过紧了）：
+  ① 普通截断（内容合法、只是写长）：抬高上限，最多 `_MAX_ESCALATIONS` 次，
+     且被**上下文余量**夹住 —— 真机 `20260928-000351` 的 `num_ctx=24576`、prompt 才 4016，
+     余量约 20k，却因为"只准抬一次"在 12288 就放弃：**限制根本不是上下文**；
+  ② 重复循环：先**压低**上限并明确叫停（换条件重试才有意义），但**只压一次** ——
+     压下去还写不完，说明它不是"在重复"而是"这张图本来就长"，那一次要走抬高路线
+     （真机 `20260928-000351` 报错里留下的 `num_predict=1536` 就是一路压到 6144//4 的后果）；
   ③ 判定本身要保守：正常的长输出（每行都在描述不同东西）不许被判成重复。
 """
 from __future__ import annotations
@@ -67,10 +71,15 @@ def _limits(sent: list[dict]) -> list[int]:
     return [int((p.get("options") or {}).get("num_predict") or 0) for p in sent]
 
 
-def _last_user(sent: list[dict]) -> str:
+def _last_user(sent: list[dict], index: int = -1) -> str:
+    """第 `index` 次请求的完整 user 文本（默认最后一次）。
+
+    带下标是必要的：退化路径的提示**只在被判定重复的那一次**重试里出现，之后会切到
+    抬高路线（提示语随之改变）。只断言"最后一次"会把这条机制测成空转。
+    """
     if not sent:
         return ""
-    return "".join(str(m.get("content") or "") for m in sent[-1].get("messages") or [])
+    return "".join(str(m.get("content") or "") for m in sent[index].get("messages") or [])
 
 
 def main() -> int:
@@ -113,18 +122,22 @@ def main() -> int:
     )
     check(_looks_degenerate(code_like) is False, "正常的类方法集合（30 个各不相同）⇒ 不误判")
 
-    print("== ③ 普通截断：至多抬高 1 次上限，不再连抬 ==")
+    print("== ③ 普通截断：抬高上限（上限 3 次），但抬不出上下文余量 ==")
     client, sent = _client([_truncated(normal)])
     try:
         client.chat_json(spec, "sys", "user", {"type": "object"}, attempts=3)
         check(False, "三次都截断应当报错", "没有抛错")
     except OllamaError as exc:
         check("已抬高上限" in str(exc), "报错里说明「抬高已到顶」（不再默默再抬）", str(exc)[:90])
-    check(_limits(sent) == [spec.num_predict, spec.num_predict * 2],
-          "上限序列 = 原值 → ×2 一次（不再 6144→12288→20161）", str(_limits(sent)))
-    check(len(sent) == 2, "一共只发 2 次请求就止损（此前 3 次）", str(len(sent)))
+    limits = _limits(sent)
+    check(limits[:2] == [spec.num_predict, spec.num_predict * 2] and len(limits) == 3,
+          "上限序列 = 原值 → ×2 → ×2（抬高上限 3 次；此前只准抬 1 次会过早放弃）", str(limits))
+    check(all(limits[i] < limits[i + 1] for i in range(len(limits) - 1))
+          and max(limits) <= spec.num_ctx,
+          "抬高只增不减，且**抬不出 num_ctx**（余量才是硬上界）", str(limits))
+    check(len(sent) == 3, "每次都用新上限重试（不做同上限白试）", str(len(sent)))
 
-    print("== ④ 重复循环：不抬高，反而压低上限 + 点名 ==")
+    print("== ④ 重复循环：先压低上限 + 点名，但**只压一次** ==")
     loop = "\n".join(['"same": "line",'] * 40)
     client, sent = _client([_truncated(loop)])
     try:
@@ -132,12 +145,16 @@ def main() -> int:
         check(False, "重复三次也应当报错", "没有抛错")
     except OllamaError:
         pass
-    check(_limits(sent) == [spec.num_predict, spec.num_predict // 2, spec.num_predict // 4],
-          "上限序列 = 原值 → ÷2 → ÷4（越重复越短）", str(_limits(sent)))
-    check("重复循环" in _last_user(sent),
-          "重试时明确告诉模型「你在重复，只输出最小合法 JSON」", _last_user(sent)[-160:])
-    check(max(_limits(sent)) <= spec.num_predict,
-          "整段过程一次都没抬高上限（不再放大白等）", str(_limits(sent)))
+    limits = _limits(sent)
+    check(limits[0] == spec.num_predict and limits[1] == spec.num_predict // 2,
+          "第一步把上限压一半（逼它写短，而不是给更多空间重复）", str(limits))
+    check(limits[2] > limits[1],
+          "**只压一次**：压下去还写不完 ⇒ 说明不是重复而是本来就长，改走抬高路线", str(limits))
+    check(min(limits) == spec.num_predict // 2 and len(sent) == 3,
+          "不会一路压到下限（真机 20260928-000351：越压越写不完）", str(limits))
+    check("重复" in _last_user(sent, 1),
+          "**被判定重复的那一次**重试里点名「你在重复，只输出最小合法 JSON」",
+          _last_user(sent, 1)[-160:])
 
     print("== ⑤ 第一次就正常返回：不受影响 ==")
     ok = {"message": {"content": '{"ok": true}'}, "done_reason": "stop",
@@ -147,6 +164,40 @@ def main() -> int:
     check(data == {"ok": True} and len(sent) == 1, "一次成功、不重试", str(meta.get("done_reason")))
     check(int((sent[0].get("options") or {}).get("num_predict")) == spec.num_predict,
           "首次请求用的就是该阶段的 num_predict", str(_limits(sent)))
+
+    print("== ⑥ 被丢弃的尝试必须即时进账（真机 20260928-110402：连发 6 次全丢弃、13 分钟无痕）==")
+    bad = {"message": {"content": '{"oops": '}, "done_reason": "stop",
+           "prompt_eval_count": 2000, "eval_count": 800,
+           "prompt_eval_duration": 4_000_000_000, "eval_duration": 20_000_000_000}
+    client, sent = _client([bad])
+    seen: list[dict] = []
+    try:
+        client.chat_json(spec, "sys", "user", {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                         attempts=3, on_attempt=seen.append)
+        check(False, "三次都不合契约应当报错", "没有抛错")
+    except OllamaError:
+        pass
+    check(len(seen) == 3, "**每一次**被丢弃的尝试都上报（不是整次调用只留一句异常）", str(len(seen)))
+    check(all(r.get("attempt_failed") for r in seen), "每条都带 attempt_failed 标记")
+    check([r.get("attempt") for r in seen] == [1, 2, 3],
+          "带尝试序号 ⇒ 「这轮到底发了几次」数得出来", str([r.get("attempt") for r in seen]))
+    check(bool(seen[-1].get("gave_up")) and seen[-1].get("attempts_used") == 3
+          and seen[-1].get("wall_total_s") is not None,
+          "最后一条是「放弃」，带整次调用的总耗时 ⇒ 「这一轮为什么慢」有账可查",
+          str({k: seen[-1].get(k) for k in ("gave_up", "attempts_used", "wall_total_s")}))
+    check(all(r.get("wall_s") is not None and r.get("schema_errors") for r in seen),
+          "每条都带耗时与契约错误（少了这些就等于没记）")
+    check(seen[0].get("prefill_tps") == 500.0 and seen[0].get("output_tokens") == 800,
+          "带当次吞吐与输出 token ⇒ 能分辨「退化烧掉的」还是「内容不合格」",
+          str((seen[0].get("prefill_tps"), seen[0].get("output_tokens"))))
+    check(seen[0].get("raw_tail"), "带原文尾部 ⇒ 事后能看出模型写成了什么样")
+
+    print("== ⑦ 成功路径不重复上报（成功那次由编排器统一记录）==")
+    client, sent = _client([ok])
+    seen_ok: list[dict] = []
+    client.chat_json(spec, "sys", "user", {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                     on_attempt=seen_ok.append)
+    check(not seen_ok, "成功不触发 on_attempt（否则同一次调用会记两遍，账就重了）", str(len(seen_ok)))
 
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0

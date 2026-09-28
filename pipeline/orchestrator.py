@@ -29,7 +29,20 @@ from typing import Any, Callable
 
 from . import flow
 from . import issues as issues_mod
-from . import evidence, patches, perfguard, prd, presence, prompts, retrieval, rules, runstore
+from . import (
+    diagnose,
+    evidence,
+    patches,
+    perfguard,
+    planir,
+    prd,
+    presence,
+    prompts,
+    retrieval,
+    rules,
+    runstore,
+    symbols as symbol_resolver,
+)
 from . import taskcompiler, tasktype
 from . import semantics
 from . import verify as verify_mod
@@ -210,8 +223,11 @@ def pm_unresolved_items(scope: Any, decisions: Any = None) -> dict[str, list[str
     # 未明确项：`apply_pm_decisions` 已把「有人工裁决」的那些从两列里移除并转成
     # confirmed_facts，所以这里剩下的就是**还没有结论**的
     vague: list[str] = []
-    for field in prompts.PM_VAGUE_FIELDS:
-        for item in merged.get(field) or []:
+    # 循环变量**不要叫 `field`**：本模块从 `dataclasses` 导入了 `field`（见 `RunResult`），
+    # 同名遮蔽会被 ruff 的 F402 抓到。今天不炸（`RunResult` 在模块导入时就用完了），
+    # 但只要有人在**这个循环之后**再定义 dataclass，就会撞上一个非常难查的 TypeError。
+    for vague_field in prompts.PM_VAGUE_FIELDS:
+        for item in merged.get(vague_field) or []:
             text = prompts.pm_vague_text(item)
             if text:
                 vague.append(text)
@@ -307,17 +323,23 @@ class Orchestrator:
 
     @property
     def round_kind(self) -> str:
-        """本轮的**任务类型**：首次开发 / 返工修缺陷。
+        """本轮的**任务类型**：首次开发 / 方案返工后施工 / 返工修缺陷。
 
-        用 `fixes` 有无来判定，而不是另存一个字段：两者必须永远一致，存两份就一定会漂移
-        （`_rewind` 清 `fixes` 时若忘了清另一个，会得到"返工口径 + 没有上一版产物"）。
+        **不再用「`fixes` 有没有」派生** —— 那是两值时代的判据，三值下会判错：
+        方案层返工后 `fixes` 里有 architect_fixes，旧判据于是把这一轮当成 bugfix，
+        而 bugfix 口径写着"只改缺陷单指到的部分、其余文件划分一律不动"。方案刚重做过，
+        开发拿到的却是最小改动纪律 ⇒ 与"按新方案施工"正面对抗（真机 L2）。
 
-        它决定 dev 用哪套系统提示词（`prompts.system_prompt` 的第三维）——
-        首次开发与 BUG 修复在输入、目标、约束、验收上都不同，硬用一套会正面冲突。
+        所以类型由**路由决策点**写入（`_mark_next_round`）、由 `_begin_round` 落到 dev 轮上，
+        并持久化进 state —— 续跑与 `--from dev` 都要能恢复。
+
+        兜底链：`state.round_kind` → 无则退回旧判据（老 running 的 state 里没有这个键）。
+        getattr 兜底同样必要：`_snapshot` / 续跑会构造出未经 `__init__` 的半成品实例。
         """
-        # getattr 兜底：`_snapshot` / 续跑会构造出未经 `__init__` 的半成品实例，
-        # 这种对象上取属性会直接抛 AttributeError，把整条流程带崩。任务类型只是
-        # 提示词选择，取不到就按首次开发处理，不值得为此中断运行。
+        state = getattr(self, "state", None) or {}
+        kind = str(state.get("round_kind") or "").strip()
+        if kind in tasktype.ROUND_KINDS:
+            return kind
         return tasktype.BUGFIX if getattr(self, "fixes", None) else tasktype.FEATURE
 
     # 注：**模块级人工闸门在作业模式下已由 `defer_human_review` 延后**（编排层入参，
@@ -550,7 +572,16 @@ class Orchestrator:
                     {"stage": record_stage, "tag": spec.tag, **gcheck}
                 )
         t0 = time.time()
-        data, meta = self.client.chat_json(spec, system, user, schema or STAGE_SCHEMAS[stage])
+        data, meta = self.client.chat_json(
+            spec,
+            system,
+            user,
+            schema or STAGE_SCHEMAS[stage],
+            # 失败尝试即时进账（日志 + llm-calls + state）。见 `_record_attempt` 的说明：
+            # 没有它，"连发 6 次、烧 13 分钟、全部丢弃"在外部只能读成"卡死"。
+            on_attempt=lambda rec: self._record_attempt(record_stage, note, rec),
+            log=self.log,
+        )
         # 调用**之后**再判一次：探针通过不等于这次一定健康（退化是逐请求翻转的，
         # 实测 P(退化|上一请求健康)=0.22 —— 本轮 plan 就是这样：探针通过、真调用只有 10.2 t/s）。
         # 只记录不干预 —— 它只影响这一次调用的耗时，不会污染下游（实测退化时生成速率仍正常）。
@@ -576,8 +607,19 @@ class Orchestrator:
                 # 这一版用的是哪份系统提示词：换了提示词后产出质量/返工率的变化才能归因，
                 # 否则只能去翻 git（还可能翻错那次运行用的是哪一版）。同阶段的第二次调用
                 # （接口骨架）用**另一份**系统提示，版本号必须能区分出来。
-                "prompt_version": prompts.prompt_version(stage, self.project_type)
-                + ("+skeleton" if artifact_stage else ""),
+                # 任务类型也要进版本标识：返工轮用的是**另一套契约**，不带后缀的话
+                # 「换了返工口径」会被误归因到别处（与指纹把三套提示词都算进去同一条理由）。
+                # 后缀标明"这次调用用的是哪一份系统提示 / 是哪一次调用"：
+                #   · 接口骨架那次用 `SKELETON_SYSTEM`（另一份文本）⇒ 必须能区分；
+                #   · 逐张施工图（`dev-T-01`）与补漏（`dev-T-01-repair`）用的是**同一份** dev
+                #     提示词，但要能按埋点分开统计。
+                # 此前一律写成 `+skeleton`，于是真机 `20260928-095848` 里 6 条 dev 调用
+                # 全带 `+skeleton`，"骨架调用"与"逐图调用"在埋点里根本分不开 ——
+                # 而本轮的返工口径归因正是靠这个字段（哪些轮用了哪套契约）。
+                "prompt_version": prompts.prompt_version(
+                    stage, self.project_type, self.round_kind
+                )
+                + (f"+{artifact_stage}" if artifact_stage else ""),
                 "truncated": truncated,
                 "switched": sched["switched"],
                 "resident_before": resident,
@@ -710,6 +752,76 @@ class Orchestrator:
         if self.project_type == "new" or isinstance(self.client, MockClient):
             return False
         return stage in ("architect_assess", "architect_plan", "dev", "test")
+
+    #: 失败尝试留在 state 里的上限（够诊断，又不至于把 state 撑大）
+    _MAX_ATTEMPT_FAILURES = 40
+
+    def _record_attempt(self, stage: str, note: str | None, rec: dict) -> None:
+        """把一次**被丢弃的尝试**即时报出去：日志一行 + 埋点一条 + state 一条。
+
+        为什么必须这么做（真机 20260928-110402，这次的教训）：
+        第 2 轮 dev 从 11:26:48 到 11:40 首尾相接发了 6 次调用，单次 8.8s / 172s / 314s / 153s
+        （同一 prompt，**逐请求退化** 20~35 倍），全部没过契约、被 `chat_json` 内部重试丢掉。
+        而埋点原先只写在"调用成功返回"之后 ⇒ `llm-calls.jsonl` 里**一条都没有**，
+        trace 也没有，state 也没动。13 分钟的算力烧掉了，事后连"烧在哪"都答不出来 ——
+        外部观测只能读成"卡死"，于是人的反应只能是杀掉它。
+
+        现在每一次被丢弃的尝试都会立刻留下：耗时、输出 token、停止原因（stop/length）、
+        当次 prefill 速率、契约错误、原文尾部。`gave_up` 的那条还带**整次调用**的总耗时，
+        于是"这一轮为什么慢"可以像别的账一样被数出来，而不是靠猜。
+        """
+        wall = rec.get("wall_s")
+        out = rec.get("output_tokens")
+        pf = rec.get("prefill_tps")
+        if not pf and rec.get("prompt_s") and rec.get("prompt_tokens"):
+            pf = round(float(rec["prompt_tokens"]) / float(rec["prompt_s"]), 1)
+        errs = [str(e) for e in (rec.get("schema_errors") or [])]
+        gave_up = bool(rec.get("gave_up"))
+        head = "调用放弃" if gave_up else "尝试未过契约"
+        total = f"，本次调用共 {rec.get('wall_total_s')}s / {rec.get('attempts_used')} 次尝试"
+        at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.log(
+            f"        [{head}] {stage} 第 {rec.get('attempt')}/{rec.get('attempts_planned')} 次"
+            f"（{wall}s，out={out} tok，done={rec.get('done_reason') or '-'}"
+            f"，prefill={pf or '-'} t/s）{total if gave_up else ''}"
+            + (f"：{errs[0][:90]}" if errs else "")
+        )
+        record = runstore.normalize_call_record(
+            {
+                "kind": "llm",
+                "at": at,
+                "stage": stage,
+                "note": f"{note or stage}·{'放弃' if gave_up else '失败尝试'}",
+                "mock": isinstance(self.client, MockClient),
+                # prefill_tps 兜底：生产里 rec 已自带（chat_json._enrich 算的），这里再算一次
+                # 是为了**失败尝试的埋点也绝不会缺这一列**——缺了就没法区分"退化烧掉的"还是
+                # "内容不合格"，而这正是真机 20260928-110402 想查却查不出的。
+                "prefill_tps": pf,
+                **rec,
+            }
+        )
+        if self.run_dir is not None and self.mode != "only":
+            with (self.run_dir / "llm-calls.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        rows = self.state.setdefault("call_attempt_failures", [])
+        rows.append(
+            {
+                "at": at,
+                "stage": stage,
+                "note": note,
+                "attempt": rec.get("attempt"),
+                "gave_up": gave_up,
+                "wall_s": wall,
+                "wall_total_s": rec.get("wall_total_s"),
+                "output_tokens": out,
+                "done_reason": rec.get("done_reason"),
+                "num_predict": rec.get("num_predict"),
+                "prefill_tps": pf,
+                "schema_errors": errs[:3],
+            }
+        )
+        if len(rows) > self._MAX_ATTEMPT_FAILURES:
+            del rows[: -self._MAX_ATTEMPT_FAILURES]
 
     def _grounded_call(
         self,
@@ -1023,6 +1135,44 @@ class Orchestrator:
                 f"        [施工图字段] 重做 {PLAN_CONTRACT_RETRIES} 次后仍有 {len(gaps)} 项缺失"
                 " → 降级为提示（跨文件契约比对将无从下手，已记入 plan_contract_gaps）"
             )
+        self.state["plan"] = self._normalize_plan_ids(self.state["plan"])
+        # 方案定稿前**冻结接口基准**。顺序很关键：它是 Plan IR 的符号索引来源 ——
+        # `CLI.add` 这类"类.方法"只有靠它才能与 `db.insert_record`（模块.符号）消歧，
+        # 没有它就只能按叶子名兜底匹配，而那正是"悄悄连错、无声漏掉"的来源。
+        self._freeze_skeleton()
+        # ---- Normalize：raw_plan → compiler_ir（**编译器的唯一稳定输入**）
+        # 合并 / 清洗 / 冲突解决 / 推导全部在这里做完，Compiler 之后只读 IR。
+        # 不做这一层，`compile_tasks` 迟早长成"第二个 orchestrator"；而且架构师提示词、
+        # task schema、编译器规则三者会纠缠在一起 —— 指标一动，说不清是谁变的。
+        ir = planir.normalize_plan(
+            self.state.get("plan"),
+            skeleton=self.state.get("skeleton") or {},
+            previous=self.state.get("compiler_ir"),
+        )
+        self.state["compiler_ir"] = ir
+        self.state["plan_sources"] = ir.get("plan_sources")
+        conflicts = ir.get("conflicts") or []
+        if conflicts:
+            self.state["plan_conflicts"] = conflicts
+            self.log(
+                f"        [Plan IR] 归一化处理了 {len(conflicts)} 处冲突/合并："
+                + "；".join(str(c.get("detail") or c.get("kind")) for c in conflicts[:3])
+            )
+        unresolved = ir.get("warnings") or []
+        if unresolved:
+            # unresolved **必须暴露**而不是隐藏：隐藏的依赖错误会在运行时变成
+            # `AttributeError`，那时归因成本高一个数量级。
+            self.state["plan_unresolved"] = unresolved
+            self.log(
+                f"        [Plan IR] {len(unresolved)} 条跨文件依赖**解析不了**（不猜，显式暴露）："
+                + "；".join(f"{u.get('symbol')}（{u.get('reason')}）" for u in unresolved[:3])
+            )
+        diff = ir.get("diff_vs_previous") or {}
+        if diff.get("removed_units"):
+            self.log(
+                f"        [Plan IR] 相对上一版方案少了 {len(diff['removed_units'])} 张施工图："
+                + "、".join(diff["removed_units"][:4])
+            )
         # ---- Task Compiler：架构师自己做不好的那部分，交给确定性编译器
         # 让 14B/8K 同时「做架构判断 + 拆任务 + 填字段」必然顾此失彼（真机 011207：
         # 5 版方案文件划分次次不同，symbols/test_hint/change 100% 为空）。
@@ -1030,7 +1180,7 @@ class Orchestrator:
         reasons = taskcompiler.plan_needs_compile(self.state.get("plan"))
         self.state["plan_compiled_reasons"] = reasons
         if reasons:
-            compiled = taskcompiler.compile_tasks(self.state.get("plan"))
+            compiled = taskcompiler.compile_tasks(self.state.get("plan"), ir=ir)
             if compiled:
                 self.state["plan"]["tasks"] = compiled
                 self.state["plan"]["tasks_compiled"] = True
@@ -1040,10 +1190,7 @@ class Orchestrator:
                     f"        [Task Compiler] 架构师的 tasks 不合格（{'；'.join(reasons[:3])}）"
                     f" → 已由编译器重新生成 {len(compiled)} 张施工图"
                 )
-        self.state["plan"] = self._normalize_plan_ids(self.state["plan"])
         self.state["plan"] = self._ensure_entry_task(self.state["plan"])
-        # 方案定稿后**冻结接口基准**（同一段 14B 驻留内的第二次调用，不额外切换模型）。
-        self._freeze_skeleton()
         return self.state["plan"]
 
     def _freeze_skeleton(self) -> dict:
@@ -1092,7 +1239,54 @@ class Orchestrator:
         filled = self._backfill_task_symbols(digest)
         if filled:
             self.log(f"        [接口骨架] 回填了 {filled} 张施工图的 symbols（原先为空）")
+        # **立刻**核对"方案声明的符号是否都在基准里" —— 而不是等 verify 才发现骨架与产物不一致。
+        # 这两份东西会同时喂给 dev 且都被注明"必须逐字一致"，不一致时 dev 怎么写都要挨一边的判。
+        gaps = self._declared_vs_skeleton(digest)
+        if gaps:
+            self.state["skeleton_gaps"] = gaps
+            self.log(
+                f"        [接口基准] ⚠ 方案声明的 {len(gaps)} 个符号**不在基准里** —— "
+                "dev 会同时收到两份互相矛盾的要求（声明 vs 基准），必然被判「漏了声明过的符号」："
+            )
+            for line in gaps[:4]:
+                self.log(f"          - {line[:110]}")
         return digest
+
+    def _declared_vs_skeleton(self, digest: dict) -> list[str]:
+        """方案 ``changes[].symbols`` 里哪些**不在**刚冻结的接口基准里。
+
+        为什么要提前核对（而不是等 verify 的 `skeleton_problems`）：那两份要求是**同时**
+        喂给 dev 的，且都被注明"必须逐字一致"。声明有、基准没有 ⇒ dev 无论怎么写都会被
+        其中一方判错（真机 `20260928-095848`：施工图要 `main()` / `CLI()`，基准给的是
+        `class App` / `def main(args)`，于是 5/5 张图的自检全报"漏了声明过的符号"，
+        而"补漏"又因另一个 bug 空转）。提前报出来，才能区分**输入构造的锅**与**模型输出的锅**。
+
+        基准里没有该文件的成员信息时**不下结论** —— 否则会全是假警报（与 resolver 同一条口径）。
+        """
+        plan = self.state.get("plan")
+        if not isinstance(plan, dict):
+            return []
+        files = [
+            str(c.get("path")) for c in (plan.get("changes") or [])
+            if isinstance(c, dict) and c.get("path")
+        ]
+        idx = symbol_resolver.build_index(files, digest)
+        members = idx.get("file_members") or {}
+        gaps: list[str] = []
+        for change in (plan.get("changes") or []):
+            if not isinstance(change, dict):
+                continue
+            path = str(change.get("path") or "").replace("\\", "/")
+            known = members.get(path)
+            if not known:
+                continue
+            for sym in (change.get("symbols") or []):
+                name = symbol_resolver.clean_symbol(sym)
+                if not name:
+                    continue
+                if name not in known and name.rsplit(".", 1)[-1] not in known:
+                    gaps.append(f"{path}: {sym}（基准里没有）")
+        return gaps
 
     def _backfill_task_symbols(self, digest: dict) -> int:
         """用冻结的接口基准回填 ``tasks[].symbols``（**只填空的，不覆盖已声明的**）。
@@ -1343,7 +1537,14 @@ class Orchestrator:
         # 只是此前一直以"一串裸文本"的形态回喂，dev 只能靠猜。
         bug_block = ""
         if self.round_kind == tasktype.BUGFIX:
-            bug_report = tasktype.bug_report_from_state(self.state, list(self.fixes or []))
+            bug_report = tasktype.bug_report_from_state(
+                self.state,
+                list(self.fixes or []),
+                plan=self.state.get("plan"),
+                # 当前代码**按文件**给进去：缺陷单要摘出"待改处的逐字原文"，
+                # 让修复方不必凭记忆改写位置（与 dev 看到的正文同源，见 _current_candidates）
+                sources=self._current_sources(),
+            )
             if bug_report.get("type") == tasktype.BUGFIX:
                 # 上一轮**已存在**的文件：判断"能不能用 add 整份重吐"的基准
                 bug_report["existing_paths"] = sorted(
@@ -1379,16 +1580,25 @@ class Orchestrator:
             # 后再组装，不能让它们再作为关键字传给 parts_dev（会撞成重复关键字参数）。
             only_paths = kw.pop("only_paths", None)
             cur = kw.pop("current_code", current)
+            # **结构化判据**（不要用渲染后的 `code` 字符串判断）：池里有真片段、或当前实现里有
+            # 真代码，才算"有可锚定的原文"。空池的占位说明曾让这个判据恒真（见 prompts.parts_dev
+            # 的 has_code 说明与 retrieval.render_excerpts）。
+            code_available = bool((cur or "").strip()) or any(
+                str(getattr(e, "text", "") or "").strip() for e in (self.pool or [])
+            )
             parts = prompts.parts_dev(
                 requirement, scope, assessment, plan, code, fixes, prev_summary,
-                verify=verify, current_code=cur,
+                verify=verify, current_code=cur, code_available=code_available,
                 # 返工轮给**结构化缺陷单**而不是裸文本列表：dev 此前拿到的只有
                 # 「有 2 条补丁未能套用」这种话，既不知道是哪个文件、也不知道验收口径，
                 # 于是只能猜（真机 20260926-214757：四轮零进展，最后一律触顶）。
                 bug_report_block=bug_block,
                 # 返工轮同时切到**裁剪视图**：不再喂需求原文/PM 背景/完整方案/检索池，
                 # 只留「修这个缺陷必需」的材料（见 prompts._bugfix_parts）
-                bugfix=self.round_kind == tasktype.BUGFIX, **kw,
+                bugfix=self.round_kind == tasktype.BUGFIX,
+                # 三值一起给：`plan_rework` 既不是首轮也不是修缺陷，视图与尾部任务段都不同
+                # （此前尾部无条件拼首轮的「按方案实现代码改动」，靠 rework note 去"盖住"它）。
+                round_kind=self.round_kind, **kw,
             )
             # 三段都钉在最前面（注意力最强）：**冻结的接口基准** + 已产出接口 + 返工退化点名。
             # 顺序刻意如此：先「应当长什么样」（方案的基准，改它要回方案），后「现在长什么样」
@@ -1425,7 +1635,14 @@ class Orchestrator:
             self.log(f"        [按 task 分派] 共 {len(per_task)} 张施工图，逐张施工")
             merged = self._dev_by_tasks(_dev_parts, plan_pin, per_task)
             repair_kwargs: dict[str, Any] = {}
-        elif DEV_TWO_PASS and (code.strip() or current.strip()):
+        elif DEV_TWO_PASS:
+            # **条件里的 `(code or current)` 已去掉**：它原本是"有没有可锚定的素材"的判据，
+            # 但 `code` 是**渲染后**的检索池 —— 池为空时 `retrieval.render_excerpts([])` 曾返回
+            # 一句占位说明（非空），于是这个条件对新建项目**恒真**。那句占位说明现已移到呈现层
+            # （`retrieval.render_excerpts` 空池返回空串），若继续留着这个条件，新建项目会被
+            # **静默降级为单遍** —— 那是行为变更，而两遍模式本来就是为"没有可锚定材料"设计的
+            # （见 `parts_dev` 的「第一遍·脚手架」分支）。这里显式化，保持既有可观测行为。
+            # 注：`DEV_PER_TASK` 且方案有 ≥2 张施工图时走上面的分派分支，本分支用不到。
             # 第一遍：只铺辅助函数（脚手架），不动主函数体
             p1 = self._grounded_call(
                 "dev",
@@ -1467,6 +1684,7 @@ class Orchestrator:
         # + 一次 14B 评审），模型下一轮照样写残 —— 真机 run 20260924-185507 连栽 4 轮。
         # 所以先原地重问，把「写残」这类低级失误在几十秒内解决。
         _shown: frozenset[str] | None = None  # 上一次拿去重问的问题集，用于判「有没有进展」
+        _prev_count: int | None = None  # 上一版的问题**条数**，用于判「有没有净进展」
         for attempt in range(1, DEV_CONTENT_REPAIR_TRIES + 1):
             problems = self._dev_selfcheck(merged)
             if not problems:
@@ -1490,13 +1708,21 @@ class Orchestrator:
             # 问题集完全相同说明模型这一轮改不动它，再问只是把预算重复烧一遍；
             # 剩下的交给评审与人工（下面已有「重问 N 次后仍不合法」的落点，证据照样留得下）。
             _now = frozenset(str(p) for p in problems)
-            if _shown is not None and _now == _shown:
+            # 无进展就停：判据是**问题条数没有下降**，而不必等到"完全相同"。
+            # 真机 `20260928-110402`：4 处 → 重问 → 6 处 → 重问 → 12 处（`补丁校验 12 个问题、
+            # 物理套不上 8 个`）→ 第三轮才因"完全相同"停下。**越修越多**说明这一版模型在
+            # 自检这条路上改不动它，多问一轮只是把预算重复烧一遍（该运行在阶段级重问上花了
+            # 168 秒，其中两次是净损失）。剩下的交给评审与人工，证据照样留得下。
+            # 注意比较基准是"上一次**拿去重问时**的条数"：机械补 import 之后条数若真的下降，
+            # 这里会放行（那是真进展）。
+            if _prev_count is not None and (len(problems) >= _prev_count or _now == _shown):
+                why = "与上一版完全相同" if _now == _shown else f"条数没有下降（{_prev_count} → {len(problems)}）"
                 self.log(
-                    f"        [自检] 重问无进展（{len(problems)} 处问题与上一版完全相同）"
-                    "→ 停止重问，交给评审与人工"
+                    f"        [自检] 重问无进展（问题{why}）→ 停止重问，交给评审与人工"
                 )
                 break
             _shown = _now
+            _prev_count = len(problems)
             self.log(
                 f"        [自检] 发现问题 {len(problems)} 处 → 带问题重问 dev"
                 f"（第 {attempt}/{DEV_CONTENT_REPAIR_TRIES} 次）"
@@ -1759,17 +1985,13 @@ class Orchestrator:
             out["summary"] = prev.get("summary") or ""
         return out
 
-    def _current_code_text(self, only_paths: set[str] | None = None) -> str:
-        """当前项目里**已有的代码正文** —— 返工时开发必须看到的东西。
+    def _current_candidates(self, only_paths: set[str] | None = None) -> list[tuple[str, str]]:
+        """当前已有代码的**逐文件正文**（`[(相对路径, 正文)]`，按"上一轮改过的优先"排序）。
 
-        为什么必须有：`_code_text()` 切的是**检索池**，而新建项目的池是空的 —— 于是开发
-        写完 2.2KB 代码后，下一轮一个字都看不到，只能照着方案**重新发明**这些文件。
-        真机 run 20260924-235001 因此连栽 8 轮：补错 import（`from snake import Food`）、
-        丢掉入口点、把已经跑通的实现改坏，返工项也一直修不掉。
-
-        来源优先「物化后的真实文件」（verify 沙箱正是上一轮的真实产物，最接近仓库现状），
-        取不到时退回实现产物里的补丁正文。按 dev 的代码预算裁剪，且**上一轮改动过的文件
-        排在最前** —— 预算不足时至少保证那些可见。
+        这是「当前代码从哪来」的**唯一一份实现**：`_current_code_text`（喂给 dev 的正文块）
+        与 `_current_sources`（缺陷单里给"待改处的逐字原文"）都走它。
+        分成两份实现迟早会漂移 —— 而**同源**在这里是有硬要求的：缺陷单给的原文
+        必须与 dev 看到的【当前项目已有代码】是同一份，否则它照着缺陷单抄也对不上。
         """
         edits = [
             e
@@ -1802,6 +2024,29 @@ class Orchestrator:
             wanted = {str(p).replace("\\", "/") for p in only_paths}
             candidates = [kv for kv in candidates if kv[0] in wanted]
         candidates.sort(key=lambda kv: (kv[0] not in touched, kv[0]))
+        return candidates
+
+    def _current_sources(self, only_paths: set[str] | None = None) -> dict[str, str]:
+        """`{相对路径: 正文}`（**不裁剪**）。
+
+        给缺陷单用：它要从中摘出"待改处的逐字原文"。裁剪会截断正文、让后面的符号取不到，
+        而这里只需要几行，不占提示词预算（真正进提示词的只有被摘出来的那几行）。
+        """
+        return dict(self._current_candidates(only_paths))
+
+    def _current_code_text(self, only_paths: set[str] | None = None) -> str:
+        """当前项目里**已有的代码正文** —— 返工时开发必须看到的东西。
+
+        为什么必须有：`_code_text()` 切的是**检索池**，而新建项目的池是空的 —— 于是开发
+        写完 2.2KB 代码后，下一轮一个字都看不到，只能照着方案**重新发明**这些文件。
+        真机 run 20260924-235001 因此连栽 8 轮：补错 import（`from snake import Food`）、
+        丢掉入口点、把已经跑通的实现改坏，返工项也一直修不掉。
+
+        来源优先「物化后的真实文件」（verify 沙箱正是上一轮的真实产物，最接近仓库现状），
+        取不到时退回实现产物里的补丁正文。按 dev 的代码预算裁剪，且**上一轮改动过的文件
+        排在最前** —— 预算不足时至少保证那些可见。
+        """
+        candidates = self._current_candidates(only_paths)
 
         budget = CODE_BUDGET.get("dev", 0) or 8000
         used = 0
@@ -2759,6 +3004,25 @@ class Orchestrator:
             self.log(f"        [未验证] {len(unverified)} 项（pass ≠ 该验的都验了）")
             for item in unverified[:3]:
                 self.log(f"          - {item}")
+        # **逐项验收**：每条修复项 ↔ 本轮的机械执行结果（转绿 / 仍失败 / 无从核对）。
+        # 存进 state 供评审与人工看。没有它，"修好了没"只能整体看 verdict —— 无法逐项追，
+        # 而"逐项可追溯"正是返工反复不收敛时最缺的可观测性。
+        verdicts = tasktype.defect_verdicts(
+            self.state,
+            list(getattr(self, "fixes", None) or []),
+            plan=self.state.get("plan"),
+            # 与缺陷单、与 dev 看到的正文**同源**（见 _current_candidates）
+            sources=self._current_sources(),
+        )
+        self.state["defect_verdicts"] = verdicts
+        if verdicts:
+            counts = {k: 0 for k in ("green", "red", "unverifiable")}
+            for row in verdicts:
+                counts[str(row.get("status"))] = counts.get(str(row.get("status")), 0) + 1
+            self.log(
+                f"        [逐项验收] {len(verdicts)} 条修复项：转绿 {counts.get('green', 0)} / "
+                f"仍失败 {counts.get('red', 0)} / 无从核对 {counts.get('unverifiable', 0)}"
+            )
 
     def _stage_review(self, requirement: str, fixes: list[str] | None = None) -> Any:
         parts = prompts.parts_review(
@@ -2772,6 +3036,10 @@ class Orchestrator:
             # 红线检查的机械证据（含每条规则的反例判据）直接摆到评审面前：
             # 判负理由与"什么能推翻它"都写清楚，评审就没有靠猜测凑条目的空间。
             rules_block=rules.format_block(self.state.get("rule_findings") or []),
+            # 逐项验收：本轮每条修复项的机械核对结果（只列仍失败 / 无从核对的）
+            defect_block=tasktype.render_defect_verdicts(
+                self.state.get("defect_verdicts") or []
+            ),
         )
         audit = self.state.get("implementation_audit") or self._audit_implementation()
         # 审计结论必须被看到（预算最紧的正是评审阶段），所以走 pin 而不是普通片段
@@ -3006,7 +3274,9 @@ class Orchestrator:
         # —— 真机 20260927-192001 里 state 上的 affected 是空的，但按当前 fixes 重算
         #   明明是 {errors.py, test_all.py, test_command.py}。读过期存档会让
         #   「只重做受影响任务」整个失效，退化成整批重做（最小改动也就没了）。
-        report = tasktype.bug_report_from_state(self.state, list(getattr(self, "fixes", None) or []))
+        report = tasktype.bug_report_from_state(
+            self.state, list(getattr(self, "fixes", None) or []), plan=self.state.get("plan")
+        )
         affected = {str(p).replace("\\", "/") for p in (report.get("affected") or {})}
         if not affected:
             return []
@@ -3100,6 +3370,123 @@ class Orchestrator:
             return False
         return True
 
+    def _task_focus(
+        self, task: dict, *, rework_problems: list[str] | None = None, symbols: list[str] | None = None
+    ) -> str:
+        """本张施工图的**聚焦块**（主路径 / 拆半 / 补漏**三处共用一份**）。
+
+        为什么要抽出来（真机 `20260928-095848` 的教训）：补漏重试此前直接引用
+        `_dev_task_call` 里的**局部变量** `focus` —— 跨函数引用局部变量编译器不管，
+        于是每次补漏都抛 `NameError`。异常被兜底吞掉（那是刻意设计：单张图失败不该
+        拖垮整轮），日志里只留一行"补符号这次调用失败"，**而机制在每一张图上空转**
+        （该运行 5/5 张全中，等于"补漏符号"这条自检完全没生效）。
+
+        那次还留下第二个教训：这类错误 `ruff` 的 F821 一查就出（定位到行），
+        但回归闸门里没跑 lint —— 所以现在 `check_lint` 是闸门的一部分。
+        """
+        view = {**task, "rework_problems": list(rework_problems or [])}
+        if symbols is not None:
+            view["symbols"] = list(symbols)
+        focus = prompts.task_focus_block(view, (self.state.get("plan") or {}).get("changes"))
+        if symbols is not None:
+            focus += (
+                f"\n【本图已被**机械拆半**】本次只写这些符号：{'、'.join(symbols)} —— "
+                "不要越出原图范围，其余符号由另一半负责。"
+            )
+        return focus
+
+    def _dev_task_call(
+        self,
+        task: dict,
+        tasks: list[dict],
+        parts_fn: Any,
+        plan_pin: Any,
+        *,
+        rework_problems: list[str] | None = None,
+        symbols: list[str] | None = None,
+        suffix: str = "",
+    ) -> dict:
+        """按一张（可能被**机械拆半**的）施工图做一次 dev 调用。
+
+        抽出来是为了让**主路径与拆半路径共用同一份组装** —— 两处各写一份，迟早漂移，
+        而"同一处逻辑两份实现"正是本项目反复踩的那类坑。
+        `symbols` 非空时表示这是拆半后的子图：只写这几个符号，并在施工图里写明。
+        """
+        tid = str(task.get("id") or "?")
+        focus = self._task_focus(task, rework_problems=rework_problems, symbols=symbols)
+        # 只喂这张图相关的文件：接口摘要 / 退化点名 / 当前正文都按它裁
+        paths = self._task_paths(task, tasks)
+        thin = self._task_drawing_is_thin(task)
+        parts = parts_fn(
+            include_plan=thin, only_paths=paths, current_code=self._current_code_text(paths)
+        )
+        return self._grounded_call(
+            "dev",
+            # 施工图放最前：`fit_prompt` 从末尾开始丢片段，而它是本次调用的**全部权威**。
+            # include_plan：施工图**太薄**时（架构师填不出 symbols/test_hint/contracts
+            # 是常态，不是例外）必须退回给整份方案 —— 否则 dev 在真空里施工，
+            # 又退回瞎出 `modify` 补丁（真机 20260927-150931）。够厚才只给施工图。
+            [focus, *parts] if focus else parts_fn(include_plan=thin),
+            pin=plan_pin,
+            note=f"dev·{tid}{suffix}",
+            # **别占 dev 的阶段槽位**：续跑时 `_restore` 会用「dev 阶段最后一次快照」
+            # 覆盖 `state["implementation"]`（那是**累积实现**），而逐张施工图的产物
+            # 只是**这一次调用**的输出 —— 覆盖的后果是累积实现被缩成"最后一张图"，
+            # 上一轮 add 出来的文件整份消失，下一轮对它们发 modify 一律判
+            # 「目标文件不存在」（真机 20260927-134222 实测：17 条累积 → 4 条）。
+            # 给它独立 artifact_stage，文件名与埋点仍留档，但不再冒充 dev 的阶段产物。
+            artifact_stage=f"dev-{tid}{suffix}",
+        )
+
+    def _dev_split_retry(
+        self,
+        task: dict,
+        exc: Exception,
+        tasks: list[dict],
+        parts_fn: Any,
+        plan_pin: Any,
+        rework_problems: list[str] | None = None,
+    ) -> dict:
+        """单张图因**输出截断**失败时，把它的符号**对半拆**逐半重试；成功则返回合并结果。
+
+        为什么由机制做：`OllamaError` 的原文就在说"让产物更短（拆分任务、减少条目）"，
+        但那句话之前只是**写给人看的**——结果就是这张图本轮直接没产出（真机
+        `20260928-000351`：T-04 / T-02 / T-05 各失败一次，整轮少了几个文件）。
+        拆半是纯机械操作：不需要模型判断，两半都仍在原图的符号范围内（不越界），
+        而且**先诊断再拆**——只有截断才拆（重复循环拆了也会再陷）。
+        """
+        if "截断" not in f"{type(exc).__name__}: {exc}":
+            return {}
+        symbols = [str(s).strip() for s in (task.get("symbols") or []) if str(s).strip()]
+        if len(symbols) < 2:
+            return {}
+        halves = [symbols[: len(symbols) // 2], symbols[len(symbols) // 2 :]]
+        self.log(
+            f"        [按 task 分派] {task.get('id')} 输出被截断 → **机械拆半**重试（"
+            + " | ".join("、".join(h) for h in halves)
+            + "）"
+        )
+        out: dict = {}
+        for half in halves:
+            try:
+                data = self._dev_task_call(
+                    task,
+                    tasks,
+                    parts_fn,
+                    plan_pin,
+                    rework_problems=rework_problems,
+                    symbols=half,
+                    suffix="-split",
+                )
+            except Exception as exc2:  # noqa: BLE001
+                self.log(
+                    f"        [按 task 分派] {task.get('id')} 拆半后仍失败"
+                    f"（{type(exc2).__name__}：{str(exc2)[:160]}）"
+                )
+                continue
+            out = self._merge_dev(out, data) if out else data
+        return out
+
     def _dev_by_tasks(self, parts_fn: Any, plan_pin: Any, tasks: list[dict]) -> dict:
         """一次 dev 调用只做一张施工图，逐张产出并累积合并。
 
@@ -3107,46 +3494,31 @@ class Orchestrator:
         这是「分 task 完成测试、审核后不用到人工」里那个"测试"的落点：它不产生人工闸门。
         """
         merged: dict = {}
-        # 方案没声明 symbols 时，施工图要从 changes.approach 推断候选符号名（见 prompts）
-        plan_changes = (self.state.get("plan") or {}).get("changes")
+        # **按施工图归因**（返工轮才有内容）：这张图上一轮到底错了什么。
+        # 诉求是"返工要指明哪个 task 的具体什么问题"，而映射本来就是机械可得的
+        # （补丁自带 `covers_tasks`、施工图自带 `target_files`），不该让模型或人工去对。
+        by_task = tasktype.bug_report_from_state(
+            self.state, list(getattr(self, "fixes", None) or []), plan=self.state.get("plan")
+        ).get("by_task") or {}
         for idx, task in enumerate(tasks, 1):
             tid = str(task.get("id") or f"#{idx}")
-            focus = prompts.task_focus_block(task, plan_changes)
-            # 只喂这张图相关的文件：接口摘要 / 退化点名 / 当前正文都按它裁
-            paths = self._task_paths(task, tasks)
+            rework = (by_task.get(tid) or {}).get("problems") or []
             # 单张图的调用失败**不能拖垮整轮**：7B 偶发进入重复生成被 ollama 中止
             # （真机 20260927-060300：`prediction aborted, token repeat limit reached`），
             # 异常冒泡出去会直接终结整个 run，前面几张图的产出全部作废、state 还停在
             # running 变成"隐身运行"。这里吞掉、记一笔，其余施工图照常施工。
             try:
-                data = self._grounded_call(
-                    "dev",
-                    # 施工图放最前：`fit_prompt` 从末尾开始丢片段，而它是本次调用的**全部权威**。
-                    # include_plan：施工图**太薄**时（架构师填不出 symbols/test_hint/contracts
-                    # 是常态，不是例外）必须退回给整份方案 —— 否则 dev 在真空里施工，
-                    # 又退回瞎出 `modify` 补丁（真机 20260927-150931）。够厚才只给施工图。
-                    [
-                        focus,
-                        *parts_fn(
-                            include_plan=self._task_drawing_is_thin(task),
-                            only_paths=paths,
-                            current_code=self._current_code_text(paths),
-                        ),
-                    ]
-                    if focus
-                    else parts_fn(include_plan=self._task_drawing_is_thin(task)),
-                    pin=plan_pin,
-                    note=f"dev·{tid}",
-                    # **别占 dev 的阶段槽位**：续跑时 `_restore` 会用「dev 阶段最后一次快照」
-                    # 覆盖 `state["implementation"]`（那是**累积实现**），而逐张施工图的产物
-                    # 只是**这一次调用**的输出 —— 覆盖的后果是累积实现被缩成"最后一张图"，
-                    # 上一轮 add 出来的文件整份消失，下一轮对它们发 modify 一律判
-                    # 「目标文件不存在」（真机 20260927-134222 实测：17 条累积 → 4 条，
-                    # 沙箱里只剩 main.py）。给它独立 artifact_stage，文件名与埋点仍留档，
-                    # 但不再冒充 dev 的阶段产物。
-                    artifact_stage=f"dev-{tid}",
-                )
+                data = self._dev_task_call(task, tasks, parts_fn, plan_pin, rework_problems=rework)
             except Exception as exc:  # noqa: BLE001
+                # **截断 ⇒ 自动拆半重试**：`OllamaError` 的原文就在说"让产物更短
+                # （拆分任务、减少条目）"，但那是**写给人看的建议** —— 结果就是这张图
+                # 本轮干脆没产出（真机 20260928-000351：T-04 / T-02 / T-05 各失败一次）。
+                # 拆半是纯机械操作，不需要模型判断，且两半都仍在原图的符号范围内（不越界）。
+                split = self._dev_split_retry(task, exc, tasks, parts_fn, plan_pin, rework)
+                if split:
+                    merged = self._merge_dev(merged, split) if merged else split
+                    self.log(f"        [按 task 分派] {tid} 拆半后完成（{idx}/{len(tasks)}）")
+                    continue
                 self.log(
                     f"        [按 task 分派] {tid} 本次调用失败（{type(exc).__name__}："
                     f"{str(exc)[:300]}）→ 跳过这张，其余图继续施工"
@@ -3164,14 +3536,23 @@ class Orchestrator:
                     f"（{'、'.join(gaps[:3])}）→ 只重做这一张"
                 )
                 try:
+                    # 与主路径**同参数**：聚焦块走共用实现（此前这里引用 `_dev_task_call`
+                    # 的局部变量 `focus` ⇒ 每次补漏都 `NameError`，机制在整个运行里空转）；
+                    # `only_paths` / `current_code` 也按本图裁剪 —— 不传的话补漏调用会看到
+                    # **全量代码**（与主路径不一致），容易顺手去改别的文件。
+                    paths = self._task_paths(task, tasks)
                     again = self._grounded_call(
                         "dev",
                         [
-                            focus,
+                            self._task_focus(task, rework_problems=rework),
                             "【补漏】上一版漏掉了施工图里声明的这些符号："
                             f"{'、'.join(gaps)}。请补齐它们的**完整定义**，"
                             "不要改动其他文件、不要重写已完成的部分。",
-                            *parts_fn(include_plan=self._task_drawing_is_thin(task)),
+                            *parts_fn(
+                                include_plan=self._task_drawing_is_thin(task),
+                                only_paths=paths,
+                                current_code=self._current_code_text(paths),
+                            ),
                         ],
                         pin=plan_pin,
                         note=f"dev·{tid}·补符号{retry}",
@@ -3517,8 +3898,14 @@ class Orchestrator:
                 # 带上第一条说明：它常常是**定位信息**（如"第 2 行：字符串 ' 未闭合"），
                 # 只给状态名的话，拿到返工项的一方不知道该改哪儿。
                 detail = "；".join(str(x) for x in (row.get("notes") or [])[:1])
+                # **点名施工图**：这句会进评审与 dev 的缺陷单。"哪个 task 出了什么问题"
+                # 是机械可得的（补丁自带 covers_tasks），那就必须写出来 ——
+                # 否则读的人只能自己去做"文件 ↔ 施工图"的映射，返工项等于无主。
+                tids = [str(t) for t in (row.get("tasks") or []) if str(t).strip()]
                 out.append(
-                    f"{name}：{patches.STATUS_CN.get(status, status)}" + (f"（{detail}）" if detail else "")
+                    (f"［施工图 {'、'.join(tids[:2])}］" if tids else "")
+                    + f"{name}：{patches.STATUS_CN.get(status, status)}"
+                    + (f"（{detail}）" if detail else "")
                 )
         return out
 
@@ -3553,6 +3940,38 @@ class Orchestrator:
     def _looks_like_entry_fix(self, text: str) -> bool:
         low = str(text).lower()
         return any(hint in low for hint in self._ENTRY_FIX_HINTS)
+
+    @staticmethod
+    def _looks_like_test_file(path: str) -> bool:
+        """`test_*.py` / `*_test.py`（测试阶段产出的文件，**不属于方案的 changes 范围**）。
+
+        为什么要排除：缺陷指向测试文件 ≠ "方案漏规划了一个产品文件"。真机 `192001` 的
+        `affected` 里就混着 `test_all.py` / `test_command.py` —— 不排除就会因为"方案里没有
+        测试文件"把整个方案打回，那是纯误判。
+        """
+        name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+        return name.startswith("test_") or name.endswith("_test.py")
+
+    def _plan_uncovered_defects(self) -> list[str]:
+        """缺陷指向、但方案里**没有任何 task 覆盖**的文件（方案层漏项）。
+
+        为什么必须由机制判：开发受方案白名单约束（只改 `changes` / `target_files` 里列出的
+        文件），方案没规划的文件**它无权创建**。于是"评审要求加 / 开发做不到"两边都没错，
+        循环却不收敛 —— 与 `_plan_missing_entry` 是同一条道理，而那条已经用真机验证有效
+        （`20260925-045404` 卡 3 轮就是靠它破的）。
+
+        还治另一件事：返工的任务此前只能来自 `plan.tasks`，这些"不属于任何施工图"的缺陷
+        **没有任务可派** ⇒ `_tasks_for_bugfix` 返回空 ⇒ 调度落到整批重做，最小改动丢失。
+        """
+        # mock 下不生效：mock 的返工项是按 schema 合成的占位文本，会指向不存在的文件，
+        # 把「流程机制」的测试整个带偏（与覆盖审计 / `_orphan_modify_files` 同一条约定）。
+        if isinstance(self.client, MockClient):
+            return []
+        report = tasktype.bug_report_from_state(
+            self.state, list(getattr(self, "fixes", None) or []), plan=self.state.get("plan")
+        )
+        gaps = tasktype.plan_gap_files(report.get("items") or [], self.state.get("plan"))
+        return [f for f in gaps if not self._looks_like_test_file(f)]
 
     def _verify_missing_entry(self) -> bool:
         """运行验证是否判了「没有可执行入口」。"""
@@ -3902,6 +4321,34 @@ class Orchestrator:
                     "（main.py / __main__.py 等，带 `if __name__ == '__main__':` 且运行时有输出）。"
                     "方案不规划它，开发就无权创建，运行验证会一直判「没有可执行入口」。"
                 ] + moved
+
+        # ---------------------------------------------------------- 方案漏项的层级纠正
+        # 缺陷指向的**文件**方案里没有 ⇒ 判断依据见 `_plan_uncovered_defects`。
+        # 这是"返工老是修不好"的一条根：返工的任务此前只能来自 `plan.tasks`
+        # （影响面 ∩ target_files），于是"不属于任何施工图"的缺陷（跨文件集成、
+        # 方案漏规划的文件）**没有任务可派** —— `_tasks_for_bugfix` 返回空，
+        # 调度落到「两遍模式整批重做」，最小改动整个丢掉；而开发受方案白名单约束，
+        # 就算派了它也**无权创建方案里没有的文件**。判 rework_dev 只会白烧一轮。
+        gap_files = self._plan_uncovered_defects()
+        if gap_files:
+            moved = [x for x in in_material if any(f in str(x) for f in gap_files)]
+            in_material = [x for x in in_material if x not in moved]
+            architect = list(architect) + [
+                f"方案漏项：缺陷指向 {'、'.join(gap_files)}，但方案里**没有任何 task 覆盖**它们。"
+                "请在 changes / tasks 里补上这些文件（开发受方案白名单约束，无权创建方案里没有的文件）——"
+                "把它硬塞给开发只会白烧一轮。"
+            ] + moved
+            if str(review.get("verdict") or "") in ("", "pass", "rework_dev"):
+                review["verdict"] = "rework_architect"
+                review["forced_rework"] = True
+                review["required_fixes"] = list(architect) + list(in_material)
+                review["reasons"] = list(review.get("reasons") or []) + [
+                    "机制判定：缺陷指向方案未规划的文件（方案层漏项）→ 强制回流方案"
+                ]
+                self.log(
+                    f"  [机制] 缺陷指向方案未规划的文件（{'、'.join(gap_files)}）"
+                    "→ 强制 rework_architect（判 dev 它也改不动）"
+                )
                 review["required_fixes"] = in_material
                 review["architect_fixes"] = architect
                 review["reasons"] = list(review.get("reasons") or []) + [
@@ -4154,10 +4601,32 @@ class Orchestrator:
             return True
         return (attempt - self.last_review_attempt) >= self.review_every
 
+    def _mark_next_round(self, kind: str) -> None:
+        """标记**下一次 dev 轮**的任务类型（由路由决策点写入、`_begin_round` 消费）。
+
+        为什么要"待定"而不是当场写 `state.round_kind`：判「回方案」时下一轮跑的是**架构师**
+        而不是开发，若当场就把类型改成 plan_rework，方案轮的提示词查询会读到它
+        （`architect_plan` 未定义这一档，靠回退侥幸正确 —— 侥幸不算设计）。
+        放成待定，由 `_begin_round("dev")` 消费，语义才与"这一轮开发是什么任务"对齐。
+        """
+        self.state["pending_round_kind"] = kind
+
+    def _take_pending_kind(self) -> str:
+        kind = str(self.state.get("pending_round_kind") or "").strip()
+        if kind:
+            self.state["pending_round_kind"] = ""
+        return kind
+
     def _begin_round(self, entry: str) -> str:
         self.attempt += 1
+        if entry == "dev":
+            # 落到 dev 轮才算定稿。`_run_architect_plan` 收尾也会推 dev ——
+            # 那条路上的类型来自 `_step_review` 的标记（方案返工），不会被方案轮吃掉。
+            self.state["round_kind"] = self._take_pending_kind() or tasktype.FEATURE
         route = "架构师方案 -> 开发 -> 测试" if entry == "architect_plan" else "开发 -> 测试"
         tail = " -> 评审" if self._review_due(self.attempt) else "（本轮跳过评审）"
+        if entry == "dev":
+            tail += f"（本轮口径：{tasktype.round_kind_label(self.state.get('round_kind'))}）"
         self.log(f"== 迭代 {self.attempt}: {route}{tail}")
         return entry
 
@@ -4210,6 +4679,29 @@ class Orchestrator:
 
     def _run_dev(self) -> str:
         self._stage_dev(self.requirement, self.fixes)
+        # **定位失败的补丁不许留在累积实现里**（见 `patches.prune_unappliable` 的真机依据）。
+        # 它们永远套用不上（`apply_all` 只收 status=="ok"），却会被 `_patch_blockers` 与
+        # verify 当成"交付物不完整"的阻断项 —— 而下一轮 dev 只会再写一条**同样对不上**的
+        # anchor（真机 20260927-221511：连续两次重问，问题集一字未变，4 条补丁照样套用不了）。
+        # 留着的唯一后果就是"恒定判负"。移除动作**留痕**（日志 + state + handoff），不静默。
+        # mock 下不生效：mock 的 dev 产物是按 schema 合成的 modify 占位数据，**每条**都
+        # 定位不到；裁掉它们等于把"流程机制"的测试基线一起裁了（与覆盖审计 /
+        # `_orphan_modify_files` 的同一条约定一致：mock 测流程，不测内容质量）。
+        pruned = (
+            {"dropped": 0, "detail": []}
+            if isinstance(self.client, MockClient)
+            else patches.prune_unappliable(self.repo, self.state.get("implementation"))
+        )
+        if pruned["dropped"]:
+            self.state.setdefault("pruned_patches", []).extend(pruned["detail"])
+            # 审计与 edits 是**按位置对齐**的（`apply_all` 用 zip），裁剪后必须重算
+            self.state.pop("patch_audit", None)
+            self.log(
+                f"        [补丁裁剪] {pruned['dropped']} 条**定位失败**的补丁（anchor/符号与原文对不上）"
+                "已从实现里移除："
+                + "、".join(pruned["detail"][:3])
+                + " —— 它们永远套用不上，留着只会变成每轮都判负的恒定阻断项（已记入 handoff）"
+            )
         audit = self._audit_implementation()
         self.state["implementation_audit"] = audit
         if audit["missing"]:
@@ -4300,14 +4792,18 @@ class Orchestrator:
             # （人工审核闸门等"评审后再续跑"的场景会暴露此问题）。
             runstore.save_artifact(self.run_dir, "review", review, note="review-normalized")
         verdict = review.get("verdict", "rework_dev")
+        # 机械证据**只取一次**：下面既写进轮次记录，又喂给归因（两处必须看到同一份，
+        # 否则会出现"轮次记录里有阻断项、归因却说无缺陷"这种自相矛盾的账）。
+        patch_blockers = self._patch_blockers()
+        mechanical_blockers = self._mechanical_blockers()
         self.rounds.append(
             {
                 "attempt": self.attempt,
                 "verdict": verdict,
                 "forced_pass": forced,
                 "forced_rework": bool(review.get("forced_rework")),
-                "patch_blockers": self._patch_blockers(),
-                "mechanical_blockers": self._mechanical_blockers(),
+                "patch_blockers": patch_blockers,
+                "mechanical_blockers": mechanical_blockers,
                 "required_fixes_in_material": in_material,
                 "required_fixes_architect": architect_fixes,
                 "required_fixes_external": external,
@@ -4329,26 +4825,61 @@ class Orchestrator:
                 else ""
             )
         )
-        if verdict == "pass":
-            return "human_review" if HUMAN_REVIEW_GATE else "done"
-        if review.get("escalated_ambiguous"):
-            self.needs_human = True
-            self.log("  评审结论自相矛盾（判方案有错却又全需外部确认），标记 needs_human 交人工裁决")
-            return "done"
-        if self.attempt > self.max_rework:
-            self.needs_human = True
-            self.log(f"  已达回流上限 {self.max_rework}，标记 needs_human")
-            return "done"
+        # ---- 归因与去向：**一次确定性分类**（替换原先散开的七层 if 链）
+        # 判据散在四个函数里时改动容易只改一半 —— 那正是本项目"机制空转"的常见成因。
+        # 现在「为什么没修好」与「下一跳去哪」由一处产出，并逐轮落进
+        # `state.failure` / `state.failure_history`：返工原因从散落日志变成可查询数据。
         # 收敛 / 预算护栏：决定「再烧一轮」之前先问一句值不值。
         # 真机教训 run 20260924-185507：required_fixes 走势 3→2→0→2→4→4→5→4，
         # 第 3 轮已经 pass 之后又反弹，一路烧到 attempt=11/max=12 —— 期间独占显存
         # （单驻留，无法新建运行）却毫无收敛迹象。光靠 max_rework 只在撞顶那一刻才停。
         stop = self._guard_stop_reason()
-        if stop:
+        record = diagnose.classify(
+            review=review,
+            attempt=self.attempt,
+            max_rework=self.max_rework,
+            guard_stop=stop or "",
+            patch_blockers=patch_blockers,
+            mechanical_blockers=mechanical_blockers,
+            # 跨文件契约虚依赖：归因指向方案层，但**路由暂不动它**（改行为要有基线，
+            # 见 diagnose.classify 的 owner_mismatch 说明）。
+            unresolved=self.state.get("plan_unresolved"),
+            missing_entry=self._plan_missing_entry(),
+            uncovered_files=self._plan_uncovered_defects(),
+            external_fixes=external,
+            prior_types=[str(r.get("failure") or "") for r in self.rounds[:-1]],
+        )
+        self.rounds[-1]["failure"] = record["type"]
+        self.state["failure"] = record
+        self.state.setdefault("failure_history", []).append(
+            {
+                key: record.get(key)
+                for key in ("round", "type", "owner", "recover_stage", "needs_human", "stop", "repeat")
+            }
+        )
+        for line in diagnose.render(record):
+            self.log(line)
+        if record["needs_human"]:
             self.needs_human = True
+        if stop:
             self.state["guard_stop"] = stop
-            self.log(f"  [护栏] {stop} → 停止返工，转人工裁决（不再继续烧）")
+        target = record["recover_stage"]
+        if target == "done":
             return "done"
+        if target == "human_review":
+            return "human_review" if HUMAN_REVIEW_GATE else "done"
+
+        # ---- 缺陷台账：跨轮守恒（仍开 / 本轮转绿 / 不再出现 / 回归）
+        # 直接用评审阶段已算好的逐项验收结果（`_stage_review` 写进 state），不重算。
+        # 它回答的是返工最缺的那句"到底还剩几条、上次那几条去哪了"。
+        led = diagnose.ledger(
+            self.state.get("defect_ledger"),
+            rows=self.state.get("defect_verdicts") or [],
+            round_no=self.attempt,
+        )
+        self.state["defect_ledger"] = led
+        self.log(diagnose.ledger_line(led))
+
         # 方案层返工项也进 fixes：回退到方案时架构师要能逐条看到「我漏了什么」，
         # 只做路由不带上内容的话，架构师拿不到任何具体指示。
         # 但**上一轮的返工项必须先过证伪**：它会被喂回下一轮评审
@@ -4366,7 +4897,7 @@ class Orchestrator:
             review["refuted_blockers"] = dropped
         fixes = list(architect_fixes) + in_material_kept + blockers_kept
         self.fixes = fixes
-        if verdict == "rework_architect" or architect_fixes:
+        if target == "architect_plan":
             # 自动回转：判「方案本身有问题」**或**有任一条方案层返工项，都回方案阶段重跑。
             # 之前只看 verdict —— 评审把方案层根因误标成实现层时，就会整轮打回开发，
             # 而开发在方案 changes 范围内改不动它，白烧一轮（真机 run 20260924-185507）。
@@ -4376,7 +4907,12 @@ class Orchestrator:
                 else f"评审把 {len(architect_fixes)} 条返工项判为方案层"
             )
             self.log(f"  {why}：回到架构师方案（方案改了实现必然重做）")
+            # 下一轮 dev 是**方案返工后施工**，不是"最小改动修缺陷"：方案可能新增了文件与符号，
+            # 口径必须跟着换 —— 否则评审要求加文件、开发无权创建，两边都没错却不收敛（真机 L2）。
+            self._mark_next_round(tasktype.PLAN_REWORK)
             return self._begin_round("architect_plan")
+        # 其余回流都是在**既有方案范围内**修东西：按缺陷修复口径（最小改动 + 逐条回应）。
+        self._mark_next_round(tasktype.BUGFIX)
         return self._begin_round("dev")
 
     def _extend_budget_for_human(self, reason: str) -> None:
@@ -4466,6 +5002,9 @@ class Orchestrator:
         # 先追加预算再回流：否则 attempt 一推过上限，下一轮评审立刻判 needs_human 结束
         # （真机 run 20260924-185507 就是"人工打回后只跑一轮就死"）
         self._extend_budget_for_human("人工审核打回")
+        # 人工打回是**缺陷修复**轮（不是方案返工）：口径按"最小改动 + 逐条回应人工意见"，
+        # 人工意见已注入 `human_feedback["dev"]`。
+        self._mark_next_round(tasktype.BUGFIX)
         return self._begin_round("dev")
 
     def _gate_after(self, stage: str, nxt: str | None = None) -> Interrupt | None:
@@ -5239,11 +5778,22 @@ class Orchestrator:
         self._write_handoff(summary)
 
         if self.unload_at_end and not isinstance(self.client, MockClient):
-            for model in self.client.ps():
-                name = model.get("name", "")
-                if name:
-                    self.client.unload(name)
-            self.log("== 已卸载全部模型（显存释放）")
+            # **收尾不许把运行带崩**（真机 `20260928-095848`）：ollama 在返工轮中途挂掉时，
+            # 这一步的 `ps()` 抛 `OllamaError`，异常从 `resume()` 一路冒到 cli 顶层 ——
+            # 进程带着 traceback 退出，而 state 停在 paused/needs_human、页面看着像"还在跑"。
+            # 这与 `_execute` 里那条"任何阶段异常都不许让运行隐身死掉"是**同一条纪律**，
+            # 只是当时只护住了阶段循环，漏了收尾。卸载只是释放显存的辅助动作，失败不该改结论。
+            try:
+                for model in self.client.ps():
+                    name = model.get("name", "")
+                    if name:
+                        self.client.unload(name)
+                self.log("== 已卸载全部模型（显存释放）")
+            except Exception as exc:  # noqa: BLE001
+                self.log(
+                    f"== [收尾] 卸载模型失败（**不影响本次结论**）："
+                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                )
 
         self.log(
             f"== {'暂停' if self.status == 'paused' else '完成'}: verdict={summary['verdict']} "
@@ -5345,6 +5895,17 @@ class Orchestrator:
             list(audit.get("missing") or []),
         )
         lines += section("开发声明未实现的任务", list(audit.get("declared_not_implemented") or []))
+        # 被裁掉的补丁必须让人看到 —— 裁剪是为了"别被一个修不掉的门永远拦住"，
+        # 不是"把问题藏起来"。这里与上面的「补丁机械校验未通过」并列展示。
+        lines += section(
+            "已移除的补丁（定位失败：anchor/符号与原文对不上，物理上套用不了）",
+            list(self.state.get("pruned_patches") or []),
+        )
+        # 逐项验收：**人工最终审核要的就是这张表** —— 哪条修好了、哪条没有、哪条压根没能核对。
+        lines += section(
+            "逐项验收（每条修复项 ↔ 本轮机械执行结果；「无从核对」= 没有命令能证明它）",
+            tasktype.render_defect_verdicts_markdown(self.state.get("defect_verdicts") or []),
+        )
         patch_audit = self.state.get("patch_audit") or {}
         if patch_audit.get("source_available"):
             lines += section(

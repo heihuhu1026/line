@@ -133,7 +133,11 @@ def write(run_dir: str | Path, stage: str = "", run_id: str | None = None,
         "pid": int(pid if pid is not None else os.getpid()),
         "run_id": str(run_id or run_dir.name),
         "stage": str(stage or ""),
+        # `started_at` = **进程**启动时间；`stage_started_at` = **当前阶段**开始时间。
+        # 两个都要：页面此前只显示前者，于是"进程跑了 1900 秒"被读成"dev 阶段跑了 1900 秒"
+        # （真机 `20260928-110402` 把人误导到直接杀掉运行）。阶段时长才是判断"卡没卡"的依据。
         "started_at": now,
+        "stage_started_at": now,
         "heartbeat": now,
     }
     runstore.write_json(path(run_dir), payload)
@@ -141,7 +145,7 @@ def write(run_dir: str | Path, stage: str = "", run_id: str | None = None,
 
 
 def touch(run_dir: str | Path, stage: str | None = None) -> None:
-    """刷心跳（保留 pid 与 started_at）。标记不存在时补写一份。"""
+    """刷心跳（保留 pid 与 started_at）；**阶段变了就重置阶段计时**。"""
     run_dir = Path(run_dir)
     cur = runstore.read_json_if_exists(path(run_dir))
     if not isinstance(cur, dict) or not cur.get("pid"):
@@ -149,7 +153,14 @@ def touch(run_dir: str | Path, stage: str | None = None) -> None:
         return
     cur["heartbeat"] = time.time()
     if stage is not None:
-        cur["stage"] = str(stage)
+        new_stage = str(stage)
+        if new_stage != str(cur.get("stage") or ""):
+            cur["stage"] = new_stage
+            cur["stage_started_at"] = time.time()
+        elif not cur.get("stage_started_at"):
+            # 老标记里没有这个键（升级前留下的）：用当前时刻补上，
+            # 宁可显示"刚进入本阶段"也不要用进程启动时间冒充阶段时长。
+            cur["stage_started_at"] = cur["heartbeat"]
     runstore.write_json(path(run_dir), cur)
 
 

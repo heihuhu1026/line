@@ -82,6 +82,10 @@ CALL_FIELDS: tuple[str, ...] = (
     "vram_gb", "model_gb", "vram_ratio",
     # 人工与契约
     "human_feedback_used", "schema_errors",
+    # 失败尝试（`attempt_failed=True` 那些行是**被丢弃**的尝试，用来回答"这轮为什么烧了这么久"；
+    # `gave_up=True` 说明整次调用作废。真机 20260928-110402 之前这类记录一条都不落，
+    # 13 分钟的算力烧掉了却查不出烧在哪。见 orchestrator._record_attempt）
+    "attempt_failed", "gave_up", "attempts_planned", "attempts_used", "wall_total_s",
     # 机械验证专有
     "verdict", "commands", "failures",
     # 闸门占位专有
@@ -616,6 +620,10 @@ def run_detail(run_dir: Path) -> dict:
                 "duplicate_stage_seqs",
                 "rule_load_notes",
                 "grounding_warnings",
+                # 本轮新增的两项**必须登记**（否则页面/接口读不到，等于白摊）：
+                # 「被移除的定位失败补丁」与「逐项验收」—— 后者是人工最终审核要的主表。
+                "pruned_patches",
+                "defect_verdicts",
                 "elapsed_s",
                 "model_switches",
                 "repo",

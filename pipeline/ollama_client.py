@@ -12,8 +12,10 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
+from . import perfguard
 from .budget import estimate_tokens
 from .config import ModelSpec
 from .schemas import ASSESSMENT, GLOBAL_ARCHITECTURE, validate
@@ -30,11 +32,14 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 #: 同 prompt 同上限重试必然在同一处再断，而「模型写错 JSON」重试才有意义。
 _DONE_REASON_LENGTH = "length"
 
-#: 撞上限后最多抬高几次上限。
-#: 真机 20260927-134222 实测：一次「输出陷入重复」的 dev 调用按 6144 → 12288 → 20161
-#: 连撞三次顶，白烧约 38k token（≈16 分钟）**最后还是失败**，两次跑到这里共约 30 分钟。
-#: 抬高上限只对「内容合法、只是写长了」有意义；对重复循环是纯粹的放大。
-_MAX_ESCALATIONS = 1
+#: 撞上限后最多抬高几次上限（**只对"内容合法、只是写长了"生效**）。
+#: **1 → 3（2026-09-28 修）**：原先的 1 次来自真机 `20260927-134222` 的观察
+#: （6144 → 12288 → 20161 连撞三次、白烧 38k token 仍失败）—— 但那次是**重复循环**，
+#: 现在已由 `_looks_degenerate` 分流去"压低上限"，不该再吃这条预算。
+#: 对非退化截断，抬高是唯一出路，而成本有**硬上界**：上限被 `num_ctx - prompt - margin`
+#: 夹住，抬不出上下文。真机 `20260928-000351`：`num_ctx=24576`、prompt 才 4016
+#: ⇒ 余量约 20k，却因为"只准抬一次"在 12288 就放弃 —— **限制根本不是上下文**。
+_MAX_ESCALATIONS = 3
 #: 判定「输出陷入重复」后下压到的输出上限下限（逼它写短，而不是给更多空间重复）。
 _MIN_PREDICT = 512
 #: 判定重复时只看结尾这么多字符 —— 重复循环的表现是**尾部**在打转。
@@ -186,13 +191,28 @@ class OllamaClient:
         # 代价只有在真失败时才付（多一次 ~60s 的调用），而崩一次的代价是丢掉整轮
         # 十几分钟的算力 + 全部中间态。这笔账明显划算。
         attempts: int = 3,
+        # **被丢弃的尝试也要进账**。真机 `20260928-110402`：第 2 轮 dev 从 11:26:48 到 11:40
+        # 连着 6 次调用、单次 8.8s→172s→314s→153s（逐请求退化），全部没过契约被内部重试丢掉，
+        # 而 `llm-calls.jsonl` 里**一条都没有** —— 埋点原先写在"调用成功返回"之后，失败路径
+        # 什么都不落。13 分钟算力烧掉了，却连"烧在哪"都答不出来，从外面只能读成"卡死"。
+        # `on_attempt` 让每一次尝试（失败/放弃）都即时可见；成功仍由编排器统一记录，不重复。
+        on_attempt: Callable[[dict], None] | None = None,
+        log: Callable[[str], None] | None = None,
     ) -> tuple[Any, dict]:
         base_user = user
+        notify = on_attempt or (lambda _rec: None)
+        emit = log or (lambda _msg: None)
+        call_t0 = time.time()  # 整次调用（含所有尝试）的起点：给"这一整次烧了多少"用
         last_errors: list[str] = []
         failed: list[dict] = []  # 未通过契约的那些原始输出也要留档（诊断提示词问题时最关键）
         # 本次实际使用的输出上限。撞到它被截断时会**调高**再试 —— 同上限重试是确定性白费。
         limit = num_predict or spec.num_predict
         escalations = 0  # 已抬高上限的次数（上限见 _MAX_ESCALATIONS）
+        # 已「压低上限」的次数（退化路径）。**必须单独计数**：压低不动 `escalations`，
+        # 拿它当"第一次"的判据会一路压到 `_MIN_PREDICT`（6144→3072→1536→…→512）——
+        # 而"越压越写不完"是必然的（真机 20260928-000351 报错里留下的 `num_predict=1536`
+        # 就是这么来的）。退化只压一次，之后走抬高路线。
+        lowered = 0
         for attempt in range(1, attempts + 1):
             prompt = base_user
             if attempt > 1:
@@ -250,6 +270,66 @@ class OllamaClient:
                 "num_predict": limit,
             }
 
+            def _enrich(rec: dict) -> dict:
+                """把 `prefill_tps` 就地算出来再上报。
+
+                这里必须**自己算**：`meta["prefill_tps"]` 是编排器在调用**成功返回后**收尾时才补的，
+                失败路径根本走不到那一步 —— 不补的话，"这次是不是退化烧掉的"在记录里就看不出来。
+                """
+                if not rec.get("prefill_tps") and rec.get("prompt_s") and rec.get("prompt_tokens"):
+                    rec["prefill_tps"] = round(float(rec["prompt_tokens"]) / float(rec["prompt_s"]), 1)
+                return rec
+
+            def _report(errors: list[str], raw: str = content, force_final: bool = False) -> None:
+                """把一次**被丢弃**的尝试即时报出去（含耗时、tokens、停止原因、原文尾部）。
+
+                **每条尝试恰好报一次**：最后一次（或提前放弃的那一次）自带 `gave_up` 与
+                整次调用的总耗时。第一版把"最后一次尝试"和"整次放弃"分成两条上报，结果
+                同一次尝试记了两遍（`attempts=[1,2,3,3]`）—— 账目本身出错比缺账更糟，
+                这条断言就是为了钉住它。
+                """
+                final = force_final or attempt >= attempts
+                rec: dict[str, Any] = {
+                    **meta,
+                    "attempt_failed": True,
+                    "attempts_planned": attempts,
+                    "schema_errors": list(errors)[:8],
+                    "raw_tail": str(raw or "")[-400:],
+                }
+                if final:
+                    rec.update(
+                        {
+                            "gave_up": True,
+                            "attempts_used": attempt,
+                            "wall_total_s": round(time.time() - call_t0, 2),
+                        }
+                    )
+                notify(_enrich(rec))
+
+            def _pre_retry() -> None:
+                """重试**前**先探退化：逐请求退化下硬重试只会再烧一遍。
+
+                真机同 prompt 实测 8.8s / 172s / 314s（20~35 倍），三次串起来 8 分钟。
+                探针健康时 ~1s、退化时 ~40s，远便宜于再扔一次几分钟的生成。
+                """
+                if attempt >= attempts:
+                    return
+                pf = meta.get("prefill_tps")
+                if not pf and meta.get("prompt_s") and meta.get("prompt_tokens"):
+                    pf = round(float(meta["prompt_tokens"]) / float(meta["prompt_s"]), 1)
+                base = perfguard.baseline_for(spec.tag)
+                if not pf or float(pf) >= base * perfguard.DEGRADED_RATIO:
+                    return
+                emit(
+                    f"        [退化重试] 本次 prefill 仅 {pf} t/s（基线 {base:.0f}）"
+                    f"→ 重试前先探一次，等它恢复再发（否则下一次大概率又是几分钟）"
+                )
+                perfguard.guard(spec.tag, spec.num_ctx, log=emit)
+
+            def _giveup(errors: list[str]) -> None:
+                """提前放弃（还没走到最后一次尝试就确定没救）：把当前这次标成 final 上报。"""
+                _report(errors, force_final=True)
+
             if done_reason == _DONE_REASON_LENGTH:
                 # ---- 输出被截断：确定性失败，必须换条件重试 ----
                 # 真机教训（2026-09-26 run snake-detailed）：test 阶段的 7B 输出被砍在字符串中间，
@@ -263,27 +343,39 @@ class OllamaClient:
                 meta["schema_errors"] = [detail]
                 failed.append({"attempt": attempt, "errors": [detail], "raw": content[-3000:]})
                 last_errors = [detail]
-                if _looks_degenerate(content):
+                room = spec.num_ctx - prompt_tokens - _CTX_SAFETY_MARGIN
+                if _looks_degenerate(content) and lowered == 0 and limit > _MIN_PREDICT:
+                    lowered += 1
                     # 重复循环：同 prompt 抬高上限必在同一处再陷，只是把白等放大一倍。
                     # 改成**压低**上限逼它写短，并明确告诉它"你在重复"（换条件重试才有意义）。
+                    #
+                    # **只压一次**（`escalations == 0`）：压下去之后若还写不完，说明问题不是
+                    # "它在重复"而是"这张图本来就长" —— 那一次要走下面的抬高路线。
+                    # 真机 `20260928-000351` 就是压到 6144//2 后仍截断，报错里留下
+                    # `num_predict=1536`（=6144//4 再压一次）；越压越写不完是必然的。
                     limit = max(_MIN_PREDICT, limit // 2)
                     last_errors = [
                         detail,
                         "上次输出陷入**重复循环**：同一段内容反复写，撞上限也没写完。"
                         "请只输出**最小合法**的 JSON —— 不要重复条目、不要复述输入、不要扩写。",
                     ]
+                    _report(last_errors)
+                    _pre_retry()
                     continue
-                if escalations >= _MAX_ESCALATIONS:
+                if escalations >= _MAX_ESCALATIONS or room <= limit:
+                    _giveup(last_errors)
+                    # 措辞里必须保留「输出被截断」与「num_ctx」两处字样：它们是
+                    # `smoke_mock` 与排障脚本用来识别这一类失败的锚点（改文案时踩过）。
                     raise OllamaError(
-                        f"{spec.tag} 输出连续被截断，已抬高上限 {escalations} 次仍不完整"
-                        f"（当前上限 {limit} tok / num_ctx={spec.num_ctx}）。"
-                        "继续抬高只是重复烧算力 —— 请调大该阶段的 num_ctx，"
+                        f"{spec.tag} 输出被截断（已抬高上限 {escalations} 次仍不完整；"
+                        f"当前上限 {limit} tok / num_ctx={spec.num_ctx} / 可用余量 {room} tok）。"
+                        "**上下文余量已用尽**或抬高次数达上限 —— 请调大该阶段的 num_ctx，"
                         "或让产物更短（拆分任务、减少条目）。"
                         f"\n最后一次原始输出尾部：\n{content[-700:]}"
                     )
-                room = spec.num_ctx - prompt_tokens - _CTX_SAFETY_MARGIN
                 raised = min(max(limit * 2, limit + 2048), room)
                 if raised <= limit:
+                    _giveup(last_errors)
                     raise OllamaError(
                         f"{spec.tag} 输出被截断，且没有上下文余量可抬高上限："
                         f"prompt 已占 {prompt_tokens} tok / num_ctx={spec.num_ctx} / "
@@ -293,6 +385,8 @@ class OllamaClient:
                     )
                 limit = raised
                 escalations += 1
+                _report(last_errors)
+                _pre_retry()
                 continue
 
             try:
@@ -301,6 +395,8 @@ class OllamaClient:
                 last_errors = [f"输出不是合法 JSON: {exc}"]
                 meta["schema_errors"] = last_errors
                 failed.append({"attempt": attempt, "errors": last_errors, "raw": content[:4000]})
+                _report(last_errors)
+                _pre_retry()
                 continue
 
             errors = validate(data, schema)
@@ -313,6 +409,8 @@ class OllamaClient:
                 return data, meta
             last_errors = errors
             failed.append({"attempt": attempt, "errors": errors, "raw": content[:4000]})
+            _report(errors)
+            _pre_retry()
 
         # 报错时把**最后一次的原始输出**也带出来。以前只留 error 文本，
         # 「模型到底写成了什么样、是截断还是畸形」只能靠猜 —— 真机 2026-09-26 崩在
@@ -364,6 +462,8 @@ class MockClient:
         schema: dict,
         num_predict: int | None = None,  # noqa: ARG002
         attempts: int = 2,  # noqa: ARG002
+        on_attempt: Callable[[dict], None] | None = None,  # noqa: ARG002
+        log: Callable[[str], None] | None = None,  # noqa: ARG002
     ) -> tuple[Any, dict]:
         data = _synthesize(schema)
         if schema is ASSESSMENT:

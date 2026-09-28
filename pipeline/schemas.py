@@ -190,7 +190,12 @@ PLAN = {
                 # `minimality_reason` 已从必填降为可选：14B/8K 下，每文件都要写一段
                 # "为什么这是最小改动"会吃掉后半段的预算，导致 tasks 缩水
                 # （真机 011207：前半 strategy/changes 质量高，后半 tasks 字段全空）。
-                "required": ["path", "intent", "approach"],
+                # 但 `symbols` **必须必填**。43 次真机运行的统计很干脆：
+                #   · 契约里没要求它时，`changes[].symbols` 填充率 **0/43**；
+                #   · 把字段写进契约后的 `tasks[].symbols`，填充率 **5/5**。
+                # 即"填不出来"从来不是模型能力问题，是**没要求**。
+                # 它是任务编译器的输入：没有变更边界，编译器只能按整文件拆图，粒度失控。
+                "required": ["path", "intent", "approach", "symbols"],
             },
         },
         "tasks": {

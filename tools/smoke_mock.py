@@ -64,7 +64,8 @@ def check(cond: bool, label: str, detail: str = "") -> bool:
 class UncoveredClient(MockClient):
     """开发把 covers_tasks 填成不存在的 id 且不声明未实现：覆盖审计必须机械发现。"""
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role.startswith("开发"):
             for edit in data.get("edits") or []:
@@ -76,7 +77,8 @@ class UncoveredClient(MockClient):
 class ExternalOnlyReviewClient(MockClient):
     """评审只提「需要外部确认」的返工项：机制应当强制放行，而不是空转到触顶。"""
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role == "评审":
             data["verdict"] = "rework_dev"
@@ -143,7 +145,8 @@ class PatchClient(MockClient):
     开发现在是两遍：第一遍只铺（可套用的）辅助函数，第二遍回填（带问题的）主函数体。
     把 fixture 拆开分别喂两遍——既贴合两遍真实形态，又保住 ok==1/problems==3 的契约。"""
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role.startswith("开发"):
             fixture = json.loads(json.dumps(PATCH_FIXTURE_IMPL, ensure_ascii=False))
@@ -160,7 +163,8 @@ class PatchClient(MockClient):
 class AllNotImplementedClient(PatchClient):
     """开发把方案任务全部声明为未实现、不给任何真实补丁（真机上出现过的"退缩"行为）。"""
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role.startswith("开发"):
             task_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', user) or ["t1"]
@@ -178,7 +182,8 @@ class AllNotImplementedClient(PatchClient):
 class PassAlwaysPatchClient(PatchClient):
     """评审无论看到什么都给 pass（模拟"宽容的评审"）：补丁有阻断级问题时机制必须推翻它。"""
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role == "评审":
             data["verdict"] = "pass"
@@ -196,7 +201,8 @@ class ArchitectBlameExternalClient(ExternalOnlyReviewClient):
     拿不到任何具体指示），应转人工裁决。
     """
 
-    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+    def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
         data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
         if spec.role == "评审":
             data["verdict"] = "rework_architect"
@@ -1914,7 +1920,8 @@ def main() -> int:
         class _BadChain(MockClient):
             """语义不自洽：执行顺序指向不存在的模块。"""
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
                 if schema is schemas_mod.GLOBAL_ARCHITECTURE:
                     data["execution_order"] = ["M-99"]
@@ -1932,7 +1939,8 @@ def main() -> int:
         class _Garbage(MockClient):
             """输出不合契约：空对象。"""
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 if schema is schemas_mod.GLOBAL_ARCHITECTURE:
                     return {}, {"tag": "x"}
                 return super().chat_json(spec, system, user, schema, num_predict, attempts)
@@ -2336,7 +2344,8 @@ def main() -> int:
         class ArchitectScopeClient(MockClient):
             """判 rework_dev，但把根因标成方案层（真机 run 20260924-185507 的形态）。"""
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
                 if spec.role == "评审":
                     data["verdict"] = "rework_dev"
@@ -2462,7 +2471,8 @@ def main() -> int:
                 super().__init__()
                 self.dev_prompts: list[str] = []
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 if spec.role.startswith("开发"):
                     self.dev_prompts.append(user)
                 return super().chat_json(spec, system, user, schema, num_predict, attempts)
@@ -2584,7 +2594,8 @@ def main() -> int:
                 self.reviews = 0
                 self.always_pass = False
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
                 if spec.role == "评审":
                     self.reviews += 1
@@ -3535,7 +3546,8 @@ def main() -> int:
                 self.dev_calls = 0
                 self.repair_prompts = 0
 
-            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2):
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                  on_attempt=None, log=None):  # noqa: ARG002
                 data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
                 if spec.role.startswith("开发"):
                     self.dev_calls += 1
@@ -3995,6 +4007,56 @@ def main() -> int:
                 "无余量时报出可操作的原因（截断 + num_ctx），不是笼统的契约失败", _msg[:170],
             )
         check(len(_c2.limits) == 1, "无余量时不白跑第二次", str(_c2.limits))
+
+        # **非退化截断必须能抬多次**（真机 20260928-000351：num_ctx=24576、prompt 才 4016
+        # ⇒ 余量约 20k，却因为「只准抬一次」在 12288 就放弃 —— **限制根本不是上下文**）。
+        class _TwiceTruncating(_Truncating):
+            def _request(self, path, payload, method="POST", timeout=None):  # noqa: ANN001
+                self.limits.append(int(payload["options"]["num_predict"]))
+                if len(self.limits) <= 2:
+                    return {
+                        "message": {"content": '{"a": "被砍在中间'},
+                        "done_reason": "length",
+                        "prompt_eval_count": self.prompt_tokens,
+                        "eval_count": 999,
+                    }
+                return {
+                    "message": {"content": '{"a": "ok"}'},
+                    "done_reason": "stop",
+                    "prompt_eval_count": self.prompt_tokens,
+                    "eval_count": 1,
+                }
+
+        _c3 = _TwiceTruncating(prompt_tokens=500)
+        _d3, _ = _c3.chat_json(_spec, "sys", "u", _tiny)
+        check(
+            _d3 == {"a": "ok"} and len(_c3.limits) == 3,
+            "连续两次截断仍继续抬高上限（不再「只准抬一次」就放弃）", str(_c3.limits),
+        )
+        check(_c3.limits[0] < _c3.limits[1] < _c3.limits[2], "上限逐次抬高", str(_c3.limits))
+
+        # **退化（重复循环）只压一次下限**：再压只会更写不完（真机报错里留下的
+        # `num_predict=1536` 就是"压了两次"的产物）。压过一次之后走抬高路线。
+        class _Degenerating(_Truncating):
+            def _request(self, path, payload, method="POST", timeout=None):  # noqa: ANN001
+                self.limits.append(int(payload["options"]["num_predict"]))
+                return {
+                    "message": {"content": '{"a": "' + ("same line\\n" * 40)},
+                    "done_reason": "length",
+                    "prompt_eval_count": self.prompt_tokens,
+                    "eval_count": 999,
+                }
+
+        _c4 = _Degenerating(prompt_tokens=500)
+        try:
+            _c4.chat_json(_spec, "sys", "u", _tiny)
+        except Exception:  # noqa: BLE001
+            pass
+        check(_c4.limits[1] < _c4.limits[0], "退化时先**压低**上限（逼它写短）", str(_c4.limits))
+        check(
+            len(_c4.limits) >= 3 and _c4.limits[2] > _c4.limits[1],
+            "退化**只压一次**：其后转为抬高（不再越压越写不完）", str(_c4.limits),
+        )
 
         # ---------------------------------------------------------------- 入口命令不被挤掉
         # 真机 2026-09-26（run snake-detailed）：test 阶段把第 1 轮的 `python main.py`

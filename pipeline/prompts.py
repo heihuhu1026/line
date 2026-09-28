@@ -16,6 +16,15 @@ _TAIL = (
     "不要编造未在输入中出现的事实（文件路径、函数名、命令），不确定的写进对应的 uncertainty/unknowns 字段。"
 )
 
+#: 任务类型的字面量（与 `tasktype` 的三个常量**同值**）。
+#:
+#: 这里刻意不 `import tasktype`：`tasktype` 依赖 `patches`，prompts 再引它只会多一条
+#: 可能成环的边，而这里要的只是三个字符串。同值由 `smoke_prompts` 的断言钉住
+#: （两边不一致会立刻报出来，不会静默漂移）。
+KIND_FEATURE = "feature"
+KIND_BUGFIX = "bugfix"
+KIND_PLAN_REWORK = "plan_rework"
+
 SYSTEM: dict[str, str] = {
     # 需求入口补强：跑在 pm 之前，把零散/模糊/口语化的原始需求整理成结构化初稿。
     # 复用机制：其 refined_requirement 直接注入 pm（见 parts_pm），产品经理不必再重新解析原始需求。
@@ -183,7 +192,11 @@ SYSTEM: dict[str, str] = {
         "方案不写它，开发受白名单约束**无权创建**，运行验证会一直判「没有可执行入口」。\n"
         "字段规范：\n"
         "  · strategy 必须与 changes / tasks 自洽，并**写明技术栈（语言 + 运行环境）**；\n"
-        "  · changes 每项 {path, intent, approach, minimality_reason}：minimality_reason **必须具体**，"
+        "  · changes 每项 {path, intent, approach, symbols, minimality_reason}："
+        "symbols＝**这个文件要动哪些符号**（新增的写新名字、修改的写原名；\n"
+        "父节点不要写 —— 同时写了 `CLI` 和 `CLI.add` 时，最长匹配原则会删掉前者）；"
+        "**它是任务编译器的输入：不填就等于没划边界**，编译器只能按整文件拆图，粒度必然失控；"
+        "minimality_reason **必须具体**，"
         "要讲清「为什么这是最小改法、相比其它做法少动了什么」，「改动少」这类空话不合格；\n"
         "  · tasks 每项字段（**逐个填实；留空会被机械判缺并打回**）：\n"
         "      id＝T-01/T-02… 编号（开发要用它填 covers_tasks，编号必须规范）；title＝一句话任务名；"
@@ -348,7 +361,9 @@ def _upstream(title: str, obj: Any, str_tokens: int = 160, list_items: int = 12)
 
 
 def _code_block(excerpts_text: str) -> str:
-    # 新建项目的检索池恒空，此时不该渲染一个空标题（真机 011207 里它就是纯噪声）
+    # 新建项目的检索池恒空，此时不该渲染一个空标题（真机 011207 里它就是纯噪声）。
+    # 上游 `retrieval.render_excerpts([])` 现在也返回空串（此前它返回一句占位说明，
+    # 把 `has_code` 判据污染成恒真 —— 见该处说明），所以这里不必再剥占位。
     if not excerpts_text or not excerpts_text.strip():
         return ""
     return "【存量代码片段（按相关度挑选，可能被截断）】\n" + excerpts_text
@@ -1482,17 +1497,31 @@ SKELETON_SYSTEM = (
 
 
 def parts_skeleton(scope: Any, plan: Any) -> list[str]:
-    """「方案·接口骨架」的输入构造：只喂**边界**与**文件清单**，不喂任何实现细节。
+    """「方案·接口骨架」的输入构造：喂**边界** + **文件清单** + **方案已声明的符号**。
 
     刻意不喂实现（连 ``changes[].approach`` 都不整段喂）：这一步要的是「把接口列全」，
     喂了实现细节或代码片段，注意力会被拉去复述实现，输出的结构反而更稀 —— 与「输入裁剪」
     是同一个道理，只不过这次裁掉的是**干扰它做枚举的东西**。
+
+    ⚠ **但 `symbols` 必须喂**（真机 `20260928-095848` 的根因）：它**不是实现细节，它就是
+    接口声明**。此前这里只给 `path` + `intent`，于是骨架这次调用只能**凭空发明**一套名字
+    （真机：它给出 `class App` / `def main(args)`），而施工图（来自 `plan.tasks[].symbols`）
+    要的是 `main()` / `CLI()` —— 两份要求同时喂给 dev，且**都被注明"必须逐字一致"**。
+    结果是 dev 无论怎么写都被自检判"漏了声明过的符号"（真机 5/5 张全中），
+    随后 verify 必然报跨文件接口不一致。**两次调用各写一套、且后一次看不到前一次的声明**
+    ⇒ 冻结基准与施工图必然打架，而这是**输入构造**的问题，不是模型能力问题。
     """
-    changes = [
-        {"path": c.get("path"), "intent": c.get("intent")}
-        for c in ((plan or {}).get("changes") or [])
-        if isinstance(c, dict) and str(c.get("path") or "").strip()
-    ]
+    changes: list[dict] = []
+    for c in ((plan or {}).get("changes") or []):
+        if not isinstance(c, dict) or not str(c.get("path") or "").strip():
+            continue
+        item: dict[str, Any] = {"path": c.get("path"), "intent": c.get("intent")}
+        syms = [str(s).strip() for s in (c.get("symbols") or []) if str(s).strip()]
+        if syms:
+            # 括号原样带着（`main()`）也行：这一步要的是"把这份清单落实成结构"，
+            # 不是让模型再猜一遍该定哪些名字。
+            item["要定的符号（方案已声明，逐个落实）"] = syms
+        changes.append(item)
     return [
         _upstream(
             "产品经理范围（**权威**：边界与验收已在此拍定）",
@@ -1610,13 +1639,39 @@ _DEV_REWORK_SCOPE = (
 )
 
 
-def _dev_rework_note(fixes: list[str] | None, repair: list[str] | None) -> str:
-    """开发的返工口径。``fixes``（评审返工）与 ``repair``（自检重问）是**两条回灌通道**，
-    这里统一成同一套说法 —— 以前前者只说「必须解决」、后者说「重出这几处」，
-    而末尾【任务】段一直是首次生成的口径，模型同时收到「把方案实现完」和「只修这几处」。
+def _dev_rework_note(
+    fixes: list[str] | None = None,
+    repair: list[str] | None = None,
+    round_kind: str = KIND_FEATURE,
+) -> str:
+    """**首轮自检重问**的口径（`repair` = 自检发现的问题）。
+
+    ⚠ 与跨轮返工口径分开（真机 `20260928-110402`）：首轮的 system 契约写着
+    「全新项目**一律** `add` + `full_symbol`、anchor 留空」，而这里此前注入的是
+    **返工口径**「优先定点改：`modify` + `replace_span`」——同一次调用里两句话正面冲突，
+    模型只能折中出片段式 `modify`，而那正是"补丁套用不上"的来源（见 tasktype 顶部记录）。
+    首轮自检重问的本质是"**补齐/修正**这一版没写全的东西"，纪律应随 `round_kind` 走：
+      · feature：仍按首轮纪律给**完整内容**（本轮没有可锚定的原文）；
+      · plan_rework：按**新**方案施工（可新增方案新增的文件）；
+      · bugfix：走跨轮返工口径（最小改，见 `_bugfix_parts` 的分支，那里本就不走这里）。
     """
     if not (fixes or repair):
         return ""
+    if round_kind == KIND_FEATURE and repair and not fixes:
+        # **首轮自检重问**（唯一走这条的情形：首轮不会有评审返工项）
+        return (
+            "【本轮口径·首轮自检重问】只改【上一版自检没过，请修这几处】指出的问题："
+            "**补齐 / 修正**这一版没写全或写错的地方；"
+            "新建文件仍按首轮纪律用 `add` + `full_symbol` 给**完整可落盘内容**"
+            "（本轮没有可锚定的原文，不要因为看到「修」字就改成片段式 `modify`）；"
+            "不要改动未被指出的文件，不要顺手重构。\n"
+        )
+    if round_kind == KIND_PLAN_REWORK:
+        return (
+            "【本轮口径·方案返工后施工】按**刚更新的方案**施工：方案新增的文件与符号**本次有权创建**；"
+            "已有文件必须定点改（`modify` + `replace_span`/`insert_after`，禁止整份重吐）；"
+            "并逐条回应上面的修复项。\n"
+        )
     return (
         rework_task_block(_DEV_REWORK_SCOPE)
         + "下面【任务】段里关于「实现 / 补齐 / 分片」的**机械纪律仍然有效**"
@@ -1738,6 +1793,27 @@ def task_focus_block(task: Any, changes: Any = None) -> str:
             f"- 前置任务（已完成，可直接用它们的成果）："
             f"{', '.join(str(x) for x in task['depends_on'])}"
         )
+    rework = [str(x) for x in (task.get("rework_problems") or []) if str(x).strip()]
+    if rework:
+        # **本张图自己的问题**。返工提示词此前给的是一串无主的问题，dev 得自己去做
+        # "文件 ↔ 施工图"的映射才知道该改哪张图；按 task 分派时更是如此 —— 这次调用
+        # 只做这一张，就必须把"这张图错在哪"直接摊在它面前。
+        lines.append(f"- ⚠ **本张施工图上一轮的具体问题**（{len(rework)} 条，逐条解决）：")
+        for p in rework[:5]:
+            lines.append(f"    · {p}")
+        lines.append("    只改这些；本张图之外的文件一条 edit 都不要提交。")
+    unresolved = [str(x) for x in (task.get("unresolved_uses") or []) if str(x).strip()]
+    if unresolved:
+        # 方案里声明了、但**接口基准里不存在**的引用。必须显式叫停，不能只"不渲染"：
+        # 真机 20260927-214253 实测 —— dev 把这些引用当成"要实现/要依赖的东西"，
+        # 重出补丁时把 anchor 写成 `DBManager.insert()` 这种调用表达式，4 条
+        # anchor_not_found，首轮即停人工。留白不等于安全，**明说禁止**才是。
+        lines.append(
+            "- ⚠ **以下引用不要去理**：方案里还声明了 "
+            + "、".join(f"`{x}`" for x in unresolved[:6])
+            + "，但它们在**接口基准里不存在**（属于方案层问题，由评审/人工处理）。"
+            "**不要**为它们写代码、也不要拿它们当 anchor —— 严格按上面的符号清单与接口基准施工。"
+        )
     return "\n".join(lines)
 
 
@@ -1750,25 +1826,49 @@ def _bugfix_parts(
     fixes: list[str] | None,
     repair: list[str] | None,
     prev_summary: str | None,
+    include_plan: bool = True,
 ) -> list[str]:
     """BUG 修复轮的**裁剪视图**（对应 `parts_dev(bugfix=True)`）。
 
     为什么必须裁：首次开发那套片段是为「从 0 到 1」设计的 —— 需求原文、PM 背景与影响面、
-    存量代码评估、完整方案、检索池。到了修缺陷这一轮它们：
-      ① 几乎零信息量（新建项目的 assessment / excerpts 恒空，且与 current_code 重复）；
+    存量代码评估、检索池。到了修缺陷这一轮它们：
+      ① 几乎零信息量（新建项目的 `assessment` / `excerpts` 恒空，且与 `current_code` 重复）；
       ② 占掉 24K 上下文里的一大块，把真正要紧的失败证据挤到后面；
       ③ **语义上把模型拉回"从需求出发重新实现一遍"** —— 与「最小改动」正面对抗。
 
-    留下的都是「不看到就会改坏」的东西：缺陷单（范围与验收口径）、现有代码正文、
-    裁决后的验收标准、失败命令证据、自检回灌、返工口径。
-    方案（`plan`）不再整份喂：跨文件接口由编排器钉在最前面的 `api_digest_block` 提供，
-    比整份方案更省也更准。
+    **但方案必须留，而且要在最前面。** 这是此前修错的一处：早先的版本把 `plan` 整份去掉了，
+    理由是"跨文件接口由 `api_digest_block` 提供" —— 那是把**接口摘要**当成了**施工图**。
+    方案是开发的施工图：返工比首轮**更需要**按图改（首轮至少有施工图按 task 分派，
+    而「不按 task 分派」时施工图也不在场 ⇒ 返工轮的 dev 会变成**无图纸按缺陷单改**）。
+    该丢的是需求原文与 PM 物料（它们会诱导"重新实现一遍"），不是方案。
+
+    留下的都是「不看到就会改坏」的东西：**方案（施工范围与边界）**、缺陷单（本轮范围与
+    验收口径）、现有代码正文、裁决后的验收标准、失败命令证据、自检回灌、返工口径。
     """
     return [
+        # 方案放在**最前面**：片段顺序即优先级（`fit_prompt` 从末尾开始丢），
+        # 首轮也是这么排的。标题里同时把"只改缺陷单指到的部分"写进去，
+        # 避免"看到整份方案"反而变成"把整份方案重做一遍"。
+        (
+            _upstream(
+                "架构师变更方案（**权威**：按它的 changes / tasks 施工。本轮**只改**"
+                "缺陷单与返工项指到的部分，其余 changes / tasks 与文件划分一律不动）",
+                plan,
+                str_tokens=240,
+                list_items=18,
+            )
+            if include_plan
+            else ""
+        ),
         bug_report_block,
         _upstream(
             "验收标准（PM 裁决后的终稿；只用于判断「修成什么样算对」）",
-            _scope_view(scope),
+            # **只取 `acceptance_criteria` 这一个字段**，与首轮分支同一条口径：
+            # PM 产物的其余部分是背景与影响面，对"按图修缺陷"没有用，
+            # 还会把开发的注意力拉回需求层（等于变相把需求原文带回来）。
+            {"acceptance_criteria": (scope or {}).get("acceptance_criteria")}
+            if isinstance(scope, dict)
+            else None,
             str_tokens=60,
             list_items=6,
         ),
@@ -1802,23 +1902,36 @@ def parts_dev(
     bug_report_block: str = "",
     bugfix: bool = False,
     include_plan: bool = True,
+    # 刻意放在**末尾**：既有调用方（含按位置传前 5 个参数的那些）全部不受影响。
+    # 为空时退回 `bugfix` 布尔，语义不变；`bugfix=True` 与 `round_kind="bugfix"` 等价，
+    # 后者更精确（还能表达 `plan_rework` —— 它既不是首轮也不是修缺陷）。
+    round_kind: str = "",
+    # **有没有真实可锚定的代码**（结构化判据，由调用方按池与当前实现算出）。
+    # `None` 时退回字符串检查 —— 但那会把"空池占位说明"误判成有代码（见下面 has_code 处）。
+    code_available: bool | None = None,
 ) -> list[str]:
-    """dev 的输入片段。
+    """dev 的输入片段（两套视图：首轮「按图施工」/ 返工「按图修缺陷」）。
 
     `include_plan=False`：**按 task 分派时不再喂整份方案**。
     一次只做一张施工图，却把整个方案（含别的任务的条目）也塞进来，等于同一件事给了两份 ——
     既占预算，又把注意力引向"这次不用做"的文件。分派模式下权威就是那一张施工图。
-    """
-    """dev 的输入片段。
 
-    `bugfix=True`（返工修缺陷轮）走**裁剪视图**（见 `_bugfix_parts`）：首次开发那套
-    「需求原文 + PM 背景 + 存量评估 + 完整方案 + 检索池」对"修一个指定缺陷"几乎没有
-    信息量，却占掉 24K 上下文里的一大块，更糟的是语义上把模型拉回"从需求出发重新
-    实现一遍" —— 与「最小改动」正面对抗。裁剪只保留"不看到就会改坏"的那几样。
+    `bugfix=True`（返工修缺陷轮）走**裁剪视图**（见 `_bugfix_parts`）：需求原文、PM 背景、
+    存量评估、检索池都不喂（它们对"修一个指定缺陷"几乎零信息量，还会把模型拉回
+    "从需求出发重新实现一遍"）。**方案仍然要喂** —— 它是施工图，返工比首轮更离不开它。
+
+    `round_kind` 三值决定**视图与尾部任务段**（`bugfix` / `plan_rework` / `feature`）：
+    光换系统提示词不够 —— 同一份用户消息里"本轮的活是什么"必须跟着变，
+    否则尾部仍拼着首轮的「按方案实现代码改动」，等于靠顺序去"盖住"它（顺序一变或被
+    `fit_prompt` 裁掉就漏回来）。
     """
+    kind = str(round_kind or "").strip() or (KIND_BUGFIX if bugfix else KIND_FEATURE)
+    is_bugfix = kind == KIND_BUGFIX
     parts = _bugfix_parts(
-        bug_report_block, scope, plan, current_code, verify, fixes, repair, prev_summary
-    ) if bugfix else [
+        bug_report_block, scope, plan, current_code, verify, fixes, repair, prev_summary,
+        # 与首轮同一条语义：按 task 分派时施工图已单独给出，不再重复喂整份方案
+        include_plan=include_plan,
+    ) if is_bugfix else [
         # **方案是开发的唯一权威**。
         # 需求理解、边界划分、取舍决策是架构师那一层已经做完的事。把需求原文与 PM 的
         # 范围/背景/假设一并喂给开发，等于允许它**重新做一遍架构师的判断** —— 它会在
@@ -1871,7 +1984,9 @@ def parts_dev(
         # 越靠前越不会被裁掉；而它必须盖住【任务】段里「按方案实现」的首次口径。
         # 缺陷单放在返工口径**之前**：它是本轮范围的权威来源，先看到它才知道"只改哪些"
         bug_report_block,
-        _dev_rework_note(fixes, repair),
+        # 两条通道都传、口径按本轮的 `round_kind` 选（见 `_dev_rework_note`）：
+        # 首轮自检重问给首轮口径、方案返工给"允许创建新增文件"、其余给跨轮最小改。
+        _dev_rework_note(fixes, repair, kind),
         (f"【上一轮实现摘要】\n{truncate_text(prev_summary, 200)}" if prev_summary else ""),
     ]
     # 「有没有原文可锚定」的判据必须是**真实存在的代码**：检索池（excerpts_text）在新建项目里
@@ -1879,10 +1994,37 @@ def parts_dev(
     # 里【当前项目已有代码】说"有"、【任务】段说"没有"，模型两边打架后折中出 `modify`+片段
     # （真机 run 20260926-214757 四轮零进展的直接诱因）。
     main = longest_definition(excerpts_text or current_code or "")
-    has_code = bool(
-        (excerpts_text and excerpts_text.strip()) or (current_code and current_code.strip())
+    # ⚠ **判据不能看 `excerpts_text` 有没有字符**：池为空时
+    # `retrieval.render_excerpts([])` 返回的是一句**占位说明**（非空），于是 `has_code` 恒为真
+    # —— 首轮所有 dev 调用都走「输出符号级 edits（用 anchor 定位）」分支，而同一份 prompt 里
+    # **没有任何可锚定的代码**，还与 system 的「一律 add + full_symbol、anchor 留空」正面冲突。
+    # 真机 `20260928-110402` / `095848`：首轮 6/6 张图全中；模型折中出 `modify` + 近似 anchor
+    # ⇒ 补丁套用不上（`[补丁裁剪] … anchor/符号与原文对不上`）。
+    # 现在由调用方给**结构化判据**（有没有真实代码/片段），字符串检查只作兜底。
+    has_code = (
+        code_available
+        if code_available is not None
+        else bool((excerpts_text or "").strip() or (current_code or "").strip())
     )
-    if dev_pass == 1:
+    if is_bugfix:
+        # 返工轮的【任务】段必须**自己**说清本轮的活，而不是拼上首轮那段再靠
+        # `_dev_rework_note`「盖住」它（顺序一变或被 fit_prompt 裁掉就漏回来）。
+        parts.append(
+            "【任务-缺陷修复】只改【缺陷单】列出的位置：给出**最小补丁**"
+            "（`modify` + `replace_span` / `insert_after`，anchor 取逐字原文）；"
+            "不要重构、不要整文件格式化、不要碰缺陷单以外的文件；"
+            "并在 deviations 里**逐条**说明返工项是否已解决。\n"
+            "⚠ 只有缺陷单说「文件不存在 / 整份写残」时，才允许对已存在的文件用 `add`。"
+        )
+    elif kind == KIND_PLAN_REWORK:
+        # 方案层返工后施工：**与修缺陷相反** —— 方案新增的文件/符号本次有权创建，
+        # 否则会出现"评审要求加文件、开发无权创建"的死循环（真机 L2）。
+        parts.append(
+            "【任务-方案返工后施工】按**刚更新的方案**施工：方案新增的文件与符号本次**有权创建**；"
+            "**已有文件必须定点改**（`modify` + `replace_span`/`insert_after`，禁止整份重吐）；"
+            "必须**逐条回应**【评审要求修复项】，并声明有没有让既有符号消失。"
+        )
+    elif dev_pass == 1:
         if has_code:
             parts.append("【任务】按方案实现代码改动，输出符号级 edits（补丁）。")
         else:
@@ -2276,6 +2418,7 @@ def parts_review(
     fixes: list[str] | None = None,
     verify: Any = None,
     rules_block: str = "",
+    defect_block: str = "",
 ) -> list[str]:
     # 评审阶段上下文最紧（8K），实现产物只保留结构：文件清单 + 自检项 + 偏差，丢掉代码正文
     impl_view = None
@@ -2321,6 +2464,10 @@ def parts_review(
         _upstream("开发实现（代码正文已省略）", impl_view, str_tokens=100, list_items=8),
         # 红线检查的机械证据：判负理由与「什么反例能推翻它」成对给出，评审没有凑条目的空间
         rules_block,
+        # **逐项验收**：本轮每条修复项的机械核对结果（只列仍失败 / 无从核对的）。
+        # 没有它，"修好了没"只能整体看 verify 的 verdict —— 评审也就无法逐项追，
+        # 而"逐项可追溯"正是返工反复不收敛时最缺的可观测性。
+        defect_block,
         # 措辞比原来更硬：不是"检查是否解决"，而是**要么解决、要么按反例判据写明已证伪**。
         # 上一轮的结论从此不再是锚点，机械证据与反例才是（见 falsify_block）。
         _feedback_block(
@@ -2592,15 +2739,25 @@ PROMPT_VERSIONS: dict[str, str] = {
 }
 
 
-def prompt_version(stage: str, project_type: str = "secondary") -> str:
+def prompt_version(
+    stage: str, project_type: str = "secondary", round_kind: str = "feature"
+) -> str:
     """该阶段实际使用的那份提示词的版本标识，形如 ``dev.v1`` / ``dev.v1-new``。
 
     ``-new`` 后缀是必须的：新建项目用的是另一份**独立文本**（``SYSTEM_NEW``），
     两份各自演进，共用一个版本号会让「哪一版出的问题」无从区分。
+
+    任务类型后缀（``-bugfix`` / ``-plan_rework``）同理：返工轮用的是**另一套契约**
+    （目标、约束、验收都不同）。少了这个后缀，跨运行对比时「换了返工口径」会被
+    误归因到别处 —— 与 `issues.pipeline_fingerprint` 把三套提示词都算进去是同一条理由：
+    哈希答「是不是同一份」，版本号答「人话是哪一版」。
     """
     version = PROMPT_VERSIONS.get(stage, "v0")
     if project_type == "new" and stage in SYSTEM_NEW:
-        return f"{stage}.{version}-new"
+        label = f"{stage}.{version}-new"
+        if stage in (SYSTEM_NEW_ROUND.get(str(round_kind or "")) or {}):
+            label += f"-{round_kind}"
+        return label
     return f"{stage}.{version}"
 
 
@@ -2631,6 +2788,66 @@ SYSTEM_NEW_BUGFIX: dict[str, str] = {
         "④ 扩大修复范围；⑤ 把没修的项写进 deviations 说“已解决”。\n"
         "验收口径：缺陷单里的失败命令退出码 0，且没有引入新的符号消失。\n" + _TAIL
     ),
+    # ---------------------------------------------------------------- 返工轮的 test / review
+    # 为什么这两档也必须换口径（实测：此前它们与首轮**逐字相同**，2029 / 1702 字）：
+    # 返工轮里 dev 受机械约束（`tasktype.allowed_scope` + 方案白名单）**只被授权改缺陷单范围**，
+    # 而 test/review 若仍按首轮口径说话，就会提"首轮级"的要求（补新功能测试、重提首轮取舍），
+    # 要求落在 dev 无权执行的地方 ⇒ 评审判负 ⇒ 下一轮白烧。两条口径对撞是**结构性**的，
+    # 不靠"评审自觉"能避免。
+    "test": (
+        "你是测试工程师。本轮是 **BUG 修复的回归验证**，不是为全新项目设计测试：\n"
+        "只做两件事：① 证明【缺陷单】里的失败命令**转绿**（命令要真的走到原来失败的那条路径）；"
+        "② 证明**没有引入新的破坏**（既有符号仍在、既有命令仍能跑）。\n"
+        "⚠ 命令必须**机械可判定**（带退出码），且参数**按【本轮已产出文件的接口】写齐** —— "
+        "命令写错会被机械自检拦下退回重写。\n"
+        "禁止：① 重新提出首轮的覆盖清单、或要求补全新功能测试（本轮的验收对象是**缺陷是否关闭**，"
+        "不是需求是否全部实现）；② 删改或弱化断言来凑绿；③ 声明环境里没装的工具（如 `pytest`）。\n"
+        "coverage_gaps 只写**本轮改动相关**的缺口，无关的首轮缺口不要在这里重复提。\n" + _TAIL
+    ),
+    "review": (
+        "你是评审人。本轮是 **BUG 修复后的增量评审**，判据与首轮不同：\n"
+        "① 缺陷是否**真的关闭** —— 对照【缺陷单】的验收口径与机械证据，而不是对照需求原文；\n"
+        "② 有没有引入**新的破坏** —— 符号消失、既有命令转红、越出缺陷单范围；\n"
+        "③ 改动是否**越出缺陷单范围**。\n"
+        "⚠ **首轮已经接受的设计取舍，本轮不得重新提出**（那会让返工永远不收敛）；"
+        "确实需要改设计的，判 scope=architect 并写明理由。\n"
+        "判 pass 前必须逐条给出机械依据（引用【补丁机械校验】【运行验证结果】的具体条目）；"
+        "拿不出依据的写 needs_external，不要凭感觉判 rework。\n"
+        "作用域规则与首轮一致（in_material / architect / needs_external），它决定下一轮回哪个阶段。\n" + _TAIL
+    ),
+}
+
+
+#: **新建项目 + 方案层返工后施工** 的专用系统提示词（对应 ``KIND_PLAN_REWORK``）。
+#:
+#: 与 `SYSTEM_NEW_BUGFIX` 的分界，是"任务边界"而不是"措辞"：
+#:   · ``bugfix``      —— 方案**不动**，在既有 changes 范围内做最小改动；
+#:   · ``plan_rework`` —— 方案**刚被重做**，实现要追上它（可能新增文件与符号，本次有权创建）。
+#: 混用会正面对抗：bugfix 口径的"其余文件划分一律不动"会挡住新方案新增的文件
+#: （真机 L2：架构师返工后 dev 仍拿最小改动纪律 —— 评审要求加文件、dev 无权创建、白烧一轮）。
+SYSTEM_NEW_PLANREWORK: dict[str, str] = {
+    "dev": (
+        "你是开发工程师。本轮是 **方案层返工后的施工轮**：架构师已按返工项**重做了方案**，"
+        "你的任务是让实现**追上新方案**，既不是重新实现整个项目，也不是只修一个缺陷。\n"
+        "与首轮的区别：① 已有文件必须**定点改**（`modify` + `replace_span` / `insert_after`，"
+        "anchor 取【当前项目已有代码】里的**逐字原文**），禁止对已存在文件整份重吐"
+        "（跨轮合并会把新旧块叠加，得到两份同名符号）；② 方案**新增**的文件与符号本次有权创建"
+        "（返工修缺陷轮不允许，本轮允许）；③ 必须**逐条回应**【评审要求修复项】，"
+        "并在 deviations 里写明哪条已解决、怎么解决的。\n"
+        "禁区：① 重写与返工项无关的文件；② 让既有符号消失（会让既有命令转红）；"
+        "③ 删除或弱化测试/断言；④ 把没做的项写进 deviations 说「已解决」。\n"
+        "验收口径：新方案里的任务都有补丁落地、既有失败命令转绿、且没有任何既有符号消失。\n" + _TAIL
+    ),
+}
+
+#: 任务类型 → 该任务的系统提示词表（按**任务类型**分，不按具体 BUG 分）。
+#:
+#: 未覆盖的阶段自动回退（见 :func:`system_prompt`）—— 这是刻意设计而非遗漏：
+#: 方案重做后本来就该按**首轮标准**验收，所以 `plan_rework` 只为 dev 定义，
+#: 它的 test/review 走首轮口径。反过来若给它们也写一套，等于凭空多两份需要维护的文本。
+SYSTEM_NEW_ROUND: dict[str, dict[str, str]] = {
+    KIND_PLAN_REWORK: SYSTEM_NEW_PLANREWORK,
+    KIND_BUGFIX: SYSTEM_NEW_BUGFIX,
 }
 
 
@@ -2639,15 +2856,17 @@ def system_prompt(stage: str, project_type: str = "secondary", round_kind: str =
 
     两维不够（真机教训）：只有 `stage × project_type` 时，「首次开发」与「返工修缺陷」
     共用一套契约，于是首轮的「整份新建」纪律被套到返工轮，与「最小改动」正面冲突。
-    `round_kind="bugfix"` 时切到专用那套（未覆盖的阶段仍回退）。
+
+    三维之后：`round_kind` ∈ {feature, plan_rework, bugfix}（见 `tasktype.ROUND_KINDS`），
+    命中 `SYSTEM_NEW_ROUND` 里的那一档就用它，**未覆盖的阶段回退首轮口径**（刻意如此：
+    方案重做后本来就该按首轮标准验收，所以那档只为 dev 定义）。
 
     注意：操作页面的「配置」页只覆盖 SYSTEM（二开那套），暂不含 SYSTEM_NEW ——
     让页面同时管两套会让 stage 列表翻倍，收益不足。
     """
-    if project_type == "new" and round_kind == "bugfix":
-        return SYSTEM_NEW_BUGFIX.get(stage) or SYSTEM_NEW.get(stage) or SYSTEM[stage]
     if project_type == "new":
-        return SYSTEM_NEW.get(stage) or SYSTEM[stage]
+        table = SYSTEM_NEW_ROUND.get(str(round_kind or "")) or {}
+        return table.get(stage) or SYSTEM_NEW.get(stage) or SYSTEM[stage]
     return SYSTEM[stage]
 
 

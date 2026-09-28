@@ -868,9 +868,18 @@ function shortReason(s){
   return s.length>42 ? s.slice(0,42)+"…" : s;
 }
 function elapsedSec(d){
+  // **阶段**时长优先：`started_at` 是**进程**启动时间，用它当阶段时长会把整条运行的用时
+  // 记在"当前阶段"头上（真机 20260928-110402：页面显示"dev 已用 1900s"，实际 dev 才几百秒，
+  // 剩下的时间在 architect_plan/test/review 上 —— 人据此判断"dev 卡死了"并杀掉运行）。
+  if(d && d.stage_started_at) return Math.max(0, Math.round(Date.now()/1000 - d.stage_started_at));
   if(d && d.started_at) return Math.max(0, Math.round(Date.now()/1000 - d.started_at));
   const sm = (d && d.summary) || {}, st = (d && d.state) || {};
   return sm.wall_s ?? st.elapsed_s ?? null;
+}
+function processSec(d){
+  // 进程总时长：与阶段时长并列显示，二者都要看得见（差得大说明前面阶段花得多）
+  if(d && d.started_at) return Math.max(0, Math.round(Date.now()/1000 - d.started_at));
+  return null;
 }
 /* ------------------------------------------------------------------ 演示 */
 // 演示数据按 run 缓存：轮询每 2.5s 会调 renderDetail，不能每次都去拉沙箱清单
@@ -1064,8 +1073,13 @@ function renderProgress(d){
     parts.push("（无 state.json，无法探测进度）");
   }
   if(st.attempt) parts.push(`第 ${st.attempt} 轮`);
-  const el = elapsedSec(d);
-  if(el != null) parts.push(`已用 ${el}s`);
+  const el = elapsedSec(d), ps = processSec(d);
+  // 两个数并列：**本阶段**用时用于判断"卡没卡"，**进程**总时长用于看整体开销。
+  // 只显示一个数时，"1900s"会被误读成"当前阶段跑了 1900 秒"。
+  if(el != null){
+    const who = d && d.stage ? esc(STAGE_CN[d.stage] || d.stage) : "本阶段";
+    parts.push(`${who}已用 ${el}s` + (ps != null && ps !== el ? ` · 进程共 ${ps}s` : ""));
+  }
   $("d-prog-summary").innerHTML = parts.join(" · ");
 
   const snaps = (d.stages||[]).slice();

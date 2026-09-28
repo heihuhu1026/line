@@ -21,6 +21,9 @@ TOOLS = ROOT / "tools"
 #: 顺序按"便宜且基础"在前：先查文档与规则，再查合并/分派，最后才是端到端
 SUITES = [
     "check_refs.py",
+    # 静态检查排在真机之前最便宜的位置：真机 `20260928-095848` 里"补漏符号"整条机制
+    # 因为一个 `NameError` 空转了 5/5 张图，而 ruff 的 F821 一行就定位到它。
+    "check_lint.py",
     "smoke_recovery.py",
     "smoke_rules.py",
     "smoke_client.py",
@@ -28,6 +31,9 @@ SUITES = [
     "smoke_patch_apply.py",
     "smoke_merge.py",
     "smoke_bugfix.py",
+    "smoke_prompts.py",   # 角色隔离：三类任务各自一套契约（结构性风险，必须常跑）
+    "smoke_planir.py",    # 编译层：归一 / 符号解析 / 编译器
+    "smoke_diagnose.py",  # 失败归因 + 缺陷台账
     "smoke_mock.py",
     "smoke_console.py",   # 较慢：会起临时服务
 ]

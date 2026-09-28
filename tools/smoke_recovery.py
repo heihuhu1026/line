@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +30,46 @@ def check(cond: bool, name: str, extra: str = "") -> None:
         print(f"  [FAIL] {name}" + (f"  <- {extra}" if extra else ""))
 
 
+def check_presence_and_budget() -> None:
+    """在场计时的两个口径 + 单次请求超时的上界（真机 20260928-110402 的教训）。
+
+    那次运行的页面显示"dev 已用 1900s"，实际 dev 只占其中几百秒 —— `started_at` 是**进程**
+    启动时间，被当成阶段时长用，人据此判断"dev 卡死"并直接杀掉了运行。阶段时长才是判断
+    "卡没卡"的依据，所以两个键必须分开，且**阶段变了要重置**。
+    """
+    print("== 在场计时：进程时长与阶段时长必须分开 ==")
+    from pipeline import config, presence
+
+    run_dir = Path(tempfile.mkdtemp())
+    presence.write(run_dir, stage="dev", run_id="smoke")
+    first = json.loads((run_dir / ".running.json").read_text(encoding="utf-8"))
+    check("stage_started_at" in first and "started_at" in first,
+          "在场标记同时写进程时长与阶段时长")
+    time.sleep(1.05)
+    presence.touch(run_dir, stage="dev")
+    same = json.loads((run_dir / ".running.json").read_text(encoding="utf-8"))
+    check(same["stage_started_at"] == first["stage_started_at"],
+          "同阶段刷心跳**不重置**阶段计时（否则阶段时长永远是 0）",
+          f"{first['stage_started_at']} vs {same['stage_started_at']}")
+    time.sleep(1.05)
+    presence.touch(run_dir, stage="test")
+    moved = json.loads((run_dir / ".running.json").read_text(encoding="utf-8"))
+    check(moved["stage_started_at"] > same["stage_started_at"],
+          "换阶段**重置**阶段计时")
+    check(moved["started_at"] == first["started_at"],
+          "进程启动时间不随阶段变化（两个数各有各的用处）")
+
+    print("== 单次请求超时上界 ==")
+    check(config.REQUEST_TIMEOUT <= 900,
+          "单次 HTTP 超时不高于 900s —— 1800s 意味着卡死可静默 30 分钟"
+          "（调用期间不写产物/追踪/日志，心跳照常 ⇒ 无法区分'在生成'与'已卡死'）",
+          str(config.REQUEST_TIMEOUT))
+    check(config.REQUEST_TIMEOUT >= 300,
+          "也不能收到低于 300s：本机最慢实测调用 ≈210s（11794 tok 的 test）", str(config.REQUEST_TIMEOUT))
+
+
 def main() -> int:
+    check_presence_and_budget()
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
 

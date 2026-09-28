@@ -391,8 +391,18 @@ def select_excerpts(
 
 
 def render_excerpts(excerpts: list[Excerpt]) -> str:
+    """把片段渲染成提示词文本；**空池返回空字符串**。
+
+    这里原先返回的是一句占位说明（`（未提供存量代码；…）`）—— 它看着无害，实际是
+    **判据污染源**：`prompts.parts_dev` 用"这段文本非空吗"判断"有没有可锚定的原文"，
+    于是新建项目（池恒空）**恒被判成"有代码"**，6/6 张首轮施工图都走了「输出符号级 edits
+    （用 anchor 定位）」分支，而 prompt 里根本没有可锚定的代码，还与 system 的
+    「一律 add + full_symbol、anchor 留空」正面冲突（真机 `20260928-110402`）—— 模型折中出
+    `modify` + 近似 anchor，补丁因此套用不上。
+    **占位说明属于呈现层**（要显示就给 `_code_block`），数据层只该如实回答"有没有"。
+    """
     if not excerpts:
-        return "（未提供存量代码；只能基于需求描述作答，任何涉及具体文件的事实都必须列入不确定性）"
+        return ""
     blocks = []
     for item in excerpts:
         marks = [f"score={item.score}"]
