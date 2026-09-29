@@ -972,6 +972,234 @@ def _scope_view(scope: Any) -> Any:
     return {k: v for k, v in scope.items() if k not in ("unknowns", "clarifying_questions")}
 
 
+#: 条款级否定极性标记。
+_DECISION_NEG_MARKERS = (
+    "无需", "不用", "不能", "不会", "不要", "不可", "不准", "禁止", "没有",
+    "勿", "别", "不",
+)
+#: 疑问式条款（"是否需要…"）是在抛问题、不是下结论，极性为"悬置"，不参与冲突判定。
+_DECISION_ASK_MARKERS = ("是否", "能否", "可否", "要不要", "能不能", "可不可以")
+#: 语义改写归一：裁决与验收各用各的措辞时，字符 n-gram 会把**同一件事**看成两件事。
+#: 真机 run 20260929-093329：裁决「不自动重排序号」，FR-03 验收写「删除后序号字段自动重置」。
+_DECISION_SYNONYMS = (
+    ("自动重置", "自动重排"),
+    ("重置序号", "重排序号"),
+    ("重新排序", "重排"),
+    ("重新编号", "重排"),
+    # 注意：不能放 "重排序"→"重排" —— 它会误伤 "重排序号"（真机裁决原文），把序号吃成"号"。
+)
+#: 话题重合阈值：overlap coefficient（共享 bigram 数 / 较短一方 bigram 数）。
+#: 真机冲突对在归一后为 0.67；配合「双边行为词」规则，0.4 即可零误报（历史 45 份产物实测）。
+_DECISION_TOPIC_RATIO = 0.4
+#: 共享 bigram 至少 3 个：2 个共享时命中的基本都是"数据库/校验/子命令"这类通用短尾
+#: （历史扫描里 2 共享的全部是误报），真正的极性翻转在行为短语上至少有 3 连字重合。
+_DECISION_MIN_SHARED = 3
+#: 双方都必须含"行为词"：纯名词标签碎片（"食物生成位置""数据库表结构"）与任何
+#: 肯/否句配对都可能字面重合，但标签本身没有行为可被翻转，不构成极性冲突。
+_DECISION_PREDICATE_RE = re.compile(
+    "自动|重排|重置|重新|创建|新建|新增|删除|清空|打印|输出|显示|展示|返回|退出|"
+    "存储|保存|持久|校验|验证|允许|支持|禁止|重叠|生成|更新|修改|插入|查询|排序|"
+    "升序|降序|编号|计数|调用|运行|执行|保留|保持|恢复|触发|读取|写入|加载|增长|"
+    "减少|移动|碰撞|暂停|继续|启动|关闭|打开|发送|接收|改变|变化|结束|开始|连续"
+)
+#: 条件状语前缀：「不/没有/无/未…时/后/之前」里的否定是**触发条件**，不是对结论的否定
+#: （"表不存在时自动创建"是肯定句）。极性只看剥掉条件后的主句。
+_DECISION_CONDITION_RE = re.compile(
+    r"^(?:如果|若|当)?[^，。；;：]*?(?:不|没有|无|未)[^，。；;：]*?(?:的时候|以后|之后|时|前|后)[，、]?"
+)
+_DECISION_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_DECISION_CLAUSE_SPLIT_RE = re.compile(
+    r"[，。；;：:、,（）()\s\"'“”‘’【】\[\]？?！!~～]+"
+)
+
+
+def _decision_norm(text: Any) -> str:
+    out = str(text or "")
+    for src, dst in _DECISION_SYNONYMS:
+        out = out.replace(src, dst)
+    return out
+
+
+def _decision_bigrams(text: str) -> set[str]:
+    out: set[str] = set()
+    for run in _DECISION_CJK_RE.findall(text):
+        if len(run) == 1:
+            out.add(run)
+            continue
+        for i in range(len(run) - 1):
+            out.add(run[i : i + 2])
+    return out
+
+
+def _decision_polarity(clause: str) -> str:
+    """条款极性：neg（否定结论）/ pos（肯定结论）/ ask（疑问，悬置）。"""
+    if any(marker in clause for marker in _DECISION_ASK_MARKERS):
+        return "ask"
+    return "neg" if any(marker in clause for marker in _DECISION_NEG_MARKERS) else "pos"
+
+
+def _decision_clauses(text: Any) -> list[str]:
+    clauses: list[str] = []
+    for raw in _DECISION_CLAUSE_SPLIT_RE.split(_decision_norm(text)):
+        if len(raw) < 3:
+            continue
+        # 剥条件状语：剥完为空（整句只是条件，如"数据库不存在时"）则丢弃。
+        matrix = _DECISION_CONDITION_RE.sub("", raw, count=1).strip()
+        clauses.append(matrix if len(matrix) >= 3 else raw)
+    return clauses
+
+
+def _decision_same_topic(a: str, b: str) -> tuple[bool, int]:
+    ba, bb = _decision_bigrams(a), _decision_bigrams(b)
+    if not ba or not bb:
+        return False, 0
+    shared = ba & bb
+    hit = (
+        len(shared) >= _DECISION_MIN_SHARED
+        and len(shared) / min(len(ba), len(bb)) >= _DECISION_TOPIC_RATIO
+    )
+    return hit, len(shared)
+
+
+def _decision_has_flipped_predicate(neg_clause: str, pos_clause: str) -> bool:
+    """极性翻转的**双边行为词**条件：否定句否定作用域里的行为词，必须也出现在肯定句中。
+
+    名词标签碎片（"食物生成位置"）也可能与长句字面高重合，但长句被否定的行为
+    （"不与蛇身**重叠**"）根本不在标签里 —— 标签既没肯定也没否定那个行为，不构成翻转。
+    真机目标对「不**自动重排**序号」⨯「…序号字段**自动重排**」两侧都含自动/重排，命中。
+    """
+    first = None
+    for marker in _DECISION_NEG_MARKERS:
+        idx = neg_clause.find(marker)
+        if idx >= 0 and (first is None or idx < first[0]):
+            first = (idx, len(marker))
+    if first is None:
+        return False
+    region = neg_clause[first[0] + first[1] :]
+    return any(word and word in pos_clause for word in _DECISION_PREDICATE_RE.findall(region))
+
+
+def _claim_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "criterion", "description", "statement", "content"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+    return ""
+
+
+def pm_decision_conflicts(scope: Any) -> list[dict[str, str]]:
+    """机械检测 PM 产物里「已裁决结论」与「需求/验收陈述」之间的**极性冲突**。
+
+    权威数据内部自相矛盾时，下游无论听谁的都是错（真机 run 20260929-093329：
+    open_questions 已裁决「不自动重排序号」，同份产物 FR-03 验收却写「删除后序号字段
+    自动重置」）。提示词拦不住相隔很远的两段文本，必须做确定性比对：条款级话题重合
+    （CJK 字符 bigram 的 overlap coefficient ≥ 阈值）但一肯一否，即判冲突。
+
+    返回 ``[{"decision", "clause", "claim", "where"}]``；空 = 未检出。**刻意只覆盖
+    极性翻转这一类高置信模式**，改写/措辞差异靠小型同义词表归一，其余一律不判 ——
+    这是会触发返工与人工闸门的强控判据，宁漏勿冤。
+    """
+    if not isinstance(scope, dict):
+        return []
+    scope = normalize_pm_questions(scope)
+
+    # ① 权威结论：带 final_decision 的未决项（问句+裁决整句）+ confirmed_facts，去重。
+    decisions: list[str] = []
+    seen_decisions: set[str] = set()
+
+    def _add_decision(text: Any) -> None:
+        text = str(text or "").strip()
+        if text and text not in seen_decisions:
+            seen_decisions.add(text)
+            decisions.append(text)
+
+    for q in scope.get("open_questions") or []:
+        if isinstance(q, dict) and str(q.get("final_decision") or "").strip():
+            _add_decision(f"{q.get('question') or ''}：{q['final_decision']}")
+    for fact in scope.get("confirmed_facts") or []:
+        if isinstance(fact, str) and fact.strip():
+            _add_decision(fact)
+    if not decisions:
+        return []
+
+    # ② 被核对陈述：功能需求描述/验收、项目级验收标准、in_scope。
+    # change_request 是**用户原话**（PM 之前的输入），裁决细化/修正它正是 PM 的工作，
+    # 不构成"自相矛盾"，刻意不查。
+    claims: list[tuple[str, str]] = []
+
+    def _add_claim(where: str, text: Any) -> None:
+        text = _claim_text(text).strip()
+        if text:
+            claims.append((where, text))
+
+    for idx, fr in enumerate(scope.get("functional_requirements") or []):
+        if not isinstance(fr, dict):
+            continue
+        fid = str(fr.get("id") or f"#{idx}")
+        _add_claim(f"functional_requirements[{fid}].description", fr.get("description") or fr.get("title"))
+        acceptance = fr.get("acceptance")
+        if isinstance(acceptance, list):
+            for j, item in enumerate(acceptance):
+                _add_claim(f"functional_requirements[{fid}].acceptance[{j}]", item)
+        elif isinstance(acceptance, str):
+            _add_claim(f"functional_requirements[{fid}].acceptance", acceptance)
+    for j, item in enumerate(scope.get("acceptance_criteria") or []):
+        _add_claim(f"acceptance_criteria[{j}]", item)
+    for j, item in enumerate(scope.get("in_scope") or []):
+        _add_claim(f"in_scope[{j}]", item)
+    if not claims:
+        return []
+
+    conflicts: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for decision in decisions:
+        for clause in _decision_clauses(decision):
+            pol_d = _decision_polarity(clause)
+            if pol_d == "ask" or not _DECISION_PREDICATE_RE.search(clause):
+                continue
+            for where, claim_text in claims:
+                for sub_clause in _decision_clauses(claim_text):
+                    pol_c = _decision_polarity(sub_clause)
+                    if pol_c == "ask" or pol_c == pol_d:
+                        continue
+                    if not _DECISION_PREDICATE_RE.search(sub_clause):
+                        continue
+                    same_topic, _shared = _decision_same_topic(clause, sub_clause)
+                    if not same_topic:
+                        continue
+                    # 被否定的行为词必须在肯定方也出现（否则只是话题相关，不是极性翻转）。
+                    neg_clause, pos_clause = (
+                        (clause, sub_clause) if pol_d == "neg" else (sub_clause, clause)
+                    )
+                    if not _decision_has_flipped_predicate(neg_clause, pos_clause):
+                        continue
+                    key = (clause, sub_clause)
+                    if key in seen_pairs:
+                        continue
+                    seen_pairs.add(key)
+                    conflicts.append(
+                        {
+                            "decision": str(decision),
+                            "clause": clause,
+                            "claim": sub_clause,
+                            "where": where,
+                        }
+                    )
+    return conflicts
+
+
+def pm_decision_conflict_lines(conflicts: list[dict[str, str]]) -> list[str]:
+    """把冲突清单渲染成给模型/人看的行（PM 返工提示、人工闸门、下游告警共用一份口径）。"""
+    return [
+        f"- 裁决「{item.get('clause') or ''}」⨯ {item.get('where') or ''}「{item.get('claim') or ''}」"
+        for item in conflicts
+        if isinstance(item, dict)
+    ]
+
+
 def pm_assumptions_block(scope: Any) -> str:
     """把 PM 对未决项给出的「默认假设」原样注入所有下游阶段。
 
@@ -1020,6 +1248,17 @@ def pm_assumptions_block(scope: Any) -> str:
         decided_keys.add(key)
         decided.append(f"- {text}")
     blocks: list[str] = []
+    # 裁决一致性告警**排在最前**：正常情况下为空（PM 返工/人工闸门已消除）。
+    # 仍存在时，必须让下游在看到 FR/验收原文**之前**先知道"哪条陈述已被裁决作废" ——
+    # 否则两段矛盾文本同时在场，7B/14B 基本是按就近/显眼原则随机选一条听。
+    conflicts = pm_decision_conflicts(scope)
+    if conflicts:
+        blocks.append(
+            "【裁决一致性（机械校验发现以下需求/验收陈述与人工裁决**极性相反**）】\n"
+            + "\n".join(pm_decision_conflict_lines(conflicts))
+            + "\n人工裁决是最高基准：设计/开发/测试**一律以裁决结论为准**，"
+            "上述矛盾陈述视为已作废，不得按它实现或验收。"
+        )
     if decided:
         blocks.append("【PM 未决项（已由人工裁决，以下是**确定结论**，直接采纳）】\n" + "\n".join(decided))
     if pending:
@@ -1320,13 +1559,15 @@ def test_audit_block(audit: dict) -> str:
     if audit.get("boundary_count"):
         lines.append(f"- 其中测异常/边界路径的用例 {audit['boundary_count']} 条")
     if audit.get("missing_symbols"):
-        # 「写了很多用例」≠「测到了改动之处」：用例 target 写文件名、补丁是符号级时，
-        # 覆盖对不上（真机 run 20260925-184300 只有 1/5 对得上）。这条把它摆到评审面前。
+        # 二级覆盖（优化建议§十七）：符号漏测只作**提示级**。内部 helper 没有单独用例
+        # 不是缺陷，业务用例自然带到即可；硬拦只会逼模型编造无价值用例。
         explained = set(audit.get("missing_symbols") or []) - set(
             audit.get("missing_unexplained") or []
         )
         lines.append(
-            f"- **本次改动的符号里，有 {len(audit['missing_symbols'])} 个没出现在任何用例中**："
+            f"- 本次改动的符号里，有 {len(audit['missing_symbols'])} 个没出现在任何用例中"
+            "（**二级参考，提示级**：业务行为覆盖才是一级目标，内部 helper 靠业务用例"
+            "自然带到即可，不必为凑覆盖编造用例）："
             + "、".join(str(s) for s in audit["missing_symbols"])
         )
         if explained:
@@ -1334,13 +1575,32 @@ def test_audit_block(audit: dict) -> str:
                 f"    · 其中 {len(explained)} 个已在 coverage_gaps 里交代过原因（视为豁免）："
                 + "、".join(sorted(explained))
             )
-    if audit.get("missing_unexplained"):
+    # 一级覆盖：业务行为（FR / 验收口径）。部分缺失只提示，整体脱锚由机制阻断。
+    behavior_total = audit.get("behavior_count") or 0
+    missing_behaviors = audit.get("missing_behaviors") or []
+    if behavior_total:
+        covered_n = behavior_total - len(missing_behaviors)
         lines.append(
-            "- **漏测（既没用例覆盖、也没在 coverage_gaps 申诉）**："
-            + "、".join(str(s) for s in audit["missing_unexplained"])
-            + " —— 属阻断级，已由机制强制判 rework_dev；用例 target 要写到符号级"
-            "（写文件名会与补丁的 target_symbol 对不上）"
+            f"- 业务行为覆盖（一级）：{covered_n}/{behavior_total} 条 FR / 验收口径有用例承载"
         )
+    unexplained_behaviors = audit.get("behavior_unexplained") or []
+    if unexplained_behaviors:
+        shown = [
+            str(b.get("id") or b.get("text") or "")[:30]
+            for b in unexplained_behaviors[:6]
+            if isinstance(b, dict)
+        ]
+        if covered_n := (behavior_total - len(missing_behaviors)):
+            lines.append(
+                "- **部分业务行为未见对应用例（提示级，请判断是否要补）**："
+                + "、".join(s for s in shown if s)
+            )
+        else:
+            lines.append(
+                "- **业务行为整体脱锚（阻断级，机制已强制返工）**："
+                + "、".join(s for s in shown if s)
+                + " —— 现有用例没有一条与 FR / 验收口径对得上"
+            )
     if not audit.get("command_count"):
         lines.append("- **没有给出任何可执行命令**：automated_commands 为空，测试方案无法被直接执行")
     elif not audit.get("assertion_count"):
@@ -2022,6 +2282,33 @@ def task_focus_block(task: Any, changes: Any = None, hint_ctx: Any = None) -> st
         "只产出下面 target_files 里这些文件的 edit；**其他任务的文件一个都不要碰**"
         "（它们由各自的施工图完成，跨任务结果由编排器合并）。",
         f"- target_files：{', '.join(str(x) for x in (task.get('target_files') or [])) or '（未声明）'}",
+    ]
+    # ---- 文件创建租约（G3，run 20260929-093329：同文件多张图都整份 add 互相覆盖）----
+    owner_map = task.get("file_owners") if isinstance(task.get("file_owners"), dict) else {}
+    owned_here = [
+        str(p) for p in (task.get("target_files") or [])
+        if owner_map.get(str(p).replace("\\", "/")) == tid
+    ]
+    foreign = [
+        (str(p), str(owner_map.get(str(p).replace("\\", "/"))))
+        for p in (task.get("target_files") or [])
+        if str(owner_map.get(str(p).replace("\\", "/")) or "") not in ("", tid)
+    ]
+    if owned_here:
+        lines.append(
+            "- 🔑 **你是这些新文件的创建者（唯一持有创建租约）**："
+            f"{'、'.join(owned_here)} —— 请给出**含文件头 import 的完整文件内容**"
+            "（change_type=add 整份新建是你的专属动作）；同文件的后续施工图只会在你这份"
+            "文件上定点增补，不要替它们实现它们负责的符号。"
+        )
+    for path, owner in foreign:
+        lines.append(
+            f"- 🔒 {path} 已由前置任务 **{owner}** 创建（正文见【当前项目已有代码】的在制文件）"
+            "：本次**禁止 change_type=add 整份重写**（整份重写会被机械丢弃，且会覆盖文件头"
+            "与别人已写好的符号）；只能用 modify / full_symbol 对你负责的符号做**定点增补**，"
+            "需要的 import 在文件头已有则复用、缺失则只插入你自己那几行。"
+        )
+    lines += [
         "- 要定义的符号（漏一个都会被机械检测抓到）：",
         symbols_block,
         f"- 对外签名：{task.get('interface') or '（未声明）'}",
@@ -2421,7 +2708,7 @@ def test_view_block(view: Any) -> str:
 
     behaviors = view.get("behaviors") or []
     if behaviors:
-        lines.append("■ 要验证的行为：")
+        lines.append("■ 要验证的业务行为（**一级覆盖目标**：每条至少有一条用例承载）：")
         for item in behaviors[:12]:
             if isinstance(item, dict):
                 bid = str(item.get("id") or "").strip()
@@ -2458,7 +2745,11 @@ def test_view_block(view: Any) -> str:
 
     symbols = view.get("symbols") or []
     if symbols:
-        lines.append("■ 本轮变更的符号（测试要覆盖的对象）：")
+        # 二级覆盖模型（优化建议§十七，run 20260929-093329：测试资源被函数覆盖率吞掉，
+        # 用户真正关心的 add/list/remove 业务行为反而没测）：符号只是**二级参考**，
+        # 业务行为覆盖才是一级目标；内部 helper 靠业务用例自然带到，不单独凑用例。
+        lines.append("■ 本轮变更的符号（**二级参考**：业务行为覆盖优先，这些符号通过业务用例"
+                     "自然带到即可；内部 helper 不必为凑覆盖单独造用例）：")
         for item in symbols[:12]:
             if isinstance(item, dict):
                 path = str(item.get("path") or "").strip()
@@ -2529,9 +2820,17 @@ def parts_test(
         blocks += [
             _feedback_block("评审要求补测项", fixes),
             _test_repair_block(repair),
-            "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。"
-            "依据上方行为与接口设计即可，不要臆测未给出的实现内部；"
-            "若某个行为确实无法从接口理解，在 coverage_gaps 里点名「需要哪个文件的哪个函数正文」。",
+            "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。",
+            # 二级覆盖模型（优化建议§十七）：一级是**业务行为覆盖** —— 上方每个 FR /
+            # 验收口径至少有一条用例以「可观察行为 + 期望值」验证（正常路径优先，
+            # 坏路径/边界按验收需要补）；二级才是实现符号，内部 helper 没有单独用例
+            # 不是缺陷，业务用例能自然带到即可 —— **不要为凑符号覆盖编造无价值用例**。
+            "【覆盖优先级（业务行为 > 实现符号）】"
+            "①先逐条核对上方 FR 与施工图验收口径是否都有用例承载；"
+            "②类的构造参数、方法名、参数顺序、返回字段**只允许**来自上面的可调用接口 / "
+            "接口摘要 / 方案，**禁止臆测方案外的接口或参数**（典型错误：凭类名猜无参构造、"
+            "编造不存在的方法）——接口里确实没有的，在 coverage_gaps 点名缺哪个签名，"
+            "不要让测试去假设；③某行为无法验证或无需验证时，在 coverage_gaps 写明原因与影响。",
         ]
         return blocks
 

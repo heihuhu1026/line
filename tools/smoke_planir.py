@@ -354,24 +354,46 @@ def main() -> int:
 
     print("== ⑦ Compiler 只读 IR ==")
     tasks = taskcompiler.compile_tasks(_plan(), ir=ir)
-    by_target = {t["target_files"][0]: t for t in tasks}
-    check([t["id"] for t in tasks] == ["T-01", "T-02", "T-03"],
-          "编号跟随 IR 的 unit 顺序（main → database → cli）", str([t["id"] for t in tasks]))
+    # v3：cli.py 的两张 draft 图（T-02 add / T-03 list）**不再被揉成一张** ——
+    # 揉成一张正是 run 20260929-093329 的语义漂移点（list_all 带着 add 的 interface/change）。
+    # 编译后编号：main（空整文件）→ database → cli:CLI.add → cli:CLI.list_all
+    check([t["id"] for t in tasks] == ["T-01", "T-02", "T-03", "T-04"],
+          "编号跟随 IR 的 unit/facet 顺序（main → database → cli/add → cli/list）",
+          str([t["id"] for t in tasks]))
     check(all(t.get("stable_id") for t in tasks),
           "每张图都有**稳定身份**（不随编号漂移）", str([t.get("stable_id") for t in tasks]))
-    cli_task = by_target.get("cli.py") or {}
+    cli_tasks = [t for t in tasks if t["target_files"][0] == "cli.py"]
+    add_task = next((t for t in cli_tasks if t["symbols"] == ["CLI.add"]), {})
+    list_task = next((t for t in cli_tasks if t["symbols"] == ["CLI.list_all"]), {})
     check(all(t["id"] not in (t.get("depends_on") or []) for t in tasks),
-          "**没有任何自引用依赖**（两图合并成一张时最容易出现）",
+          "**没有任何自引用依赖**（同文件多图时最容易出现）",
           str([(t["id"], t.get("depends_on")) for t in tasks]))
-    check(cli_task.get("depends_on") == ["T-02"],
-          "依赖翻译成新编号，且指向 database 那张图", str(cli_task.get("depends_on")))
-    check(cli_task.get("interface") == "add(amount: str, note: str) -> None"
-          and cli_task.get("data_model") and cli_task.get("constraints") == ["仅标准库"],
-          "施工图字段**透传给 dev**（编译器不得丢信息）", str(sorted(cli_task.keys())))
-    check(cli_task.get("test_hint") == 'python -c "import cli"',
-          "test_hint 用方案里那条（不是机械兜底那条）", str(cli_task.get("test_hint")))
-    check(sorted(cli_task.get("symbols") or []) == ["CLI.add", "CLI.list_all"],
-          "类的点号前缀**保留**（区分同名方法、也是锚点依据）", str(cli_task.get("symbols")))
+    check(add_task.get("depends_on") == ["T-02"],
+          "add 图的 draft 依赖翻译成新编号，指向 database 那张图", str(add_task.get("depends_on")))
+    check(list_task.get("depends_on") == ["T-03"],
+          "list 图只挂同文件顺序边（add 先于 list）", str(list_task.get("depends_on")))
+    # 字段透传 + task 级隔离：T-02 的 interface/constraints 只在 add 图上；
+    # 两图共享的只有 data_model（文件级事实，允许合并）。
+    check(add_task.get("interface") == "add(amount: str, note: str) -> None"
+          and add_task.get("data_model") and add_task.get("constraints") == ["仅标准库"],
+          "add 图透传 T-02 的 interface/data_model/constraints", str(sorted(add_task.keys())))
+    check(not list_task.get("interface") and list_task.get("constraints") is None
+          and list_task.get("data_model"),
+          "list 图**不继承** T-02 的 interface/constraints（只共享文件级 data_model）",
+          str({k: list_task.get(k) for k in ("interface", "constraints", "data_model")}))
+    check(add_task.get("change") == "实现 add 子命令"
+          and list_task.get("change") == "实现 list 子命令",
+          "每张图带**自己那张 draft 图**的 change（不再 first-wins 串味）",
+          str([(t["id"], t.get("change")) for t in cli_tasks]))
+    check(add_task.get("test_hint") == 'python -c "import cli"',
+          "test_hint 用方案里那条（不是机械兜底那条）", str(add_task.get("test_hint")))
+    check(sorted(s for t in cli_tasks for s in t["symbols"]) == ["CLI.add", "CLI.list_all"],
+          "类的点号前缀**保留**（区分同名方法、也是锚点依据）",
+          str([t.get("symbols") for t in cli_tasks]))
+    check("（来源 T-02）" in str(add_task.get("acceptance"))
+          and "（来源 T-03）" in str(list_task.get("acceptance")),
+          "验收文本按 facet 各自带来源（不交叉）",
+          str([(t["id"], t.get("acceptance")) for t in cli_tasks]))
     all_acc = " ".join(str(t.get("acceptance")) for t in tasks)
     check("（来源 T-" in all_acc, "验收文本带来源（可追溯是谁提的要求）", all_acc[:140])
     check(all(len(t["symbols"]) <= taskcompiler.MAX_SYMBOLS_PER_TASK for t in tasks),

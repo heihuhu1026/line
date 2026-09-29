@@ -3010,15 +3010,18 @@ def main() -> int:
             "符号在原文里不存在时不补（真编造该照旧判负）",
         )
 
-        # ③a-3 漏测阻断 + 申诉通道（mock 下 _test_blockers 被跳过，故直接调它验证）
+        # ③a-3 测试阻断（**二级覆盖模型**，优化建议§十七，run 20260929-093329）：
+        # 业务行为覆盖（一级）决定阻断，符号漏测（二级）只作提示。mock 下
+        # _test_blockers 被整体跳过，故直接调它验证。
         from pipeline.orchestrator import Orchestrator as _Orch
 
         class _TbShim(_Orch):
             """只替换 state/client 的编排器外壳。
 
             **刻意继承而不是逐个复制方法**：`_test_blockers` 会回落到 `_audit_test` 重算，
-            而这个链条上每加一个辅助方法（例如后来的 `_entry_command_gap`）都得记得同步
-            复制过来，否则就是 `AttributeError` —— 实测已经踩过一次。继承之后不用再管。
+            而这个链条上每加一个辅助方法（例如后来的 `_entry_command_gap`、行为覆盖的
+            `_behavior_hit`）都得记得同步复制过来，否则就是 `AttributeError` ——
+            实测已经踩过一次。继承之后不用再管。
             """
 
             def __init__(self, state, client=None):
@@ -3034,26 +3037,50 @@ def main() -> int:
              "steps": ["构造"], "expected": "返回长度为 3 的列表"},
         ], "automated_commands": [{"command": "python -m unittest a_test"}],
             "coverage_gaps": [], "uncertainties": []}
+        # PM 业务行为：两条 FR + 一条验收口径（行为覆盖的核对基准）
+        tb_scope = {"functional_requirements": [
+            {"id": "FR-01",
+             "description": "贪吃蛇吃到食物后身体增长一节并且分数增加",
+             "acceptance": ["蛇头碰到食物后长度加一"]},
+            {"id": "FR-02",
+             "description": "撞墙或撞到自身时游戏结束并展示最终得分",
+             "acceptance": ["游戏结束后停止接受方向输入"]},
+        ], "acceptance_criteria": ["方向键改变蛇的移动方向"]}
 
-        def _tb(report, **kw):
-            return _TbShim({"implementation": tb_impl, "test_report": report}, **kw)._test_blockers()
+        def _tb(report, scope=None, impl=tb_impl):
+            state = {"implementation": impl, "test_report": report}
+            if scope is not None:
+                state["scope"] = scope
+            return _TbShim(state)._test_blockers()
 
-        blocked = _tb(tb_cases)
+        def _tb_audit(report, scope=None, impl=tb_impl):
+            state = {"implementation": impl, "test_report": report}
+            if scope is not None:
+                state["scope"] = scope
+            return _TbShim(state)._audit_test()
+
+        # 符号漏测（Food 没出现在用例里）但 state 里没有业务行为基准 → **不再阻断**，
+        # 只在 audit 里留事实清单（missing_unexplained 仍在，供评审/人工扫读）。
         check(
-            bool(blocked) and "Food" in blocked[0],
-            "改动的符号既没用例覆盖、也没申诉 → 判阻断（强制 rework）",
-            str(blocked)[:140],
+            _tb(tb_cases) == [],
+            "二级覆盖：符号漏测只作提示级，不再判阻断（内部 helper 无需单独用例）",
+            str(_tb(tb_cases))[:140],
         )
-        # 申诉通道：在 coverage_gaps 里写明原因即可豁免
+        check(
+            _tb_audit(tb_cases)["missing_unexplained"] == ["Food"],
+            "符号漏测事实仍进 audit（降的是阻断级别，不是不核对）",
+            str(_tb_audit(tb_cases)["missing_unexplained"]),
+        )
+        # 申诉通道仍然作用在 audit 清单上：点名 Food 后从未解释清单消失
         appealed = json.loads(json.dumps(tb_cases))
         appealed["coverage_gaps"] = [{
             "gap": "Food 只改了内部常量，无需单独用例",
             "reason": "Food 的行为未变化", "impact": "无",
         }]
         check(
-            _tb(appealed) == [],
-            "在 coverage_gaps 里交代过原因即豁免（符号覆盖那条的申诉出口）",
-            str(_tb(appealed))[:140],
+            not _tb_audit(appealed)["missing_unexplained"],
+            "符号漏测在 coverage_gaps 点名后从未解释清单移除（申诉出口保留）",
+            str(_tb_audit(appealed)["missing_unexplained"]),
         )
         # 但「一条可执行命令都没有」**不留申诉出口** —— 任何技术栈都能声明一条跑测试的
         # 命令，不存在「确实无法声明」的合法情形；此时 verify 除自带检查外无物可跑。
@@ -3065,22 +3092,66 @@ def main() -> int:
             "automated_commands 为空 → 判阻断（此时 verify 无物可跑）",
             str(_tb(no_cmd))[:140],
         )
-        # 申诉要针对**具体符号**才生效
-        wrong_appeal = json.loads(json.dumps(tb_cases))
-        wrong_appeal["coverage_gaps"] = [{
+        # 一级覆盖：用例与 PM 业务行为整体对不上（哪怕写了用例、有可执行命令）→ 阻断
+        check(
+            any("业务行为整体对不上" in b for b in _tb(tb_cases, scope=tb_scope)),
+            "一级覆盖：全部 FR / 验收口径都没被用例承载 → 判阻断",
+            str(_tb(tb_cases, scope=tb_scope))[:140],
+        )
+        # 用例对照着业务行为写（即便没提 Food 这个符号）→ 不阻断
+        behavior_cases = {"cases": [
+            {"id": "NEW-01", "type": "new", "target": "game",
+             "steps": ["蛇头碰到食物吃到食物后身体增长一节，分数增加"],
+             "expected": "长度加一且分数增加"},
+            {"id": "REG-01", "type": "regression", "target": "game",
+             "steps": ["撞墙和撞到自身时游戏结束，展示最终得分"],
+             "expected": "游戏结束后停止接受方向输入"},
+            {"id": "COMP-01", "type": "compat", "target": "game",
+             "steps": ["按下方向键"], "expected": "方向键改变蛇的移动方向"},
+        ], "automated_commands": [{"command": "python -m unittest a_test"}],
+            "coverage_gaps": [], "uncertainties": []}
+        ba = _tb_audit(behavior_cases, scope=tb_scope)
+        check(
+            ba["behavior_count"] == 3 and not ba["missing_behaviors"]
+            and sorted(ba["missing_unexplained"]) == ["Food", "Snake"],
+            "业务用例承载全部 FR（一级满足），Snake/Food 符号未提只记提示",
+            f"cov={ba['covered_behaviors']} miss_sym={ba['missing_unexplained']}",
+        )
+        check(
+            _tb(behavior_cases, scope=tb_scope) == [],
+            "一级覆盖满足时符号漏测不阻断（业务用例自然带到即可）",
+            str(_tb(behavior_cases, scope=tb_scope))[:140],
+        )
+        # 行为级申诉：泛泛的理由（不含任何 FR 措辞）不豁免；点名具体行为才豁免
+        generic_gap = json.loads(json.dumps(tb_cases))
+        generic_gap["coverage_gaps"] = [{
             "gap": "环境限制没法测", "reason": "无头环境", "impact": "中",
         }]
         check(
-            bool(_tb(wrong_appeal)),
-            "泛泛的申诉（没点名符号）不豁免，否则等于没要求",
-            str(_tb(wrong_appeal))[:120],
+            bool(_tb(generic_gap, scope=tb_scope)),
+            "泛泛的申诉（没点名任何业务行为）不豁免，否则等于没要求",
+            str(_tb(generic_gap, scope=tb_scope))[:120],
+        )
+        named_gap = json.loads(json.dumps(tb_cases))
+        named_gap["coverage_gaps"] = [{
+            "gap": "吃到食物身体增长分数增加、撞墙撞到自身游戏结束展示最终得分、"
+                   "方向键改变移动方向，这些行为只能人工验证",
+            "reason": "无显示环境无法自动化", "impact": "发布前人工走查",
+        }]
+        check(
+            _tb(named_gap, scope=tb_scope) == [],
+            "coverage_gaps 逐条点名业务行为并说明原因 → 豁免",
+            str(_tb(named_gap, scope=tb_scope))[:120],
         )
         # mock 运行下跳过：否则占位数据每轮命中，把流程机制的测试带偏
         from pipeline.ollama_client import MockClient as _MC
 
         check(
-            _tb(tb_cases, client=_MC()) == [],
-            "mock 运行下跳过错测阻断（占位产物不带符号级 target）",
+            _TbShim(
+                {"implementation": tb_impl, "test_report": tb_cases, "scope": tb_scope},
+                client=_MC(),
+            )._test_blockers() == [],
+            "mock 运行下跳过测试阻断（占位产物不带真实覆盖）",
         )
 
         # ③a-4 LSP 健壮性：server 中途死掉绝不能把 verify 带崩

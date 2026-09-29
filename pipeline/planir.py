@@ -43,7 +43,11 @@ from . import symbols as symbol_resolver
 #: 编译器**输入契约**版本。见模块 docstring 的「冻结时机」。
 #: v2：units 增加 ``self_depends``（draft 自依赖取证）；``depends_on_files``
 #: 并入二开项目的**现存 import 边**（``file_imports``）。
-COMPILER_INPUT_VERSION = "2"
+#: v3：units 增加 ``work_units``（task 级 facet）——同文件被多张 draft 图覆盖时，
+#: change/interface/acceptance/contracts/constraints/test_hint 按**源任务**分别保留，
+#: compiler 出图只带本 facet 的字段（真机 run 20260929-093329：v2 first-wins 合并
+#: 导致"符号是 A 的、interface 是 B 的"）。file 级仍只合并 intent/data_model。
+COMPILER_INPUT_VERSION = "3"
 
 __all__ = [
     "COMPILER_INPUT_VERSION",
@@ -331,12 +335,39 @@ def normalize_plan(
                 "depends_on": [],
                 "self_depends": [],
                 "source_task_ids": [],
+                #: task 级 facet（v3）：同一文件被多张 draft 图覆盖时，各自的
+                #: change/interface/acceptance/contracts/constraints/test_hint **不合并**，
+                #: compiler 按 facet 出图。file 级同名首胜字段保留，仅作兼容回退。
+                "work_units": [],
                 "uses_resolved": [],
                 "unresolved": [],
                 "_declared": [],
                 "_order": order_index.get(path, len(changes)),
             }
         return units[path]
+
+    def _changes_facet(unit: dict) -> dict:
+        """changes[] 贡献的 file 级 facet（每文件至多一个，固定排在最前）。"""
+        wus = unit["work_units"]
+        if not wus or wus[0].get("source") != "@changes":
+            wus.insert(
+                0,
+                {
+                    "source": "@changes",
+                    "symbols": [],
+                    "change": "",
+                    "acceptance": [],
+                    "interface": "",
+                    "test_hint": "",
+                    "constraints": [],
+                    "deps_raw": [],
+                    "uses_raw": [],
+                    "exposes_raw": [],
+                    "uses": [],
+                    "exposes": [],
+                },
+            )
+        return wus[0]
 
     for change in changes:
         path = _norm(change.get("path"))
@@ -345,16 +376,21 @@ def normalize_plan(
         # 那一路已经过 resolver 的 `clean_symbol` ⇒ 裸名。两条入口书写不一致时，同一符号会在
         # 定稿后的清单里**出现两次**（真机 `20260928-110402`：`main` 与 `main()` 并存），
         # 提示词里就成了"要定义两个东西"，而机械自检的判据也跟着分裂。
-        unit["_declared"].extend(
+        change_syms = [
             symbol_resolver.clean_symbol(s)
             for s in _as_list(change.get("symbols"))
             if symbol_resolver.clean_symbol(s)
-        )
+        ]
+        unit["_declared"].extend(change_syms)
+        facet = _changes_facet(unit)
+        facet["symbols"].extend(change_syms)
         if str(change.get("intent") or "").strip():
             unit["intent"].append({"text": str(change["intent"]).strip(), "source": "changes"})
         if not unit["change"]:
             # 「改什么」优先取 approach（更具体），退回 intent
             unit["change"] = str(change.get("approach") or change.get("intent") or "").strip()
+        if not facet["change"]:
+            facet["change"] = str(change.get("approach") or change.get("intent") or "").strip()
 
     # ---------- 3) 合并 draft tasks（稳定排序）
     def _task_sort_key(t: dict) -> tuple:
@@ -403,30 +439,53 @@ def normalize_plan(
             unit = _unit(f)
             if tid and tid not in unit["source_task_ids"]:
                 unit["source_task_ids"].append(tid)
-            unit["symbols"].extend(buckets.get(f) or [])
-            # 来源追溯：多张图改同一文件时，逐条记录是"谁提的"
-            for key in ("change", "acceptance"):
-                val = task.get(key)
-                if key == "acceptance" and not isinstance(val, str):
-                    continue
-                if isinstance(val, str) and val.strip():
-                    if key == "change" and not unit["change"]:
-                        unit["change"] = val.strip()
-                    if key == "acceptance":
-                        unit["acceptance"].append({"text": val.strip(), "source": tid or "draft"})
+            bucket_syms = buckets.get(f) or []
+            unit["symbols"].extend(bucket_syms)
+            # task 级 facet（v3）：该 draft 图对**这一个文件**的全部字段原样留存，
+            # 不再被同文件其它图的 first-wins 合并污染（run 20260929-093329 的漂移点）。
+            contracts = task.get("contracts")
+            facet_contracts = contracts if isinstance(contracts, dict) else {}
+            dep_ids = [
+                str(d).strip() for d in _as_list(task.get("depends_on")) if str(d).strip()
+            ]
+            facet_acceptance = str(task.get("acceptance") or "").strip()
+            unit["work_units"].append(
+                {
+                    "source": tid or "draft",
+                    "symbols": list(bucket_syms),
+                    "change": str(task.get("change") or "").strip(),
+                    "acceptance": (
+                        [{"text": facet_acceptance, "source": tid or "draft"}]
+                        if facet_acceptance
+                        else []
+                    ),
+                    "interface": str(task.get("interface") or "").strip(),
+                    "test_hint": str(task.get("test_hint") or "").strip(),
+                    "constraints": _dedup(_as_list(task.get("constraints"))),
+                    "deps_raw": dep_ids,
+                    "uses_raw": _dedup(_as_list(facet_contracts.get("uses"))),
+                    "exposes_raw": _dedup(_as_list(facet_contracts.get("exposes"))),
+                    # uses/exposes 在定稿阶段按 unit 级解析结果回填
+                    "uses": [],
+                    "exposes": [],
+                }
+            )
+            # 来源追溯：多张图改同一文件时，逐条记录是"谁提的"（file 级聚合保留，供旧消费方）
+            if str(task.get("change") or "").strip() and not unit["change"]:
+                unit["change"] = str(task["change"]).strip()
+            if facet_acceptance:
+                unit["acceptance"].append({"text": facet_acceptance, "source": tid or "draft"})
             if str(task.get("test_hint") or "").strip() and not unit["test_hint"]:
                 unit["test_hint"] = str(task["test_hint"]).strip()
             if str(task.get("interface") or "").strip() and not unit["interface"]:
                 unit["interface"] = str(task["interface"]).strip()
             if str(task.get("data_model") or "").strip() and not unit["data_model"]:
+                # data_model 是**文件级**事实（表结构只可能有一版），允许 file 级 first-wins 合并
                 unit["data_model"] = str(task["data_model"]).strip()
             unit["constraints"].extend(
                 str(s).strip() for s in _as_list(task.get("constraints")) if str(s).strip()
             )
-            unit["_declared"].extend(buckets.get(f) or [])
-            dep_ids = [
-                str(d).strip() for d in _as_list(task.get("depends_on")) if str(d).strip()
-            ]
+            unit["_declared"].extend(bucket_syms)
             unit["depends_on"].extend(dep_ids)
             # **自依赖取证**：draft 图 T 声明 depends_on 含 T 自己，是方案层的硬错误，
             # 编译器据此报 self_dependency。必须在合并前留证 —— 合并后只剩 unit 聚合，
@@ -434,7 +493,6 @@ def normalize_plan(
             # 变成自引用（合并的机械副产物，应静默滤掉）」。
             if tid and tid in dep_ids and tid not in unit["self_depends"]:
                 unit["self_depends"].append(tid)
-            contracts = task.get("contracts")
             if isinstance(contracts, dict):
                 for key in ("uses", "exposes"):
                     unit["contracts"][key].extend(
@@ -464,10 +522,48 @@ def normalize_plan(
         unit["symbols"] = sorted(kept, key=_symbol_sort_key(skel_order))
         unit.pop("_declared", None)
 
+        # facet 定稿：符号按同一套最长匹配结果归位（被父符号覆盖的同样从 facet 剔除），
+        # 顺序与 unit.symbols 的排序口径一致（单 facet 场景出图必须与 v2 完全相同）。
+        kept_set = set(kept)
+        # 双源去重：changes[].symbols 是**边界声明**，draft tasks 才是可施工的拆解。
+        # 同一符号两边都写时（真机常态），归属 draft facet —— 否则 @changes 会多出
+        # 一组重复图，同一符号被两张图各实现一遍。@changes 只保留 draft 没覆盖的符号。
+        draft_owned: set[str] = set()
+        for wu in unit["work_units"]:
+            if wu.get("source") == "@changes":
+                continue
+            draft_owned.update(
+                s for s in _dedup(symbol_resolver.clean_symbol(x) for x in _as_list(wu.get("symbols")))
+                if s in kept_set
+            )
+        for wu_order, wu in enumerate(unit["work_units"]):
+            wu_syms = _dedup(symbol_resolver.clean_symbol(s) for s in _as_list(wu.get("symbols")))
+            wu_syms = [s for s in wu_syms if s in kept_set]
+            if wu.get("source") == "@changes" and draft_owned:
+                wu_syms = [s for s in wu_syms if s not in draft_owned]
+            wu["symbols"] = sorted(wu_syms, key=_symbol_sort_key(skel_order))
+            wu["constraints"] = _dedup(wu.get("constraints"))
+            wu["deps_raw"] = _dedup(wu.get("deps_raw"))
+            wu["uses_raw"] = _dedup(wu.get("uses_raw"))
+            wu["exposes_raw"] = _dedup(wu.get("exposes_raw"))
+            wu["order"] = wu_order
+
         uses = _dedup(unit["contracts"]["uses"])
         unit["contracts"]["uses"] = uses
         unit["contracts"]["exposes"] = _dedup(unit["contracts"]["exposes"])
-        resolved = [dict(symbol_resolver.resolve(s, files=[path], index=index), role="uses") for s in uses]
+        # 同一 raw use 在 unit 级只解析一次，facet 按原文回填解析结果 —— 解析口径
+        # 必须全文件唯一，否则同一条 uses 在两张图上解析成两个目标，契约又漂了。
+        resolution = {
+            s: dict(symbol_resolver.resolve(s, files=[path], index=index), role="uses")
+            for s in uses
+        }
+        resolved = list(resolution.values())
+        resolved_name = {
+            raw: str(row.get("symbol")) for raw, row in resolution.items() if row.get("resolved")
+        }
+        for wu in unit["work_units"]:
+            wu["uses"] = _dedup(resolved_name[raw] for raw in wu["uses_raw"] if raw in resolved_name)
+            wu["exposes"] = list(wu["exposes_raw"])
         unit["uses_resolved"] = resolved
         unit["unresolved"] = symbol_resolver.unresolved_warnings(resolved)
         # 外部依赖（标准库/第三方）单独记：它们是**合法**依赖，只是不参与

@@ -499,21 +499,44 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
             "；".join(str(x) for x in (test_audit.get("vague_expected") or [])),
         )
     if test_audit.get("missing_symbols"):
-        # 「写了很多用例」≠「测到了改动之处」。
-        # 已在 coverage_gaps 里交代过原因的算豁免（info）；没交代的属漏测 —— 那条
-        # 由 _test_blockers 强制 rework，这里也按 warn 记一笔，便于事后统计。
+        # 二级覆盖（优化建议§十七，run 20260929-093329）：符号漏测降为**提示级** ——
+        # 内部 helper 没有单独用例不是缺陷，业务用例自然带到即可；强制 rework 只会
+        # 逼模型编造无价值用例。一级覆盖（业务行为）在下方单独记。
         unexplained = {str(s) for s in (test_audit.get("missing_unexplained") or [])}
         add(
-            "test_gap", "test", "warn" if unexplained else "info", "system",
-            f"本次改动的 {len(test_audit['missing_symbols'])} 个符号没出现在任何用例中："
+            "test_gap", "test", "info", "system",
+            f"本次改动的 {len(test_audit['missing_symbols'])} 个符号没出现在任何用例中"
+            "（二级参考，提示级）："
             + "、".join(str(s) for s in test_audit["missing_symbols"]),
-            "编排器机械核对：用例 target 要写到符号级，写文件名会与补丁的 target_symbol 对不上；"
+            "业务行为覆盖优先于符号覆盖，内部 helper 靠业务用例自然带到即可；"
             + (
-                f"其中 {len(unexplained)} 个未在 coverage_gaps 申诉 → 强制 rework"
+                f"其中 {len(unexplained)} 个未在 coverage_gaps 申诉（仅提示，不再阻断）"
                 if unexplained
-                else "（均已在 coverage_gaps 里交代原因，视为豁免）"
+                else "均已在 coverage_gaps 里交代原因"
             ),
         )
+    behavior_total = test_audit.get("behavior_count") or 0
+    behavior_missing = test_audit.get("missing_behaviors") or []
+    if behavior_total and behavior_missing:
+        labels = [
+            str(b.get("id") or b.get("text") or "")[:30]
+            for b in behavior_missing[:5]
+            if isinstance(b, dict)
+        ]
+        if not test_audit.get("covered_behaviors"):
+            # 一级覆盖整体脱锚：_test_blockers 已据此强制返工，这里留 warn 便于事后追踪。
+            add(
+                "test_gap", "test", "warn", "system",
+                f"业务行为整体脱锚：{behavior_total} 条 FR / 验收口径没有一条被用例覆盖",
+                "未对上的行为：" + "、".join(x for x in labels if x),
+            )
+        else:
+            add(
+                "test_gap", "test", "info", "system",
+                f"部分业务行为未见对应用例：{len(behavior_missing)}/{behavior_total} 条"
+                "（提示级，请评审判断是否要补）",
+                "、".join(x for x in labels if x),
+            )
     scope = artifacts.get("scope") or {}
     for item in scope.get("unknowns") or []:
         add("pm_unknown", "pm", "info", "model", f"需求未决：{item}")

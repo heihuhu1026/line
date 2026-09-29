@@ -47,7 +47,11 @@ def _chunk(items: list[str], size: int) -> list[list[str]]:
 
 
 def compile_plan(
-    plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK, ir: Any = None
+    plan: Any,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_TASK,
+    ir: Any = None,
+    existing_files: set[str] | None = None,
 ) -> dict:
     """编译入口（**带错误通道**）：返回 ``{"tasks": [...], "errors": [...]}``。
 
@@ -57,6 +61,12 @@ def compile_plan(
     的真实 bug：9/10 个符号被切成 5 个一张），而是照常切出合格的图、同时在 ``errors``
     里报 ``task_capacity_exceeded`` —— 由上游 Design Gate 决定回架构师重拆还是转人工，
     绝不带一张超限的图进开发。
+
+    ``existing_files``：编译时刻仓库里**已存在**的文件相对路径集合。不在集合里的文件
+    是本次方案要新建的 —— 其 DAG 第一张图被标 ``creates_file: true``（**文件创建租约**
+    的唯一 owner，run 20260929-093329：同文件 4 张图都整份 add，合并互相覆盖、modify
+    全部 anchor 落空）。为 None（旧调用 / 单测，信息未知）时按全新项目处理：每个文件
+    第一张图都是 owner。
     """
     units = [
         u for u in ((ir or {}).get("units") or []) if isinstance(u, dict) and _norm(u.get("file"))
@@ -65,14 +75,43 @@ def compile_plan(
         tasks, errors = _compile_from_units(units, max_symbols=max_symbols)
     else:
         tasks, errors = _compile_from_changes(plan, max_symbols=max_symbols)
+    _annotate_create_owners(tasks, existing_files)
     return {"tasks": tasks, "errors": errors}
 
 
 def compile_tasks(
-    plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK, ir: Any = None
+    plan: Any,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_TASK,
+    ir: Any = None,
+    existing_files: set[str] | None = None,
 ) -> list[dict]:
     """兼容包装：只要施工图（容量错误走 :func:`compile_plan` 的 ``errors``）。"""
-    return compile_plan(plan, max_symbols=max_symbols, ir=ir)["tasks"]
+    return compile_plan(
+        plan, max_symbols=max_symbols, ir=ir, existing_files=existing_files
+    )["tasks"]
+
+
+def _annotate_create_owners(tasks: list[dict], existing_files: set[str] | None) -> None:
+    """**文件创建租约**（G3）：每个新建文件的第一张施工图标记 ``creates_file: true``。
+
+    只认 DAG 排序后的**第一张**（tasks 已是拓扑序；同文件顺序边保证 owner 先施工）：
+    owner 有权整份新建（含文件头 import），其余同文件图只能在**在制文件**上定点增补；
+    非 owner 的 ``add`` 整份重写由 orchestrator 机械丢弃。仓库已存在的文件不发租约
+    （所有图天然都是 modify）。确定性：同输入同标注（不依赖 dict 序）。
+    """
+    existing = {_norm(p) for p in (existing_files or set())}
+    known = existing_files is not None
+    owned: set[str] = set()
+    for task in tasks:
+        for p in (task.get("target_files") or []):
+            path = _norm(p)
+            if not path or path in owned:
+                continue
+            if known and path in existing:
+                continue  # 存量文件：没有"创建"动作，不设 owner
+            task["creates_file"] = True
+            owned.add(path)
 
 
 def _dedup(items: Any) -> list[str]:
@@ -121,6 +160,34 @@ def _acceptance_text(raw: Any, path: str, group: list[str]) -> str:
     return f"{path} 可被导入，且承载 intent 描述的能力"
 
 
+def _facet_segments(unit: dict, symbols: list[str], max_symbols: int) -> list[tuple[list[str], dict | None]]:
+    """把一个 file unit 切成 ``[(符号组, 源 facet)]``。
+
+    v3：优先按 ``work_units``（task 级 facet）切 —— 每张图只继承**产生这些符号的那张
+    draft 图**的 change/interface/contracts/acceptance/constraints/test_hint；同文件
+    多图之间不再 first-wins 串味（run 20260929-093329）。没有符号的 facet 不出图
+    （它的符号都归到了同任务的其它文件）。v2 IR / changes 兼容路径退化为整文件切分。
+    """
+    wus = [w for w in (unit.get("work_units") or []) if isinstance(w, dict)]
+    segments: list[tuple[list[str], dict | None]] = []
+    seen_symbols: list[str] = []
+    for wu in wus:
+        wu_symbols = [str(s).strip() for s in (wu.get("symbols") or []) if str(s).strip()]
+        for chunk in _chunk(wu_symbols, max_symbols):
+            if chunk:
+                segments.append((chunk, wu))
+                seen_symbols.extend(chunk)
+    # 兜底：facet 的符号并集与 unit.symbols 不一致（旧版 IR、或手写 IR）时，
+    # 漏掉的符号仍按 v2 口径补成无 facet 的组，绝不静默丢符号。
+    missing = [s for s in symbols if s not in seen_symbols]
+    if missing:
+        for chunk in _chunk(missing, max_symbols):
+            segments.append((chunk, None))
+    if not segments:
+        segments = [(chunk, None) for chunk in _split_groups(symbols, max_symbols)]
+    return segments
+
+
 def _compile_from_units(
     units: list[dict], *, max_symbols: int
 ) -> tuple[list[dict], list[dict]]:
@@ -131,35 +198,39 @@ def _compile_from_units(
     seq = 0
     id_map: dict[str, list[str]] = {}
     file_tasks: dict[str, list[str]] = {}
-    pending: list[tuple[dict, list[str], dict]] = []
+    pending: list[tuple[dict, list[str], dict, dict | None]] = []
     for unit in units:
         path = _norm(unit.get("file"))
         symbols = [str(s).strip() for s in (unit.get("symbols") or []) if str(s).strip()]
-        change_text = str(unit.get("change") or "").strip() or f"按设计实现 {path}"
         # 施工图字段**原样传给 dev**：这些是方案阶段好不容易补上的信息，
-        # 编译器不得丢失（丢了 dev 就只能猜，跨文件接口必然对不上）
-        hints = {
+        # 编译器不得丢失（丢了 dev 就只能猜，跨文件接口必然对不上）。
+        # 注意 data_model / unresolved_uses 是**文件级**事实（表结构只有一版、
+        # 禁用项对全文件生效），挂给该文件每张图；interface/contracts/constraints
+        # 已改为 facet 级，不再在这里整文件下发。
+        file_hints = {
             key: unit.get(key)
-            for key in ("interface", "contracts", "data_model", "constraints", "unresolved_uses")
+            for key in ("data_model", "unresolved_uses")
             if unit.get(key) not in (None, "", [], {})
         }
-        groups = _split_groups(symbols, max_symbols)
-        if len(groups) > MAX_TASKS_PER_FILE:
-            # 容量冲突**显式报错**：该文件的符号总量装不进「最多 N 张图 × 每张 M 个符号」。
-            # 正确解法在方案层（重拆到更多文件 / 调整文件边界），编译器无权替架构师做这个决定。
+        segments = _facet_segments(unit, symbols, max_symbols)
+        # 容量按**符号总量**判，不再按 facet 切出的图数判：v3 保留架构师对同文件的
+        # 多任务拆解（同文件顺序施工是受支持的形态，见文件创建租约），8 个符号分 4 张
+        # facet 图与分 2 张图，dev 工作量相同、且每张图仍 ≤max_symbols，不该阻断。
+        # 真正超的是单文件符号总量（>上限张数×单图上限），那才是文件边界要重拆。
+        symbol_capacity = MAX_TASKS_PER_FILE * max_symbols
+        if len(symbols) > symbol_capacity:
             errors.append(
                 {
                     "code": "task_capacity_exceeded",
                     "file": path,
                     "symbols": len(symbols),
-                    "tasks_needed": len(groups),
+                    "tasks_needed": len(segments),
                     "max_tasks_per_file": MAX_TASKS_PER_FILE,
                     "max_symbols_per_task": max_symbols,
                     "detail": (
-                        f"{path} 声明 {len(symbols)} 个符号，按单图 ≤{max_symbols} 需要 "
-                        f"{len(groups)} 张图，超过单文件上限 {MAX_TASKS_PER_FILE} 张"
-                        f"（容量 {MAX_TASKS_PER_FILE * max_symbols} 个符号）"
-                        " —— 需架构师重拆文件边界或合并符号"
+                        f"{path} 声明 {len(symbols)} 个符号，超过单文件容量 {symbol_capacity}"
+                        f"（{MAX_TASKS_PER_FILE} 张图 × 每张 {max_symbols} 个符号；当前需 "
+                        f"{len(segments)} 张图）—— 需架构师重拆文件边界或合并符号"
                     ),
                 }
             )
@@ -176,41 +247,87 @@ def _compile_from_units(
                 }
             )
         new_ids: list[str] = []
+        unit_has_facets = any(facet is not None for _group, facet in segments)
         # 只保留**跨 unit** 的 draft 依赖参与建边：
         #  · 自依赖（self_ids）：方案硬错误，上面已登记，且不能映成边（多图时会造幻影反向边）；
         #  · 同一 unit 内部的 draft 互依（T-02/T-03 合并后符号被重新分组，对应关系已不存在）：
         #    静默丢弃 —— 组间顺序由「同文件顺序边」承担，映成"所有组互依"反而会造假环。
         source_ids = set(_dedup(unit.get("source_task_ids")))
-        raw_deps = [
+        unit_raw_deps = [
             d for d in _dedup(unit.get("depends_on"))
             if d not in self_ids and d not in source_ids
         ]
-        for group in groups:
+        for group, facet in segments:
             seq += 1
             tid = f"T-{seq:02d}"
             new_ids.append(tid)
+            # ---- facet 级字段：只带产生本组符号的那张 draft 图的内容（v3）
+            if facet is not None:
+                change_text = str(facet.get("change") or "").strip()
+                if not change_text and str(facet.get("source") or "") == "@changes":
+                    # changes facet 的 change 为空时退回 file 级 approach/intent
+                    change_text = str(unit.get("change") or "").strip()
+                acceptance = _acceptance_text(facet.get("acceptance"), path, group)
+                interface = str(facet.get("interface") or "").strip()
+                constraints = _dedup(facet.get("constraints"))
+                test_hint = str(facet.get("test_hint") or "").strip()
+                uses = _dedup((facet.get("contracts") or {}).get("uses")) if isinstance(facet.get("contracts"), dict) else []
+                exposes = _dedup((facet.get("contracts") or {}).get("exposes")) if isinstance(facet.get("contracts"), dict) else []
+                if not uses and not exposes:
+                    uses = _dedup(facet.get("uses"))
+                    exposes = _dedup(facet.get("exposes"))
+                facet_source = str(facet.get("source") or "")
+                facet_deps = [
+                    d for d in _dedup(facet.get("deps_raw"))
+                    if d not in self_ids and d not in source_ids
+                ]
+            else:
+                change_text = str(unit.get("change") or "").strip()
+                acceptance = _acceptance_text(unit.get("acceptance"), path, group)
+                interface = str(unit.get("interface") or "").strip()
+                constraints = _dedup(unit.get("constraints"))
+                test_hint = str(unit.get("test_hint") or "").strip()
+                uses = _dedup((unit.get("contracts") or {}).get("uses"))
+                exposes = _dedup((unit.get("contracts") or {}).get("exposes"))
+                facet_source = ""
+                facet_deps = unit_raw_deps
             task: dict[str, Any] = {
                 "id": tid,
                 "title": f"实现 {path} 的 {'、'.join(group)}" if group else f"实现 {path}",
-                "change": change_text,
+                "change": change_text or f"按设计实现 {path}",
                 "target_files": [path],
-                "acceptance": _acceptance_text(unit.get("acceptance"), path, group),
+                "acceptance": acceptance,
                 "symbols": list(group),
                 "depends_on": [],
                 # 跨轮**稳定身份**：task id 会被重编号（方案一重做就变），
                 # 「哪些图没变」与归因必须建在不随编号漂移的东西上（见 planir.stable_id）
                 "stable_id": f"{path}::{sorted(group)[0]}" if group else f"{path}::<whole-file>",
             }
-            if unit.get("test_hint"):
-                task["test_hint"] = str(unit["test_hint"])
+            if test_hint:
+                task["test_hint"] = test_hint
             elif path.endswith(".py"):
                 task["test_hint"] = f'python -c "import {_module_of(path)}"'
-            for key, val in hints.items():
+            if interface:
+                task["interface"] = interface
+            if constraints:
+                task["constraints"] = constraints
+            if uses or exposes:
+                task["contracts"] = {"uses": uses, "exposes": exposes}
+            for key, val in file_hints.items():
                 task.setdefault(key, val)
             tasks.append(task)
             file_tasks.setdefault(path, []).append(tid)
-            pending.append((task, raw_deps, unit))
-        for key in _dedup([*(unit.get("source_task_ids") or []), str(unit.get("stable_id") or "")]):
+            pending.append((task, facet_deps, unit, facet if facet is not None and facet_source else None))
+            # draft 原图 id → **它自己 facet 切出的图**（v3：不再把依赖挂给同文件
+            # 其它图；同文件先后由顺序边保证）。无 facet（v2 兼容）维持全量映射。
+            if facet_source and facet_source != "@changes":
+                id_map.setdefault(facet_source, []).extend([tid])
+        # stable_id 始终映射整 unit；draft 原图 id 只在**无 facet（v2 兼容）**时
+        # 映射整 unit（v3 下它们在上面各自只映射自己 facet 的图）。
+        mapped_keys = [str(unit.get("stable_id") or "")]
+        if not unit_has_facets:
+            mapped_keys.extend(source_ids)
+        for key in _dedup(mapped_keys):
             id_map.setdefault(key, []).extend(new_ids)
     tasks, dep_errors = _assemble_dependency_dag(tasks, pending, id_map, file_tasks)
     errors.extend(dep_errors)
@@ -219,7 +336,7 @@ def _compile_from_units(
 
 def _assemble_dependency_dag(
     tasks: list[dict],
-    pending: list[tuple[dict, list[str], dict]],
+    pending: list[tuple[dict, list[str], dict, dict | None]],
     id_map: dict[str, list[str]],
     file_tasks: dict[str, list[str]],
 ) -> tuple[list[dict], list[dict]]:
@@ -247,11 +364,15 @@ def _assemble_dependency_dag(
             bucket.append(why)
 
     # 编译后编号 → 模型原图任务 id（编号会重排，给模型看的指引必须能对回它自己的图）。
+    # v3：有 facet 的图精确对到**它自己的源图**，不再整 unit 混报。
     source_of: dict[str, list[str]] = {}
-    for task, deps, unit in pending:
+    for task, deps, unit, facet in pending:
         path = _norm(unit.get("file"))
         tid = str(task.get("id"))
-        src_ids = [str(x) for x in _dedup(unit.get("source_task_ids"))]
+        if facet is not None and str(facet.get("source") or "") not in ("", "@changes"):
+            src_ids = [str(facet.get("source"))]
+        else:
+            src_ids = [str(x) for x in _dedup(unit.get("source_task_ids"))]
         if src_ids:
             source_of[tid] = src_ids
         edges: set[str] = set()

@@ -1136,11 +1136,54 @@ class Orchestrator:
         # 归一 —— 否则 02-pm.json 存的是原始产物，续跑时 _restore 拿快照覆盖 state，
         # 被剔除的技术问题原样复活（真机 run 20260928-180933：归一后的 state 被
         # 含 5 条问题的快照覆盖，「数据库表结构」重新下发给下游）。
+        pm_parts = prompts.parts_pm(requirement, self.state.get("intake"))
         self.state["scope"] = self._call(
             "pm",
-            prompts.parts_pm(requirement, self.state.get("intake")),
+            pm_parts,
             post=lambda data: prompts.normalize_pm_questions(data, log=self.log),
         )
+        # ---- 裁决一致性机械校验（P0①，run 20260929-093329）
+        # PM 产物可能自相矛盾：open_questions 已裁决「不自动重排序号」，同一份产物的
+        # FR 验收却写「删除后序号自动重置」。矛盾一旦进下游就是双向必错，提示词管不住
+        # 相隔很远的两段文本 —— 这里先给 PM **一次**确定性返工；返工后仍冲突的，
+        # 由 PM 条件闸门暂停交人工（见 _conditional_gate），下游提示词另有"以裁决为准"
+        # 的下钉兜底（pm_assumptions_block）。mock 不做（占位产物，测流程不测内容）。
+        if not isinstance(self.client, MockClient):
+            conflicts = prompts.pm_decision_conflicts(self.state.get("scope"))
+            if conflicts:
+                lines = prompts.pm_decision_conflict_lines(conflicts)
+                self.log(
+                    f"        [裁决一致性] 发现 {len(conflicts)} 处裁决与需求/验收极性冲突 → 让 PM 修正一次"
+                )
+                fix_block = (
+                    "【上一版存在自相矛盾，必须修正】\n"
+                    + "\n".join(lines)
+                    + "\n人工裁决是最高基准：请修改与之矛盾的功能需求/验收标准文本"
+                    "（使陈述与裁决结论一致），open_questions 的 final_decision 与 "
+                    "confirmed_facts **保持原样不得改动**；其余内容不要重做。"
+                )
+                baseline = self.state.get("scope")
+                try:
+                    self.state["scope"] = self._call(
+                        "pm",
+                        [*pm_parts, fix_block],
+                        note="pm·裁决一致性",
+                        post=lambda data: prompts.normalize_pm_questions(data, log=self.log),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # 返工调用失败不该跑崩整轮：保留首版，冲突留给人工闸门。
+                    self.state["scope"] = baseline
+                    self.log(
+                        f"        [裁决一致性] 返工调用失败（{type(exc).__name__}：{str(exc)[:80]}）"
+                        "→ 保留首版，冲突交人工闸门"
+                    )
+                left = prompts.pm_decision_conflicts(self.state.get("scope"))
+                if left:
+                    self.log(
+                        f"        [裁决一致性] 返工后仍有 {len(left)} 处冲突 → PM 闸门暂停，交人工裁决"
+                    )
+                else:
+                    self.log("        [裁决一致性] 返工后冲突已消除")
         return self.state["scope"]
 
     def _stage_assess(self, requirement: str) -> Any:
@@ -1382,7 +1425,9 @@ class Orchestrator:
             draft = plan_obj.get("tasks")
             if draft:
                 self.state["plan_draft_tasks"] = draft
-        result = taskcompiler.compile_plan(plan_obj, ir=ir)
+        result = taskcompiler.compile_plan(
+            plan_obj, ir=ir, existing_files=self._existing_repo_files()
+        )
         errors = list(result.get("errors") or [])
         compiled = list(result.get("tasks") or [])
         self.state["plan_compile_errors"] = errors
@@ -1895,6 +1940,9 @@ class Orchestrator:
         return out
 
     def _stage_dev(self, requirement: str, fixes: list[str] | None = None) -> Any:
+        # 先作废旧的在制工作区引用：本轮缺陷单 / 首图 current_code 必须以上一轮
+        # verify 沙箱为准；新的 dev-wip 在 _dev_by_tasks 开头重建（G4）。
+        self._wip_dir = None
         prev = self.state.get("implementation") or {}
         # 「这一轮让哪些符号消失了」——必须在下面覆盖 `implementation_symbols_prev` **之前**
         # 算出来：它是"上上轮有、上一轮没了"的差集，也就是返工退化的实证。
@@ -2443,18 +2491,32 @@ class Orchestrator:
         ]
         touched = {str(e.get("path") or "").replace("\\", "/") for e in edits}
         candidates: list[tuple[str, str]] = []
+        seen_rel: set[str] = set()
+
+        def _scan_dir(folder: Path) -> None:
+            # **先扫的优先**：dev 在制工作区（本轮前序施工图的真实产物，G4）比
+            # verify/work（上一轮的沙箱）更贴近"当前项目已有代码"；同路径只取第一份。
+            if not folder.is_dir():
+                return
+            for path in sorted(p for p in folder.rglob("*") if p.is_file()):
+                if "__pycache__" in path.parts or path.suffix.lower() not in _CURRENT_CODE_SUFFIXES:
+                    continue
+                rel = str(path.relative_to(folder)).replace("\\", "/")
+                if rel in seen_rel:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if text.strip():
+                    candidates.append((rel, text))
+                    seen_rel.add(rel)
+
+        wip = getattr(self, "_wip_dir", None)
+        if wip is not None:
+            _scan_dir(wip)
         if self.run_dir is not None:
-            work = self.run_dir / "verify" / "work"
-            if work.is_dir():
-                for path in sorted(p for p in work.rglob("*") if p.is_file()):
-                    if "__pycache__" in path.parts or path.suffix.lower() not in _CURRENT_CODE_SUFFIXES:
-                        continue
-                    try:
-                        text = path.read_text(encoding="utf-8", errors="replace")
-                    except OSError:
-                        continue
-                    if text.strip():
-                        candidates.append((str(path.relative_to(work)).replace("\\", "/"), text))
+            _scan_dir(self.run_dir / "verify" / "work")
         if not candidates:
             for edit in edits:
                 body = str(edit.get("patch") or "")
@@ -2612,6 +2674,308 @@ class Orchestrator:
             {str(item.get("path") or "") for item in report.get("files") or []} - {""}
         )
         return (probe, written) if written else None
+
+    # ===================== 文件创建租约 + 任务事务点（G3/G4） =====================
+    # 真机 run 20260929-093329 的两处机械失效：
+    #   ① T-01~T-04 对同一个新文件 main.py 都交 change_type=add 整份正文（target_symbol
+    #      全是模块名占位 "main"），物化时 new_file 块合并互相覆盖；它们本该用的 3 条
+    #      modify 又因 anchor 对不上被 prune —— 最终文件只剩一个任务的内容；
+    #   ② 后做的任务看不到前面任务刚写出来的文件（current_code 只读仓库原件 / 上一轮
+    #      verify 沙箱），于是只能再整份重写一遍。
+    # 机制：编译期给每个新文件定唯一 create owner（taskcompiler._annotate_create_owners）；
+    # dev 逐图施工时在 ``dev-wip/`` 在制工作区累积物化，非 owner 的整份 add 机械丢弃，
+    # 每图过一次 py_compile，失败带错误只重问一次。mock 路径不启用（测流程不测内容）。
+
+    def _existing_repo_files(self) -> set[str] | None:
+        """编译时刻仓库**已存在**的文件相对路径集合；没有仓库（全新项目）返回 None。
+
+        None 是有意区分的三值：编译器据此把所有文件当新建（首图领创建租约）；
+        空集合表示仓库存在但为空（同为全新项目语义）。
+        """
+        if not self.repo:
+            return None
+        repo = Path(self.repo)
+        if not repo.is_dir():
+            return None
+        out: set[str] = set()
+        for p in repo.rglob("*"):
+            if not p.is_file() or "__pycache__" in p.parts:
+                continue
+            if any(part in VERIFY_SKIP_DIRS for part in p.relative_to(repo).parts):
+                continue
+            try:
+                out.add(str(p.relative_to(repo)).replace("\\", "/"))
+            except ValueError:
+                continue
+        return out
+
+    def _wip_init(self) -> None:
+        """初始化本轮的**在制工作区**基线 ``runs/<id>/dev-wip-base`` + 工作区 ``dev-wip``。
+
+        每次物化都从基线**整份重放**（不是把补丁往旧结果上叠）：否则 owner 那条
+        change_type=add 整份新建在文件已存在后会被判 anchor_not_found，后续每个任务
+        都收到一条假的"补丁未能套用"。语义与 verify.materialize 完全同源：
+        audit 基准=base（仓库 + 上一轮产物种子），out_dir=wip（base 的副本），
+        新文件走 new_file 块合并、modify 打在合并结果上。
+
+        第二轮起：上一轮 verify 沙箱（verify/work）里、属于上一版实现产物的文件
+        （implementation.edits 的路径，**不含** test 阶段的测试文件）补种子进基线 ——
+        否则返工轮的 modify 补丁在空基准上必然 anchor 落空。
+        """
+        self._wip_dir: Path | None = None
+        self._wip_base: Path | None = None
+        if self.run_dir is None:
+            return
+        base = self.run_dir / "dev-wip-base"
+        wip = self.run_dir / "dev-wip"
+        shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(wip, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        if self.repo and Path(self.repo).is_dir():
+            try:
+                verify_mod._copy_tree(
+                    Path(self.repo),
+                    base,
+                    VERIFY_COPY_LIMIT_MB * 1024 * 1024,
+                    VERIFY_SKIP_DIRS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"        [在制工作区] 仓库复制失败，按空目录起步：{type(exc).__name__}: {exc}")
+        prev_work = self.run_dir / "verify" / "work"
+        prev_impl = self.state.get("implementation")
+        if prev_work.is_dir() and isinstance(prev_impl, dict):
+            for e in (prev_impl.get("edits") or []):
+                if not isinstance(e, dict):
+                    continue
+                rel = str(e.get("path") or "").replace("\\", "/").strip()
+                if not rel:
+                    continue
+                src, dst = prev_work / rel, base / rel
+                try:
+                    if src.is_file() and not dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+                except OSError:
+                    continue
+        self._wip_base = base
+        self._wip_dir = wip
+
+    def _wip_materialize(self, impl: Any) -> dict:
+        """从基线**整份重放**累积实现到在制工作区。
+
+        返回 ``{"written": [相对路径], "problems": [人话问题]}``：problems 含
+        ① 新文件内容本身语法错误（analyze 判 ``new_file_syntax_error``，根本没写盘）
+        ② 非幂等的补丁套用跳过（anchor 落空等）——这些与 py_compile 一样是事务点要
+        带回去重问的机械事实（口径对齐 verify.materialize）。失败静默降级。
+        """
+        empty = {"written": [], "problems": []}
+        wip = getattr(self, "_wip_dir", None)
+        base = getattr(self, "_wip_base", None)
+        if wip is None or base is None or not isinstance(impl, dict):
+            return empty
+        if not isinstance(impl.get("edits"), list):
+            return empty
+        # 重放：工作区还原成基线副本，避免"上一次物化的结果"污染本轮审计口径。
+        shutil.rmtree(wip, ignore_errors=True)
+        try:
+            shutil.copytree(base, wip)
+            audit = patches.analyze_all(base, impl)
+            report = patches.apply_all(base, impl, audit, in_place=False, out_dir=wip)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"        [在制工作区] 物化失败，跳过：{type(exc).__name__}: {exc}")
+            return empty
+        written = sorted({str(item.get("path") or "") for item in report.get("files") or []} - {""})
+        problems: list[str] = []
+        syntax_error_paths: set[str] = set()
+        for row in (audit.get("edits") or []):
+            if isinstance(row, dict) and str(row.get("status") or "") == "new_file_syntax_error":
+                syntax_error_paths.add(str(row.get("path") or ""))
+                problems.append(
+                    f"新文件 {row.get('path')} 内容有语法错误，未能写入在制工作区"
+                    f"（{str(row.get('detail') or '')[:160]}）"
+                )
+        for skip in (report.get("skipped") or []):
+            if not isinstance(skip, dict) or patches.is_benign_skip(skip):
+                continue
+                if str(skip.get("path") or "") in syntax_error_paths:
+                    continue
+                problems.append(
+                    f"补丁未能套用到 {skip.get('path') or '?'}：{str(skip.get('reason') or '')[:200]}"
+                )
+        return {"written": written, "problems": problems}
+
+    @staticmethod
+    def _file_owner_map(tasks: list[dict]) -> dict[str, str]:
+        """``{文件相对路径: 创建租约 owner 任务 id}``（取编译器标注的 creates_file）。"""
+        owners: dict[str, str] = {}
+        for t in tasks or []:
+            if not isinstance(t, dict) or not t.get("creates_file"):
+                continue
+            tid = str(t.get("id") or "").strip()
+            for p in (t.get("target_files") or []):
+                path = str(p or "").replace("\\", "/").strip()
+                if path and tid and path not in owners:
+                    owners[path] = tid
+        return owners
+
+    def _enforce_file_lease(self, task: dict, data: Any, owner_map: dict[str, str]) -> list[str]:
+        """**文件创建租约执法**（G3）：丢弃非 owner 任务对租约文件的整份重写补丁。
+
+        判据刻意收窄，宁可漏判不可误杀合法补丁：
+          · change_type 必须是 add；
+          · target_symbol 为空或等于文件模块名（真机四份 main.py 全是 ``sym="main"``
+            这种"整文件占位"写法）——非 owner 给**自己负责的符号**交 add/full_symbol
+            （如 sym=``list``）是合法的定点新增，必须放行。
+        """
+        if isinstance(self.client, MockClient) or not isinstance(data, dict):
+            return []
+        edits = data.get("edits")
+        if not isinstance(edits, list):
+            return []
+        tid = str(task.get("id") or "").strip()
+        kept: list[dict] = []
+        violations: list[str] = []
+        for e in edits:
+            if not isinstance(e, dict):
+                continue
+            path = str(e.get("path") or "").replace("\\", "/").strip()
+            owner = owner_map.get(path)
+            sym = str(e.get("target_symbol") or "").strip().strip("`").rstrip("()")
+            is_whole_rewrite = bool(
+                owner
+                and owner != tid
+                and str(e.get("change_type") or "").strip() == "add"
+                and (not sym or sym == Path(path).stem)
+            )
+            if is_whole_rewrite:
+                violations.append(
+                    f"{path} 的创建租约属于 {owner}：本任务（{tid}）提交的 change_type=add "
+                    f"整份重写（target_symbol={sym or '空'}，即整文件占位写法）已被机械丢弃；"
+                    "在制文件已存在，只能用 modify / full_symbol 对你负责的符号做定点增补"
+                )
+                self.state.setdefault("file_lease_violations", []).append(
+                    {"task": tid, "path": path, "owner": owner, "round": self.attempt}
+                )
+                continue
+            kept.append(e)
+        if violations:
+            data["edits"] = kept
+        return violations
+
+    def _py_compile_problems(self, rel_paths: list[str]) -> list[str]:
+        """在制工作区上的 **py_compile 快检**（G4 事务点）：语法不过带错误重问，不留到 verify。"""
+        import py_compile
+        import tempfile
+
+        wip = getattr(self, "_wip_dir", None)
+        if wip is None:
+            return []
+        tmp = tempfile.mkdtemp(prefix="devwip_pyc_")
+        problems: list[str] = []
+        try:
+            for rel in rel_paths:
+                if not str(rel).endswith(".py"):
+                    continue
+                src = wip / str(rel)
+                if not src.is_file():
+                    continue
+                try:
+                    py_compile.compile(
+                        str(src),
+                        cfile=os.path.join(tmp, str(abs(hash(rel))) + ".pyc"),
+                        doraise=True,
+                    )
+                except py_compile.PyCompileError as exc:
+                    detail = str(exc).replace(str(wip) + os.sep, "").strip()
+                    lines = [ln for ln in detail.splitlines() if ln.strip()]
+                    problems.append(f"py_compile {rel}：" + " / ".join(lines[-2:])[:400])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return problems
+
+    def _task_txn_checkpoint(
+        self,
+        task: dict,
+        tasks: list[dict],
+        parts_fn: Any,
+        plan_pin: Any,
+        merged: dict,
+        data: dict,
+        owner_map: dict[str, str],
+        rework: list[str],
+    ) -> dict:
+        """单张施工图的**事务点**（G3+G4）：租约执法 → 在制物化 → py_compile → 最多重问一次。
+
+        返回（可能被重问结果替换/合并过的）本任务产物。修不掉的残留**只留痕升级**
+        （state + 日志，交评审/verify），不在同 prompt 上空转 —— 与补符号零生效同口径。
+        """
+        # mock 路径整体 no-op：占位产物（<path>/<symbols>）过不了任何内容判据，
+        # 也没有在制工作区；mock 测流程不测内容，基线不动。
+        if isinstance(self.client, MockClient):
+            return data
+        tid = str(task.get("id") or "?")
+        paths = self._task_paths(task, tasks)
+        lease = self._enforce_file_lease(task, data, owner_map)
+        cand = self._merge_dev(merged, data) if merged else data
+        mat = self._wip_materialize(cand)
+        touched = [
+            str(p).replace("\\", "/")
+            for p in (task.get("target_files") or [])
+            if (getattr(self, "_wip_dir", None) / str(p)).is_file()
+        ]
+        compile_errs = self._py_compile_problems(touched)
+        problems = [*lease, *mat.get("problems", []), *compile_errs]
+        if not problems:
+            return data
+        self.log(
+            f"        [任务事务点] {tid} 快检发现 {len(problems)} 个问题（租约 {len(lease)} / "
+            f"语法 {len(compile_errs)}）→ 带错误只重问一次"
+        )
+        try:
+            again = self._grounded_call(
+                "dev",
+                [
+                    self._task_focus(task, rework_problems=rework),
+                    "【任务事务点快检未过】上一版补丁物化为在制文件后发现以下机械问题，"
+                    "请**只针对这些问题**重做本任务的 edit（其余内容保持不变）：\n"
+                    + "\n".join(f"  · {p}" for p in problems)
+                    + "\n注意：①已存在的文件禁止 change_type=add 整份重写，"
+                    "用 modify / full_symbol 对你负责的符号定点增补；"
+                    "②不要改其他文件；③在制文件当前正文见下方【当前项目已有代码】。",
+                    *parts_fn(
+                        include_plan=self._task_drawing_is_thin(task),
+                        only_paths=paths,
+                        current_code=self._current_code_text(paths),
+                    ),
+                ],
+                pin=plan_pin,
+                note=f"dev·{tid}·事务点",
+                artifact_stage=f"dev-{tid}-txn",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(
+                f"        [任务事务点] {tid} 重问调用失败（{type(exc).__name__}："
+                f"{str(exc)[:200]}）→ 保留这一版，残留升级"
+            )
+            again = {}
+        if isinstance(again, dict) and again:
+            lease2 = self._enforce_file_lease(task, again, owner_map)
+            data = self._merge_dev(data, again)
+            cand = self._merge_dev(merged, data) if merged else data
+            mat = self._wip_materialize(cand)
+            compile_errs = self._py_compile_problems(touched)
+            problems = [*lease2, *mat.get("problems", []), *compile_errs]
+        if problems:
+            self.state.setdefault("task_txn_residual", []).append(
+                {"task": tid, "round": self.attempt, "problems": problems}
+            )
+            self.log(
+                f"        [任务事务点] {tid} 重问后残留 {len(problems)} 个问题 → 留痕升级"
+                f"（不阻塞后续施工图）：{problems[0][:160]}"
+            )
+        return data
+    # ===================== G3/G4 结束 =====================
+
 
     def _ensure_api_digest(self) -> dict:
         """接口摘要（``{相对路径: [成员签名, …]}``）：dev 自检时已产出；缺了就按当前实现补算。
@@ -3173,6 +3537,48 @@ class Orchestrator:
         "invalid", "empty", "error", "fail", "raise", "boundary", "none", "nil", "negative",
     )
 
+    @staticmethod
+    def _behavior_terms(text: str) -> set[str]:
+        """业务行为文本 → 匹配词集合（CJK bigram + 长度≥2 的字母数字词）。
+
+        刻意做成**纯字面**匹配：行为覆盖核对是机械判据，不能引入语义模型；
+        bigram 对中文短句鲁棒（「新增记录」「增加一条记录」共享 新增/记录 等），
+        ascii 词保住命令 / 专有名词（add、REAL、unittest）。
+        """
+        terms: set[str] = set()
+        for word in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", str(text or "")):
+            if len(word) >= 2:
+                terms.add(word.lower())
+        for run in re.findall(r"[\u4e00-\u9fff]+", str(text or "")):
+            terms.update(run[i : i + 2] for i in range(len(run) - 1))
+        return terms
+
+    #: 行为覆盖判定阈值（bigram/词重叠占比与最少命中数）。宁松勿紧 —— 部分漏测只作
+    #: 提示级，只有**所有**业务行为都对不上才阻断（见 _test_blockers），误伤面很小。
+    _BEHAVIOR_COVER_RATIO = 0.35
+    _BEHAVIOR_MIN_SHARED = 2
+    _BEHAVIOR_MIN_TERMS = 4
+
+    @staticmethod
+    def _term_is_cjk(term: str) -> bool:
+        return bool(re.fullmatch(r"[\u4e00-\u9fff]{2}", term))
+
+    def _behavior_hit(self, terms: set[str], blob_terms: set[str]) -> bool:
+        """单条行为是否被单条用例覆盖。
+
+        主通道：重叠词占比 ≥ ``_BEHAVIOR_COVER_RATIO`` 且至少 2 个共享词。
+        宽松通道：用例短、FR 文本长时占比天然吃亏，但**专有名词**（add / list /
+        REAL 这类命令与类型名，长度 ≥3 的 ascii 词）+ 至少 2 个汉字实义 bigram
+        同时命中，已足以说明用例在测该行为 —— 阻断只在全部行为都漏掉时发生，
+        宽松判定收窄的是误伤面。
+        """
+        shared = terms & blob_terms
+        if len(shared) >= self._BEHAVIOR_MIN_SHARED and len(shared) / len(terms) >= self._BEHAVIOR_COVER_RATIO:
+            return True
+        cjk_hit = sum(1 for t in shared if self._term_is_cjk(t))
+        ascii_hit = any(t.isascii() and len(t) >= 3 for t in shared)
+        return ascii_hit and cjk_hit >= self._BEHAVIOR_MIN_SHARED
+
     def _audit_test(self) -> dict:
         """确定性核对测试产物：三类用例是否齐全、expected 是否笼统、有没有可执行命令。
 
@@ -3267,6 +3673,43 @@ class Orchestrator:
             for g in (report.get("coverage_gaps") or [])
         )
         missing_unexplained = [s for s in missing_symbols if s not in gap_text]
+
+        # ---- 一级覆盖：业务行为（FR + PM 验收口径）是否有用例承载 ----
+        # 优化建议§十七（run 20260929-093329）：Business Coverage 优先于 Symbol Coverage。
+        # 符号漏测只是二级事实（内部 helper 没有单独用例不是缺陷）；真正不可接受的是
+        # 「用例写了一堆，但 FR 描述的业务行为一条都没对上」。行为来源 = PM 的
+        # functional_requirements（描述 + acceptance）与 acceptance_criteria。
+        scope = self.state.get("scope") or {}
+        behavior_items: list[dict] = []
+        for fr in (scope.get("functional_requirements") or []):
+            if not isinstance(fr, dict):
+                continue
+            parts = [str(fr.get("id") or ""), str(fr.get("description") or fr.get("title") or "")]
+            for acc in (fr.get("acceptance") or []):
+                parts.append(str(acc or ""))
+            behavior_items.append({"id": str(fr.get("id") or ""), "text": " ".join(p for p in parts if p)})
+        for crit in (scope.get("acceptance_criteria") or []):
+            if str(crit or "").strip():
+                behavior_items.append({"id": "", "text": str(crit)})
+        blob_terms = [self._behavior_terms(blob) for blob in blobs]
+        gap_terms = self._behavior_terms(gap_text)
+        covered_behaviors: list[str] = []
+        missing_behaviors: list[dict] = []
+        behavior_unexplained: list[dict] = []
+        for item in behavior_items:
+            terms = self._behavior_terms(item["text"])
+            # 文本太短（标题型条目）时机械判不可靠，宁漏勿误：不纳入统计。
+            if len(terms) < self._BEHAVIOR_MIN_TERMS:
+                continue
+            hit = any(self._behavior_hit(terms, bt) for bt in blob_terms)
+            label = item["id"] or item["text"][:30]
+            if hit:
+                covered_behaviors.append(label)
+            else:
+                missing_behaviors.append({"id": item["id"], "text": item["text"][:120]})
+                # 申诉通道与符号同级：coverage_gaps 里点名过该行为即豁免
+                if not self._behavior_hit(terms, gap_terms):
+                    behavior_unexplained.append({"id": item["id"], "text": item["text"][:120]})
         return {
             "case_count": len(cases),
             "by_type": by_type,
@@ -3281,6 +3724,11 @@ class Orchestrator:
             "missing_symbols": missing_symbols,
             # 既没被用例覆盖、也没在 coverage_gaps 里交代的 —— 这才是真漏测
             "missing_unexplained": missing_unexplained,
+            # 一级覆盖（业务行为）：被覆盖/未被覆盖的行为清单
+            "behavior_count": len(covered_behaviors) + len(missing_behaviors),
+            "covered_behaviors": covered_behaviors,
+            "missing_behaviors": missing_behaviors,
+            "behavior_unexplained": behavior_unexplained,
             # 有没有一条命令真的执行交付物入口（真机 run snake-detailed 就栽在这上面）
             "entry_gap": self._entry_command_gap(),
             # 异常/边界覆盖：只报事实，不判负（见上面 boundary_count 的说明）
@@ -3295,11 +3743,16 @@ class Orchestrator:
            这时 verify 除自带的语法/导入检查之外**无物可跑**，「测试写了但没真跑」
            就是这么发生的。**刻意不留申诉出口**：任何技术栈都至少能声明一条跑测试的
            命令，不存在「确实无法声明」的合法情形。
-        ② 改动的符号既没被测到、也没申诉说明。``missing_symbols`` 原先只作提示，
-           结果是「写了很多用例、真正改的东西一个没测」也能一路 pass —— 那正是回归
-           测试形同虚设的根因（真机 run 20260925-184300：5 个被改符号只有 1 个对得上）。
-           **这条必须留申诉出口**：符号可能确实无需单独用例（只改了内部常量），
-           只要在 ``coverage_gaps`` 里写明原因即可豁免；否则模型会被逼着编造用例。
+        ② **业务行为整体脱锚**：PM 的 FR / 验收口径没有一条能与现有用例对上
+           （``covered_behaviors`` 为 0 且 coverage_gaps 也未逐条申诉）。这是二级覆盖
+           模型（优化建议§十七，run 20260929-093329）的一级判据 —— 真机上测试资源被
+           函数覆盖率吞掉，add/list/remove 这些用户真正关心的行为反而一条没测。
+           刻意只在「**全部**行为都对不上」时阻断：bigram 字面匹配对部分漏测会有误判，
+           部分缺失只作提示级（清单进评审），整体脱锚才是高置信的「用例与需求无关」。
+           申诉出口仍是 coverage_gaps：点名行为并说明无法/无需覆盖即豁免。
+
+        **符号漏测不再阻断**（降为纯提示级，清单仍在 audit 里给评审/人工）：内部 helper
+        没有单独 testcase 不是缺陷，业务用例自然带到即可；硬拦只会逼模型编造无价值用例。
 
         为什么「入口没被执行」（``entry_gap``）**不在这里**、只作提示级：它有**合法的
         反例** —— GUI / 常驻程序（本项目的贪吃蛇就是 tkinter）在无显示环境里本来就没法
@@ -3320,28 +3773,24 @@ class Orchestrator:
                 "按项目实际技术栈补至少一条"
                 "（如 `python -m unittest xxx`、`go test ./...`、`npm test`）。"
             )
-        missing = list(audit.get("missing_unexplained") or [])
-        # BUG 修复模式**收窄**这条判据：本轮只改了缺陷单指向的那一处，却要求"全部改动符号
-        # 都有用例"，等于逼它把整套用例重出一遍 —— 这正是「补测」被判成「漏测」的同类问题。
-        # 收窄到缺陷单范围内：范围外的符号沿用上一轮的覆盖结果（用例集是跨轮累积的）。
-        if missing and self.round_kind == tasktype.BUGFIX:
-            report = self.state.get("bug_report") or {}
-            affected = {
-                str(p).replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".py")
-                for p in (report.get("affected") or {})
-            }
-            affected |= {
-                str(p).removesuffix(".py")
-                for p in (report.get("existing_paths") or [])
-            }
-            if affected:
-                missing = [s for s in missing if str(s).split(".")[0] in affected]
-        if missing:
-            out.append(
-                "测试没覆盖到本次改动的这些符号，且 coverage_gaps 里也没说明："
-                + "、".join(str(s) for s in missing[:6])
-                + "（用例 target 要写到符号级；确实无需用例的，在 coverage_gaps 里写明原因即可）"
-            )
+        behavior_count = int(audit.get("behavior_count") or 0)
+        # 全部行为都没对上、也没在 coverage_gaps 申诉 —— 用例集与需求整体脱锚
+        if behavior_count and not audit.get("covered_behaviors"):
+            unexplained = audit.get("behavior_unexplained") or []
+            if len(unexplained) >= behavior_count:
+                names = [
+                    str(b.get("id") or b.get("text") or "")[:40]
+                    for b in unexplained[:6]
+                    if isinstance(b, dict)
+                ]
+                out.append(
+                    "测试用例与需求的业务行为整体对不上：PM 列出的 "
+                    f"{behavior_count} 条 FR / 验收口径没有一条被任何用例覆盖"
+                    + (f"（如 {'、'.join(n for n in names if n)}）" if names else "")
+                    + "。请对照 functional_requirements 逐条补业务行为用例"
+                    "（可观察行为 + 期望值，正常路径优先）；个别行为确实无法/无需覆盖的，"
+                    "在 coverage_gaps 点名并说明原因与影响即可。"
+                )
         return out
 
     def _stage_test(self, requirement: str, fixes: list[str] | None = None) -> Any:
@@ -3946,6 +4395,9 @@ class Orchestrator:
         view = {**task, "rework_problems": list(rework_problems or [])}
         if symbols is not None:
             view["symbols"] = list(symbols)
+        # G3 文件创建租约：把本张施工图涉及文件的 owner 告诉提示词块
+        # （owner 自己要交含文件头的完整文件；非 owner 只能在在制文件上定点增补）。
+        view["file_owners"] = self._file_owner_map((self.state.get("plan") or {}).get("tasks") or [])
         # import 清单的**机械校对**：uses 成环（errors↔cli 那种顶层互导）与 verify
         # 已报缺失的导入契约，都不能再无条件写成"文件头必须"（真机 20260928-221831）。
         hint_ctx = tasktype.import_hint_context(
@@ -4060,6 +4512,11 @@ class Orchestrator:
         这是「分 task 完成测试、审核后不用到人工」里那个"测试"的落点：它不产生人工闸门。
         """
         merged: dict = {}
+        # G3/G4：非 mock 路径启用在制工作区（每图累积物化 + py_compile 快检）与文件创建租约。
+        # mock 测流程不测内容（占位数据每条都过不了这些内容判据），基线不动。
+        if not isinstance(self.client, MockClient):
+            self._wip_init()
+        owner_map = self._file_owner_map(tasks)
         # **按施工图归因**（返工轮才有内容）：这张图上一轮到底错了什么。
         # 诉求是"返工要指明哪个 task 的具体什么问题"，而映射本来就是机械可得的
         # （补丁自带 `covers_tasks`、施工图自带 `target_files`），不该让模型或人工去对。
@@ -4082,6 +4539,10 @@ class Orchestrator:
                 # 拆半是纯机械操作，不需要模型判断，且两半都仍在原图的符号范围内（不越界）。
                 split = self._dev_split_retry(task, exc, tasks, parts_fn, plan_pin, rework)
                 if split:
+                    # 拆半产物同样过任务事务点（租约/物化/语法），不能绕过。
+                    split = self._task_txn_checkpoint(
+                        task, tasks, parts_fn, plan_pin, merged, split, owner_map, rework
+                    )
                     merged = self._merge_dev(merged, split) if merged else split
                     self.log(f"        [按 task 分派] {tid} 拆半后完成（{idx}/{len(tasks)}）")
                     continue
@@ -4168,6 +4629,11 @@ class Orchestrator:
                 if set(left) >= set(gaps):
                     no_progress[tid] = {"round": self.attempt, "gaps": list(gaps)}
                 gaps = left
+            # G3/G4 **任务事务点**：文件租约执法 → 在制工作区累积物化 → py_compile 快检
+            # （失败带错误重问一次，残留留痕升级）。mock 在该方法内部直接降级为 no-op。
+            data = self._task_txn_checkpoint(
+                task, tasks, parts_fn, plan_pin, merged, data, owner_map, rework
+            )
             merged = self._merge_dev(merged, data) if merged else data
             self.log(f"        [按 task 分派] {tid} 完成（{idx}/{len(tasks)}）")
         return merged
@@ -5991,12 +6457,20 @@ class Orchestrator:
                 )
         if stage == "pm" and self.pause_on_open_questions:
             left = self._pm_unresolved()
-            if left["pending"] or left["vague"]:
+            # 裁决一致性：判据**现算**（人工可能直接编辑了 02-pm.json），与 PM 返工、
+            # 作业层 gateway 用同一份 prompts.pm_decision_conflicts。
+            conflicts = self._pm_decision_conflicts()
+            if left["pending"] or left["vague"] or conflicts:
                 bits: list[str] = []
                 if left["pending"]:
                     bits.append("未裁决的未决项：" + "；".join(left["pending"][:4]))
                 if left["vague"]:
                     bits.append("未明确的条目：" + "；".join(left["vague"][:4]))
+                if conflicts:
+                    bits.append(
+                        "裁决与需求/验收自相矛盾（一律以裁决为准，或直接编辑产物消除矛盾）："
+                        + "；".join(prompts.pm_decision_conflict_lines(conflicts)[:4])
+                    )
                 spec = flow.gate_spec("pm")
                 return Interrupt(
                     stage,
@@ -6030,6 +6504,15 @@ class Orchestrator:
         （``gateway.job_pm_blockers``）用的是**同一份判据**。
         """
         return pm_unresolved_items(self.state.get("scope"), self.pm_decisions)
+
+    def _pm_decision_conflicts(self) -> list[dict[str, str]]:
+        """裁决 vs 需求/验收的极性冲突 —— 与未决项同一口径：先并人工裁决再现算。
+
+        人工可以直接编辑 02-pm.json 消除矛盾，所以这里**不读缓存**，每次从当前 scope 现算。
+        """
+        scope = prompts.normalize_pm_questions(self.state.get("scope"))
+        merged = prompts.apply_pm_decisions(scope, self.pm_decisions)
+        return prompts.pm_decision_conflicts(merged)
 
     def _should_pause(self, stage: str) -> bool:
         """兼容旧签名的薄包装：等价于「该阶段之后是否会 interrupt」。"""

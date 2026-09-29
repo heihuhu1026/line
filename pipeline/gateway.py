@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import flow, ga_prompt, local_config, runstore, schemas
+from . import flow, ga_prompt, local_config, prompts, runstore, schemas
 from .budget import estimate_tokens, fit_prompt
 from .config import (
     GA_MAX_MODULES,
@@ -1425,6 +1425,15 @@ def job_pm_blockers(runs_dir: str | Path, data: dict[str, Any]) -> dict[str, lis
         scope, decisions = _pm_scope_of(Path(str(run_dir)))
         left = pm_unresolved_items(scope, decisions)
         items = [f"未裁决：{q}" for q in left["pending"]] + [f"未明确：{v}" for v in left["vague"]]
+        # 裁决一致性：与模块内 PM 条件闸门同一份判据（run 20260929-093329：
+        # 裁决「不自动重排序号」⨯ FR-03 验收「序号自动重置」）。
+        merged = prompts.apply_pm_decisions(prompts.normalize_pm_questions(scope), decisions)
+        for conflict in prompts.pm_decision_conflicts(merged):
+            items.append(
+                "裁决矛盾："
+                + f"{conflict.get('clause') or ''} ⨯ {conflict.get('where') or ''}"
+                f"「{conflict.get('claim') or ''}」"
+            )
         if items:
             out[mid] = items
     return out
