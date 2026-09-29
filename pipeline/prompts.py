@@ -1200,6 +1200,116 @@ def pm_decision_conflict_lines(conflicts: list[dict[str, str]]) -> list[str]:
     ]
 
 
+def _statement_polarity(text: str) -> int | None:
+    """整句**单一极性**才可比：所有谓词子句同肯→1，同否→-1；疑问/混合/无谓词→None。
+
+    与 ``pm_decision_conflicts`` 同一套极性口径（宁漏勿冤：这是阻断级判据）。
+    """
+    pol = ""
+    for clause in _decision_clauses(text):
+        p = _decision_polarity(clause)
+        if p == "ask" or not _DECISION_PREDICATE_RE.search(clause):
+            continue
+        if pol and pol != p:
+            return None
+        pol = p
+    return 1 if pol == "pos" else (-1 if pol == "neg" else None)
+
+
+def claim_conflict_groups(scope: Any, intake_rows: Any = None) -> list[list[dict[str, Any]]]:
+    """规格§三十三：跨字段事实的**极性冲突分组**（机械提取，供 ontology.reconcile_claims 仲裁）。
+
+    与 ``pm_decision_conflicts`` 的分工：后者只比「人工裁决 vs PM 陈述」（必返工）；
+    本函数把**所有层级**陈述拉平（人工裁决/confirmed_facts=ASSERTED·human；
+    FR/验收/默认假设=DERIVED·pm），按「同话题 + 极性翻转 + 双边行为词」连边并求连通组。
+    组内是同级对立还是高优先级覆盖，交给 ``ontology.reconcile_claims`` 按
+    USER>HUMAN>PM>ARCHITECT>TEST>DEV_SELF_CHECK 裁决 —— 本函数只做机械发现，不猜赢家。
+
+    ``intake_rows`` 为已并过人工裁决的 intake 条目（``prompts.intake_items`` 的产物）。
+    返回 ``list[group]``；group = 事实 dict 列表
+    ``{"id", "text", "where", "source", "truth", "polarity"}``，每组 ≥2 条。
+    """
+    facts: list[dict[str, Any]] = []
+
+    def _add(text: Any, where: str, source: str, truth: str) -> None:
+        text = str(text or "").strip()
+        polarity = _statement_polarity(text)
+        if not text or polarity is None:
+            return
+        facts.append({
+            "id": f"fact:{len(facts) + 1:02d}",
+            "text": text, "where": where,
+            "source": source, "truth": truth,
+            "polarity": polarity,
+        })
+
+    if isinstance(scope, dict):
+        for q in scope.get("open_questions") or []:
+            if not isinstance(q, dict):
+                continue
+            if str(q.get("final_decision") or "").strip():
+                _add(q["final_decision"], "open_questions.final_decision", "human", "ASSERTED")
+            elif str(q.get("assumed_answer") or "").strip():
+                _add(q["assumed_answer"], "open_questions.assumed_answer", "pm", "DERIVED")
+        for fact in scope.get("confirmed_facts") or []:
+            _add(fact, "confirmed_facts", "human", "ASSERTED")
+        for idx, fr in enumerate(scope.get("functional_requirements") or []):
+            if not isinstance(fr, dict):
+                continue
+            fid = str(fr.get("id") or f"#{idx}")
+            _add(fr.get("description") or fr.get("title"),
+                 f"functional_requirements[{fid}].description", "pm", "DERIVED")
+            acceptance = fr.get("acceptance")
+            if isinstance(acceptance, list):
+                for j, item in enumerate(acceptance):
+                    _add(item, f"functional_requirements[{fid}].acceptance[{j}]", "pm", "DERIVED")
+        for j, item in enumerate(scope.get("acceptance_criteria") or []):
+            _add(item, f"acceptance_criteria[{j}]", "pm", "DERIVED")
+        for j, item in enumerate(scope.get("in_scope") or []):
+            _add(item, f"in_scope[{j}]", "pm", "DERIVED")
+
+    for row in (intake_rows or []):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("final_decision") or "").strip():
+            _add(row["final_decision"], "intake.final_decision", "human", "ASSERTED")
+        elif str(row.get("default_assumption") or "").strip():
+            _add(row["default_assumption"], "intake.default_assumption", "pm", "DERIVED")
+
+    # 连边：极性对立 + 同话题 + 否定作用域的行为词在肯定方出现（沿用既有严判据）
+    n = len(facts)
+    parent = list(range(n))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = facts[i], facts[j]
+            if a["polarity"] == b["polarity"]:
+                continue
+            same, _shared = _decision_same_topic(a["text"], b["text"])
+            if not same:
+                continue
+            neg = a["text"] if a["polarity"] < 0 else b["text"]
+            pos = b["text"] if a["polarity"] < 0 else a["text"]
+            if _decision_has_flipped_predicate(neg, pos):
+                _union(i, j)
+
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for i, fact in enumerate(facts):
+        groups.setdefault(_find(i), []).append(fact)
+    return [members for members in groups.values() if len(members) >= 2]
+
+
 def pm_assumptions_block(scope: Any) -> str:
     """把 PM 对未决项给出的「默认假设」原样注入所有下游阶段。
 

@@ -120,6 +120,64 @@ _OWNER_CLASS_LABELS = {
     OWNER_PATCH_RUNTIME: "物化/仓库快照（运行时基础设施）",
 }
 
+# ----------------------- Ontology Failure Taxonomy（规格§二十六，9 类，纯机械映射）
+# 与上面的既有 ftype 并存：ftype 是历史归因（含路由习惯），failure_type 是 Ontology
+# 责任链上的**有限闭集**类别，供 Defect/Recovery 投影使用；不改 classify 的既有键。
+FAIL_REQUIREMENT = "requirement_failure"        # 需求本身矛盾/不可能（P2 起由矛盾检测产出）
+FAIL_PLANNING = "planning_failure"              # 方案漏项/契约虚依赖/缺入口
+FAIL_COMPILATION = "compilation_failure"        # 施工图目标与仓库不符（编译器/方案核对）
+FAIL_IMPLEMENTATION = "implementation_failure"  # 补丁内容错/实现层质量问题
+FAIL_VERIFICATION = "verification_failure"      # 验证命令真实失败或缺必需机械证据
+FAIL_TEST = "test_failure"                      # 测试本身错/弱（P1-3 test compiler 起产出）
+FAIL_ENVIRONMENT = "environment_failure"        # 依赖/工具链/权限等环境问题
+FAIL_PIPELINE = "pipeline_failure"              # 流水线物化/快照/基础设施故障
+FAIL_AMBIGUOUS = "ambiguous_failure"            # 证据互相矛盾或不足，必须人工裁决
+
+#: 责任角色（Ontology 闭集；与历史 owner 字符串的差异仅在于补出 compiler/pipeline）
+ROLE_DEV = "dev"
+ROLE_ARCHITECT = "architect"
+ROLE_COMPILER = "compiler"
+ROLE_TESTER = "tester"
+ROLE_PIPELINE = "pipeline"
+ROLE_HUMAN = "human"
+ROLE_PM = "pm"
+
+#: (ftype, owner_class) → (failure_type, role, recover_stage)；owner_class 只对补丁类有意义
+_FAILURE_MAP: dict[tuple[str, str], tuple[str, str, str]] = {
+    (PATCH_UNAPPLIABLE, OWNER_PATCH_RUNTIME): (FAIL_PIPELINE, ROLE_PIPELINE, "human_review"),
+    (PATCH_UNAPPLIABLE, OWNER_COMPILER_TARGET): (FAIL_COMPILATION, ROLE_COMPILER, "architect_plan"),
+    (PATCH_UNAPPLIABLE, ""): (FAIL_IMPLEMENTATION, ROLE_DEV, "dev"),
+    (VERIFY_FAILED, ""): (FAIL_VERIFICATION, ROLE_DEV, "dev"),
+    (CONTRACT_UNRESOLVED, ""): (FAIL_PLANNING, ROLE_ARCHITECT, "architect_plan"),
+    (PLAN_GAP, ""): (FAIL_PLANNING, ROLE_ARCHITECT, "architect_plan"),
+    (MISSING_ENTRY, ""): (FAIL_PLANNING, ROLE_ARCHITECT, "architect_plan"),
+    (AMBIGUOUS, ""): (FAIL_AMBIGUOUS, ROLE_HUMAN, "human_review"),
+    (REVIEW_QUALITY, ""): (FAIL_IMPLEMENTATION, ROLE_DEV, "dev"),
+    # Proof Gate 决策码（DECISION_PROOF_* 在本块之后定义，这里用字面量同值）
+    ("proof_gate_unproven", ""): (FAIL_VERIFICATION, ROLE_DEV, "dev"),
+    ("proof_gate_failed", ""): (FAIL_VERIFICATION, ROLE_DEV, "dev"),
+}
+
+
+def failure_taxonomy(ftype: str, owner_class: str = "") -> dict:
+    """把历史归因机械映射为 Ontology Failure 三元组（纯函数，不做任何推断）。
+
+    返回 ``{"type", "owner_role", "recover_stage"}``；NONE/未知归因为空类别
+    （``type=""``），调用方不得据此构造 Defect。
+    """
+    ftype = str(ftype or "")
+    if ftype == NONE or not ftype:
+        return {"type": "", "owner_role": "", "recover_stage": "done"}
+    mapped = _FAILURE_MAP.get((ftype, str(owner_class or "")))
+    if mapped is None:
+        # 补丁类在 owner_class 缺省时按补丁内容错处理；其余未知归因一律 AMBIGUOUS，
+        # 禁止悄悄塞进某个确定责任桶。
+        if ftype == PATCH_UNAPPLIABLE:
+            mapped = _FAILURE_MAP[(PATCH_UNAPPLIABLE, "")]
+        else:
+            mapped = (FAIL_AMBIGUOUS, ROLE_HUMAN, "human_review")
+    return {"type": mapped[0], "owner_role": mapped[1], "recover_stage": mapped[2]}
+
 
 def _short(text: Any, limit: int = 90) -> str:
     """压平空白并截断 —— 台账 key 与日志都用它，保证同一缺陷得到同一个字符串。"""
@@ -172,6 +230,8 @@ DECISION_PLAN_ARCH = "plan_rework_architect"  # 方案层矛盾/漏项
 DECISION_AMBIGUOUS = "ambiguous_human"  # 只有风险描述、没有材料支撑
 DECISION_PASS_EXTERNAL = "pass_external"  # 问题全在范围外
 DECISION_PASS_RESIDUAL = "pass_residual_downgrade"  # 验证全绿，残留风险降级
+DECISION_PROOF_UNPROVEN = "proof_gate_unproven"  # 规格§二十：缺必需机械证据（含 verify skipped）
+DECISION_PROOF_FAILED = "proof_gate_failed"  # 规格§二十：必需机械证据验证失败
 
 
 def review_decision(
@@ -183,6 +243,7 @@ def review_decision(
     plan_gap: bool = False,
     verify_pass: bool = False,
     evidence_clean: bool = False,
+    proof: dict | None = None,
 ) -> dict:
     """把「语义建议 + 机械事实」收敛成确定 verdict（纯函数，无 IO、无状态）。
 
@@ -258,6 +319,29 @@ def review_decision(
         forced = True
         action = DECISION_PASS_RESIDUAL
         reason = "机制判定：verify 全绿且机械证据干净，残留风险降级为 residual_risks"
+
+    # ======================================== Proof Gate（规格§二十/§四十五，最高优先级硬条件）
+    # 放在**所有分支之后**：即使语义判 pass、或被上面的 PASS_EXTERNAL / PASS_RESIDUAL
+    # 强制改成 pass，只要必需的机械证据不成立就一律翻回 rework_dev。
+    # 铁律：verify skipped + semantic pass = NOT PASS；self_check / WAIVED 不是 PROVEN。
+    if proof and cur == "pass" and not proof.get("can_pass", True):
+        cur = "rework_dev"
+        forced = True
+        if proof.get("status") == "FAILED":
+            action = DECISION_PROOF_FAILED
+            detail = "；".join(str(x) for x in (proof.get("failed") or [])[:3])
+            reason = (
+                "机制判定（Proof Gate）：必需的机械验证失败，不允许 pass"
+                f"（UNPROVEN_REQUIRED_EVIDENCE / failed）：{detail}"
+            )
+        else:
+            action = DECISION_PROOF_UNPROVEN
+            detail = "；".join(str(x) for x in (proof.get("mandatory_missing") or [])[:3])
+            reason = (
+                "机制判定（Proof Gate）：缺少必需的机械证据，语义 pass 不能放行"
+                "（UNPROVEN_REQUIRED_EVIDENCE；verify skipped / self_check / WAIVED 都不是 PROVEN）："
+                + detail
+            )
     return {"verdict": cur, "forced": forced, "action": action, "reason": reason}
 
 
@@ -471,6 +555,8 @@ def classify(
         "repeat": repeat,
         "escalate_suggested": escalate,
         "recovery": recovery,
+        # Ontology Failure 三元组（规格§二十六）：附加键，历史调用方不受影响
+        "failure": failure_taxonomy(ftype, owner_class),
     }
 
 

@@ -5,7 +5,7 @@ python tools/export_io.py 20260927-192001 --no-raw           # 只要输入不�
 python tools/export_io.py 20260927-192001 --out D:\tmp\io    # 自定义目录
 
 
-python tools/export_io.py 20260929-093329 --out C:\Users\Administrator\Desktop\新建文件夹 
+python tools/export_io.py 20260929-121404 --out C:\Users\Administrator\Desktop\新建文件夹 
 
    
 20260928-000351

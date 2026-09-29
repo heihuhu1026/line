@@ -1,0 +1,27 @@
+{
+  "id": "fixture-005-stale-defect-blocker",
+  "source_run": "",
+  "derived_from": ["规格§四十一 Task Txn / Defect Ledger 跨轮身份"],
+  "description": "同一条 verify 失败（ImportError / 文件 / 符号 / 命令都相同）在两轮里行号与措辞漂移，defect_key 必须仍是同一条（行号与措辞是证据不是身份），台账残留继续阻断放行；责任归因稳定为 verification_failure/dev，回 dev 修复，不允许换个行号就当新问题放过。",
+  "scenario": "stale_defect",
+  "input": {
+    "row_round_1": {
+      "kind": "traceback:ImportError", "path": "src/store.py", "symbol": "Database",
+      "command": "python -m pytest", "line": 12, "what": "无法导入 Database", "status": "fail", "source": "verify"
+    },
+    "row_round_2": {
+      "kind": "traceback:ImportError", "path": "src/store.py", "symbol": "Database",
+      "command": "python -m pytest", "line": 27, "what": "模块中不存在名称 Database（措辞已变）",
+      "status": "fail", "source": "verify"
+    },
+    "reason_code": "verify_failed"
+  },
+  "expect": {
+    "defect_key_equal": true,
+    "failure_type": "verification_failure",
+    "owner_role": "dev",
+    "recovery_stage": "dev",
+    "decision": "rework_dev",
+    "decision_action": "proof_gate_failed"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "fixture-003-interface-drift",
+  "source_run": "",
+  "derived_from": ["规格§十八 Interface Freeze 双证据"],
+  "description": "方案与冻结骨架都承诺 Store.save，契约检查（核方案 contract）通过，但产物里没有该冻结符号（骨架一致性失败）：interface_freeze 双证据缺一不可 ⇒ PO FAILED（不是 UNPROVEN），Proof Gate 翻回 rework_dev，责任在 dev。",
+  "scenario": "interface_freeze",
+  "input": {
+    "skeleton": {
+      "store.py": ["class Store", "    def save(self, record)", "    def audit(self)"]
+    },
+    "plan_symbols": {"store.py": ["Store.save"]},
+    "verify_report": {
+      "verdict": "pass",
+      "materialized": ["store.py"],
+      "commands": [
+        {"status": "ok", "command": "python main.py", "exit_code": 0,
+         "stdout_tail": "", "stderr_tail": "", "source": "entry"}
+      ]
+    },
+    "contract_checked": true,
+    "contract_problems": [],
+    "skeleton_conformance": {
+      "missing": ["产物 store.py 中未找到冻结声明的 `Store.save`"],
+      "mismatch": [],
+      "by_file": {"store.py": ["Store.save"]},
+      "checked": 1
+    }
+  },
+  "expect": {
+    "frozen_symbols": [["store.py", "Store"], ["store.py", "Store.save"]],
+    "po_status": "FAILED",
+    "po_evidence_kinds": ["skeleton_conformance"],
+    "proof_status": "FAILED",
+    "proof_code": "required_proof_failed",
+    "can_pass": false,
+    "decision": "rework_dev",
+    "decision_action": "proof_gate_failed",
+    "recovery_stage": "dev"
+  }
+}

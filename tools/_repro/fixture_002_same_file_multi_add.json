@@ -1,0 +1,25 @@
+{
+  "id": "fixture-002-same-file-multi-add",
+  "source_run": "",
+  "derived_from": ["tools/smoke_patch_apply.py ⑦"],
+  "description": "新建项目空仓库：同一新文件由两条 add 分块创建时，补丁物化必须合并写入，后写不得覆盖先写；两条 edit 都判 ok，合并结果完整写盘。",
+  "scenario": "patches_apply",
+  "input": {
+    "repo_state": "empty",
+    "impl": {
+      "edits": [
+        {"path": "game.py", "change_type": "add", "patch": "class Snake:\n    pass\n"},
+        {"path": "game.py", "change_type": "add", "patch": "class Food:\n    pass\n"}
+      ]
+    }
+  },
+  "expect": {
+    "statuses": ["ok", "ok"],
+    "materialized_files": ["game.py"],
+    "content_contains": ["class Snake:", "class Food:"],
+    "content_not_contains": [],
+    "skipped_non_benign": 0,
+    "decision": null,
+    "recovery_stage": null
+  }
+}

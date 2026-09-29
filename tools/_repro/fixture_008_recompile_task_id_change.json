@@ -1,0 +1,45 @@
+{
+  "id": "fixture-008-recompile-task-id-change",
+  "source_run": "",
+  "derived_from": ["规格§四十一 Task Txn；smoke_ontology M 段"],
+  "description": "架构师返工重编译时前面插入无关任务，原任务编号从 T-01 漂移为 T-02：semantic_task_id 必须保持不变（身份由 文件+符号+facet 决定，与编号无关），revision 递增到 2 且 supersedes 指向上版 T-id —— Defect/Recovery 链因此不断。",
+  "scenario": "recompile_id",
+  "input": {
+    "scope": {
+      "functional_requirements": [
+        {"id": "FR-01", "description": "运行记账命令后在 SQLite 建表并写入一条流水"}
+      ]
+    },
+    "plan_round_1": {
+      "changes": [
+        {"path": "ledger_db.py", "symbols": ["init_database"],
+         "intent": "运行记账命令后在 SQLite 建表并写入一条流水"}
+      ],
+      "tasks": [
+        {"id": "T-01", "target_files": ["ledger_db.py"], "symbols": ["init_database"],
+         "constraints": ["不得删除已有流水"]}
+      ]
+    },
+    "plan_round_2": {
+      "changes": [
+        {"path": "util_helpers.py", "symbols": ["format_money"], "intent": "格式化金额"},
+        {"path": "ledger_db.py", "symbols": ["init_database"],
+         "intent": "运行记账命令后在 SQLite 建表并写入一条流水"}
+      ],
+      "tasks": [
+        {"id": "T-09", "target_files": ["util_helpers.py"], "symbols": ["format_money"]},
+        {"id": "T-10", "target_files": ["ledger_db.py"], "symbols": ["init_database"],
+         "constraints": ["不得删除已有流水"]}
+      ]
+    }
+  },
+  "expect": {
+    "symbol": "init_database",
+    "task_id_changes": true,
+    "semantic_id_stable": true,
+    "revision_round_2": 2,
+    "supersedes_contains_old_id": true,
+    "decision": null,
+    "recovery_stage": null
+  }
+}

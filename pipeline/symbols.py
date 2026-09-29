@@ -37,7 +37,13 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-__all__ = ["build_index", "clean_symbol", "resolve", "unresolved_warnings"]
+__all__ = [
+    "build_index",
+    "clean_symbol",
+    "resolve",
+    "resolve_symbol_to_file",
+    "unresolved_warnings",
+]
 
 #: 标准库模块名（3.10+ 由解释器提供）。真机 `contracts.uses` 里的 `tkinter` / `sqlite3`
 #: 属于**外部依赖**，不是"本产物内的契约对不上"。把它们混进 unresolved 会稀释信号 ——
@@ -445,6 +451,49 @@ def resolve(symbol: str, *, files: Any = None, index: dict | None = None) -> dic
     # 也可能是模块名本身，但那个不该出现在依赖图里（依赖的是"谁的什么"）
     out.update(kind="bare", candidates=sorted(modules.get(sym) or []), reason="未在接口骨架里找到该符号")
     return out
+
+
+def resolve_symbol_to_file(
+    symbol: str,
+    *,
+    changes_files: Any = (),
+    existing_files: Any = (),
+    skeleton: Any = None,
+) -> dict[str, Any]:
+    """TaskCompiler 用的符号→文件解析（规格§十三）：**多候选就是 unresolved，禁止猜第一个**。
+
+    在 ``resolve()`` 外面包一层面向调用方的稳定结果：
+
+      * ``{"status": "resolved", "file": "db.py", "kind": ..., "reason": ""}``
+      * ``{"status": "external", "file": "", "kind": "external", "reason": ...}``
+      * ``{"status": "unresolved", "file": "", "candidates": [...],
+            "reason": "ambiguous_symbol" | "not_found" | ...}``
+
+    解析顺序沿用 resolve()：① 显式 path ② 模块精确 ③ 类名 ④ 路径后缀 ⑤ 全局唯一。
+    唯一候选但成员对不上（模块确定、方法不在骨架里）仍判 ``resolved``——文件边是确定的，
+    成员缺口是另一个问题，由契约校验报告，不在这里吞掉。
+    """
+    files = [_norm(p) for p in (changes_files or ()) if p]
+    existing_norm = [_norm(p) for p in (existing_files or ()) if p]
+    for p in existing_norm:
+        if p not in files:
+            files.append(p)
+    index = build_index(files, skeleton)
+    row = resolve(symbol, files=files, index=index)
+    candidates = sorted({_norm(c) for c in (row.get("candidates") or []) if c})
+    kind = str(row.get("kind") or "")
+    reason = str(row.get("reason") or "")
+    if kind == "external" and not candidates:
+        return {"status": "external", "file": "", "kind": kind, "reason": reason,
+                "candidates": []}
+    if len(candidates) == 1:
+        return {"status": "resolved", "file": candidates[0], "kind": kind,
+                "reason": reason, "candidates": candidates}
+    if len(candidates) > 1:
+        return {"status": "unresolved", "file": "", "kind": kind,
+                "reason": "ambiguous_symbol", "candidates": candidates}
+    return {"status": "unresolved", "file": "", "kind": kind,
+            "reason": reason or "not_found", "candidates": []}
 
 
 def unresolved_warnings(rows: Any) -> list[dict]:

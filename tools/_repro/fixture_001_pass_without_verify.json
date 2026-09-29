@@ -1,0 +1,52 @@
+{
+  "id": "fixture-001-pass-without-verify",
+  "source_run": "20260929-121404",
+  "derived_from": [
+    "18-verify.json",
+    "29-verify.json",
+    "19-review.json",
+    "30-review.json"
+  ],
+  "description": "new 项目无 repo：verify mode=real 但 verdict=skipped（summary 原文照抄），语义评审却给 pass 时，机械闸门必须拒绝（skipped != PROVEN）。义务清单由 PM 需求 Requirement→Claim→PO 投影产生（脱敏）。",
+  "input": {
+    "semantic_pass": true,
+    "mechanical_blockers": [],
+    "verify_verdict": "skipped",
+    "verify_summary": "没有仓库路径，运行验证无法进行",
+    "verify_mode": "real",
+    "workspace_verified": false,
+    "negative_control_no_power": [],
+    "unresolved_contracts": [],
+    "plan_gap": false,
+    "obligations": [
+      {
+        "id": "po:FR-01:behavior_1",
+        "name": "记账主流程行为可运行（脱敏，源自真机记账需求 FR 投影）",
+        "requirement_id": "req:FR-01",
+        "claim": "behavior",
+        "kind": "behavior",
+        "required": true,
+        "verifier": {"type": "command_assert"},
+        "status": "UNPROVEN",
+        "evidence_ids": []
+      },
+      {
+        "id": "po:delivery:workspace-verified",
+        "name": "交付物在物化工作区中被真实验证",
+        "requirement_id": "req:root",
+        "claim": "verified workspace",
+        "kind": "delivery",
+        "required": true,
+        "verifier": {"type": "workspace_verified"},
+        "status": "UNPROVEN",
+        "evidence_ids": []
+      }
+    ]
+  },
+  "expect": {
+    "status": "UNPROVEN",
+    "can_pass": false,
+    "code": "required_proof_unproven",
+    "reason_contains": "verify_skipped"
+  }
+}

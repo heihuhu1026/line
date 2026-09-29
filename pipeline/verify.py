@@ -1999,6 +1999,7 @@ def verify(
     allowed_bins: frozenset[str] = frozenset(),
     deny_patterns: tuple[str, ...] = (),
     mock: bool = False,
+    project_type: str = "secondary",
 ) -> dict:
     """物化 → 计划 → 执行 → 汇总结论。返回可直接落盘/进 prompt 的 verify_report。"""
     report: dict[str, Any] = {
@@ -2011,26 +2012,61 @@ def verify(
         "notes": [],
         # 未验证项（强制披露）：见 unverified_claims
         "unverified": [],
+        # Proof Gate 事实（规格§二十）：executed=False 时 verdict 必然不是 PROVEN，
+        # review 语义 pass 也必须被机械闸门拦下。
+        "executed": False,
+        "reason_code": "",
+        "baseline_dir": "",
     }
     if not enabled:
         report["notes"].append("运行验证已关闭（PIPELINE_VERIFY=0）")
         report["summary"] = "未启用运行验证"
+        report["reason_code"] = "disabled"
         return report
     if not impl or not (impl.get("edits") or []):
         report["notes"].append("没有实现产物（dev 阶段未跑或没产出补丁），无可验证内容")
         report["summary"] = "没有可验证的实现产物"
-        return report
-    if not audit.get("source_available"):
-        # 没有仓库路径时，补丁既无法机械核对也无从物化 —— 与其空转出一堆
-        # 「未能套用」，不如直接把原因说清楚（新建项目要把生成目录作为 --repo 传进来）。
-        report["notes"].append(
-            "没有提供仓库路径：补丁无法核对与物化，运行验证无法进行"
-            "（新建项目请把生成目录作为 --repo 传入）"
-        )
-        report["summary"] = "没有仓库路径，运行验证无法进行"
+        report["reason_code"] = "no_implementation"
         return report
 
+    repo_path = Path(repo) if repo else None
+    if not audit.get("source_available"):
+        # 注意：source_available=True 但 repo 目录不存在（truthy Path）是历史既有的
+        # 「空基线」调用约定（analyze_all 按新增合并、materialize 走 _no_repo），
+        # 下游 smoke 与内部调用在用 —— 不能拦。这里只处理**明确没有 repo**（None）。
+        #
+        # 新建项目（规格§二十 P0-2）：没有仓库不是"无法验证"的理由 —— 自动建立
+        # ``runs/<id>/verify/base/`` 空基线，把所有 add 当新文件物化进沙箱后**真跑**。
+        # mock 不走这条（mock 只计划不执行，空基线物化会改变它既有产物形态）。
+        if project_type == "new" and not mock:
+            baseline = Path(run_dir) / "verify" / "base"
+            # analyze 需要 truthy 路径：文件在基线下不存在 ⇒ add 全部按新增合并，
+            # 返工轮同一文件的 modify 也以"本份 edits 的合并结果"为基准（见 analyze_all 注释）。
+            # 注意 materialize 会整体清空 verify/，audit 文本在此处一次性承载，基线目录
+            # 在物化完成后重建（见下方），保证 runs/<id>/verify/base/ 稳定可查。
+            audit = patches.analyze_all(baseline, impl)
+            repo = None  # 物化走 _no_repo 只读分支；内容以 audit 文本为准
+            report["baseline_dir"] = str(baseline)
+            report["notes"].append(
+                "新建项目无仓库基线：已建立空基线 verify/base/，补丁按新增文件物化为完整工作区后真跑"
+            )
+        else:
+            # 二次开发无仓库：可以 skipped，但 Proof Gate 会在 review 处机械阻断 pass
+            # （skipped != PROVEN；规格§二十）。
+            report["notes"].append(
+                "没有提供仓库路径：补丁无法核对与物化，运行验证无法进行"
+                "（新建项目请把生成目录作为 --repo 传入）"
+            )
+            report["summary"] = "没有仓库路径，运行验证无法进行"
+            report["reason_code"] = "no_repo"
+            return report
+
     mat = materialize(run_dir, repo, impl, audit, copy_limit_mb=copy_limit_mb, skip_dirs=skip_dirs)
+    if report["baseline_dir"]:
+        # materialize 整体清空过 verify/，这里把空基线目录重建为稳定锚点。
+        Path(report["baseline_dir"]).mkdir(parents=True, exist_ok=True)
+        # 交给编排器回写 state.patch_audit（落盘前由编排器 pop，不进 verify 产物正文）。
+        report["audit_for_state"] = audit
     report["sandbox"] = mat["work"]
     report["materialized"] = list(mat["written"])
     report["notes"].extend(mat["notes"])
@@ -2071,6 +2107,7 @@ def verify(
     if not specs:
         report["notes"].append("没有可执行的命令（测试阶段也没声明 automated_commands）")
         report["summary"] = "没有可执行的验证命令，无法确认能否运行"
+        report["reason_code"] = "no_commands"
         return report
     for spec in specs:
         # 常驻类入口（游戏/桌面窗口）跑满完整超时是白等：它的「跑满」本来就被
@@ -2094,6 +2131,7 @@ def verify(
     if mock:
         report["notes"].append("mock 运行：只计划命令、不执行")
         report["summary"] = "mock 运行，未真正执行"
+        report["reason_code"] = "mock"
         return report
 
     # 静态检查（零执行）：不依赖执行顺序，因此**不会**被语法错短路 —— 一次把所有问题列全。
@@ -2256,6 +2294,8 @@ def verify(
     # 会落到下面的 elif 分支判成 pass，把残缺的交付物放过去。
     if failed or static_problems or blocking:
         report["verdict"] = "fail"
+        report["executed"] = True
+        report["reason_code"] = "verify_failed"
         for cmd in failed:
             label = STATUS_CN.get(cmd["status"], cmd["status"])
             report["problems"].append(
@@ -2265,8 +2305,11 @@ def verify(
             )
     elif any(c["status"] == "ok" for c in executed):
         report["verdict"] = "pass"
+        report["executed"] = True
+        report["reason_code"] = "verify_passed"
     else:
         report["verdict"] = "skipped"
+        report["reason_code"] = report.get("reason_code") or "no_effective_command"
         report["notes"].append(
             "没有任何命令成功执行（被安全约定跳过 / 程序不可用），无法确认产物能否运行"
         )

@@ -1,0 +1,27 @@
+{
+  "id": "fixture-007-add-then-modify-patch",
+  "source_run": "20260927-123032",
+  "derived_from": ["18-verify.json；tools/smoke_patch_apply.py ①"],
+  "description": "真机 123032 回归锁定：新建项目空仓库，同批 edit 先 add 建文件、随后 modify 在刚 add 出的内容上改名修复。modify 必须在同批累积内容上核对成功并真的落盘（历史缺陷：modify 固定去空仓库找原文 ⇒ unchecked ⇒ 修复被静默丢弃，8 轮 verify 全 fail）。",
+  "scenario": "patches_apply",
+  "input": {
+    "repo_state": "empty",
+    "impl": {
+      "edits": [
+        {"path": "main.py", "change_type": "add",
+         "patch": "import tkinter\nfrom tkinter import event\n\ndef run():\n    return event\n"},
+        {"path": "main.py", "change_type": "modify", "patch_mode": "replace_span",
+         "anchor": "from tkinter import event", "patch": "from tkinter import Event as event"}
+      ]
+    }
+  },
+  "expect": {
+    "statuses": ["ok", "ok"],
+    "materialized_files": ["main.py"],
+    "content_contains": ["from tkinter import Event as event"],
+    "content_not_contains": ["from tkinter import event\n"],
+    "skipped_non_benign": 0,
+    "decision": null,
+    "recovery_stage": null
+  }
+}

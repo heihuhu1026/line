@@ -45,6 +45,8 @@ from . import (
 )
 from . import taskcompiler, tasktype
 from . import semantics
+from . import ontology
+from . import ontology_validate
 from . import verify as verify_mod
 from .budget import chars_for_tokens, estimate_tokens, fit_prompt
 from .config import (
@@ -455,11 +457,32 @@ class Orchestrator:
         """
         self._seq += 1
         assert self.run_dir is not None
+        base_stage, _task, _repair = self._parse_produced(stage)
+        chain = self.state.setdefault("artifact_chain", {})
+        prev_artifact = str(chain.get(base_stage) or "")
+        revisions = self.state.setdefault("artifact_revisions", {})
+        artifact_revision = int(revisions.get(base_stage) or 0) + 1
+        revisions[base_stage] = artifact_revision
         artifact_id, produced_by, caused_by = self._provenance(stage)
         if caused_by_extra:
             for aid in caused_by_extra:
                 if aid and aid not in caused_by:
                     caused_by.append(str(aid))
+        # Ontology 真值（规格§三）：verify 是机械产物 PROVEN；human_review 携带人工事实
+        # ASSERTED；其余阶段（含 intake/pm/plan/skeleton/dev/test/review LLM）一律 DERIVED。
+        artifact_truth = {
+            "verify": ontology.TRUTH_PROVEN,
+            "human_review": ontology.TRUTH_ASSERTED,
+        }.get(base_stage, ontology.TRUTH_DERIVED)
+        created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            input_hash = "h:" + ontology.stable_hash(
+                ontology.canonical_json([request_preview, system]), length=12)
+            output_hash = "h:" + ontology.stable_hash(
+                ontology.canonical_json(artifact), length=12)
+        except (TypeError, ValueError):
+            # 兜底：理论上产物都可 JSON 化；不可算 hash 时留空，不阻断落盘。
+            input_hash = output_hash = ""
         payload = {
             "stage": stage,
             # 建议⑰：artifact_id / produced_by / caused_by 放快照顶层（与 meta 平级），
@@ -467,6 +490,14 @@ class Orchestrator:
             "artifact_id": artifact_id,
             "produced_by": produced_by,
             "caused_by": caused_by,
+            # Ontology provenance（规格§三十三/三十四）：同一逻辑阶段再产出 ⇒ revision+1、
+            # supersedes 指向上版；输入/输出内容 hash 让两代产物可逐字比对。
+            "artifact_revision": artifact_revision,
+            "supersedes": [prev_artifact] if prev_artifact and prev_artifact != artifact_id else [],
+            "input_hash": input_hash,
+            "output_hash": output_hash,
+            "created_at": created_at,
+            "truth": artifact_truth,
             "meta": meta,
             "artifact": artifact,
             # 完整用户输入（不再截断）
@@ -484,8 +515,23 @@ class Orchestrator:
         with (self.run_dir / "llm-calls.jsonl").open("a", encoding="utf-8") as fh:
             # 规整成固定列（见 runstore.CALL_FIELDS）：列一定在，聚合脚本可以无条件取；
             # 不加这一层的话列集由 meta 的构造点隐式决定，缺列只有到聚合时才发现。
+            # 规格§五十七：补 artifact/ontology/task 三列 provenance（缺省 null，不臆造）。
+            task_semantic_id = ""
+            if _task:
+                for t in ((self.state.get("plan") or {}).get("tasks") or []):
+                    if isinstance(t, dict) and str(t.get("id") or "") == str(_task):
+                        task_semantic_id = str(t.get("semantic_task_id") or "")
+                        break
+            ont_desc = self.state.get("ontology_revision")
             record = runstore.normalize_call_record(
-                {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage, **meta}
+                {
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage,
+                    "artifact_id": artifact_id,
+                    "ontology_revision": (
+                        ont_desc.get("revision_id") if isinstance(ont_desc, dict) else ""),
+                    "task_semantic_id": task_semantic_id,
+                    **meta,
+                }
             )
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1372,11 +1418,18 @@ class Orchestrator:
         # 合并 / 清洗 / 冲突解决 / 推导全部在这里做完，Compiler 之后只读 IR。
         plan_obj0 = self.state.get("plan")
         file_imports = self._plan_file_imports(plan_obj0)
+        # 规格§三十四：人工裁决并回后再取 intake 条目，默认假设 DERIVED、裁决 ASSERTED
+        intake_merged = prompts.apply_intake_decisions(
+            self.state.get("intake") or {}, self.intake_decisions
+        )
         ir = planir.normalize_plan(
             plan_obj0,
             skeleton=self.state.get("skeleton") or {},
             previous=self.state.get("compiler_ir"),
             file_imports=file_imports,
+            scope=self.state.get("scope"),
+            original_requirement=self.requirement or "",
+            intake_rows=prompts.intake_items(intake_merged),
         )
         self.state["compiler_ir"] = ir
         self.state["plan_sources"] = ir.get("plan_sources")
@@ -1426,11 +1479,15 @@ class Orchestrator:
             if draft:
                 self.state["plan_draft_tasks"] = draft
         result = taskcompiler.compile_plan(
-            plan_obj, ir=ir, existing_files=self._existing_repo_files()
+            plan_obj, ir=ir, existing_files=self._existing_repo_files(),
+            # 上一版**已编译**施工图（不是架构师 draft）：用于 semantic_task_id 版本链。
+            previous_tasks=self.state.get("plan_compiled_tasks"),
         )
         errors = list(result.get("errors") or [])
         compiled = list(result.get("tasks") or [])
         self.state["plan_compile_errors"] = errors
+        if compiled:
+            self.state["plan_compiled_tasks"] = compiled
         if compiled and isinstance(plan_obj, dict):
             plan_obj["tasks"] = compiled
             plan_obj["tasks_compiled"] = True
@@ -1440,6 +1497,10 @@ class Orchestrator:
         for err in errors:
             self.log(f"        [Task Compiler·错误] {err.get('detail')}")
         self.state["plan"] = self._ensure_entry_task(plan_obj)
+        # 方案定稿的语义图也留一个只追加版本（Requirement/Claim/PO/Constraint 投影）。
+        plan_ont = ir.get("ontology")
+        if isinstance(plan_ont, dict):
+            self._persist_ontology(ontology.OntologyGraph.from_dict(plan_ont), "architect_plan")
         return errors
 
     #: compile error code → Design Gate 阻断 kind。容量与依赖两类都是
@@ -1485,6 +1546,51 @@ class Orchestrator:
                     )
         for gap in self.state.get("skeleton_gaps") or []:
             blockers.append({"kind": "skeleton_mismatch", "detail": str(gap)})
+        # ④' Ontology：冻结骨架相对方案的**越权**（方向与 skeleton_gaps 相反）——
+        # 第二次 LLM 调用私自新增文件/扩大符号面，属于方案层自相矛盾，开发无权跟着扩。
+        plan_obj = self.state.get("plan")
+        skeleton = self.state.get("skeleton")
+        if isinstance(plan_obj, dict) and isinstance(skeleton, dict) and skeleton:
+            overreach = planir.skeleton_overreach(plan_obj, skeleton)
+            for extra_file in overreach.get("extra_files") or []:
+                blockers.append({
+                    "kind": "skeleton_overreach_file",
+                    "file": extra_file,
+                    "detail": f"接口骨架新增了方案 changes 未规划的文件 {extra_file}（骨架无权扩大方案边界）",
+                })
+            for extra_path, names in (overreach.get("extra_symbols") or {}).items():
+                blockers.append({
+                    "kind": "skeleton_overreach_symbol",
+                    "file": extra_path,
+                    "symbols": names,
+                    "detail": f"{extra_path}: 骨架多出方案未声明的符号 {'、'.join(names)}（以方案为准重冻骨架或回架构师）",
+                })
+        # ④'' Ontology：PM 的每条 Requirement 必须能确定性挂到至少一个施工单元。
+        # 全量挂不上（不是个别 FR）才阻断 —— 个别匹配失败常见于 FR 与文件名/符号完全
+        # 无字面重合，留作 ontology_design_problems 暴露；**所有**需求都无落点则方案与
+        # 需求无关，是方案层硬矛盾（规格§二十六：Task 必须 implements Requirement）。
+        if isinstance(ir, dict):
+            links = ir.get("ontology_links")
+            if isinstance(links, dict):
+                unlinked = list(links.get("unlinked_requirements") or [])
+                by_file = links.get("by_file") or {}
+                linked_count = len({r for v in by_file.values() for r in (v.get("requirements") or [])})
+                self.state["ontology_design_problems"] = {
+                    "unlinked_requirements": unlinked,
+                    "unlinked_files": list(links.get("unlinked_files") or []),
+                    "linked_requirement_count": linked_count,
+                }
+                scope = self.state.get("scope")
+                total = len(ontology.requirement_claims(scope)) if isinstance(scope, dict) else 0
+                if total and unlinked and linked_count == 0 and (ir.get("units") or []):
+                    blockers.append({
+                        "kind": "requirement_unanchored",
+                        "detail": (
+                            f"PM 的 {total} 条功能需求没有一条能机械挂到施工单元"
+                            "（文件/符号/变更描述与需求无字面重合）——方案与需求脱节，"
+                            "请回架构师按需求重拆，而不是让开发自行揣测"
+                        ),
+                    })
         # ⑤ ``uses_cycle`` —— contracts.uses 在任务**之间**成环。
         # g4 会把 uses 翻译成文件头**必须**写的顶层 import：uses 成环 ⇒ 顶层互导 ⇒
         # 运行即 ImportError（真机 20260928-221831：errors↔cli，三轮没修掉）。
@@ -2893,6 +2999,29 @@ class Orchestrator:
             shutil.rmtree(tmp, ignore_errors=True)
         return problems
 
+    @staticmethod
+    def _manifest_digest(root: Path | None) -> str:
+        """工作区内容寻址摘要（规格§四十一）：``sha256(排序后的 相对路径+文件sha256)``。
+
+        纯机械、确定性：同一文件集必得同一 digest，与物化顺序无关。用于 task transaction
+        的 base/result WorkspaceRevision 身份。目录不存在/为空 ⇒ 空串（不伪造 revision）。
+        """
+        if root is None or not root.is_dir():
+            return ""
+        items: list[str] = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root).as_posix()
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            items.append(f"{rel}:{digest}")
+        if not items:
+            return ""
+        return "wsr:wip:" + hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()[:16]
+
     def _task_txn_checkpoint(
         self,
         task: dict,
@@ -2925,7 +3054,46 @@ class Orchestrator:
         ]
         compile_errs = self._py_compile_problems(touched)
         problems = [*lease, *mat.get("problems", []), *compile_errs]
+
+        # 规格§四十一：每个 task transaction 记录语义边界 —— 从哪个 workspace revision
+        # 起、物化到哪个 revision、是哪个语义任务的哪个补丁、带了哪些机械快检证据。
+        # 链式内容寻址：base = 轮次基线 + 本任务之前已累积补丁；result = 本次物化后工作区。
+        def _base_rev() -> str:
+            base_manifest = self._manifest_digest(getattr(self, "_wip_base", None))
+            try:
+                prior = ontology.stable_hash(
+                    ontology.canonical_json((merged or {}).get("edits") or []), length=10)
+            except (TypeError, ValueError):
+                prior = ""
+            return f"{base_manifest}+prior:{prior}" if (base_manifest or prior) else ""
+
+        def _ledger(cur_data: Any, cur_mat: dict, probs: list[str], reasked: bool) -> None:
+            try:
+                patch_id = "patch:" + ontology.stable_hash(
+                    ontology.canonical_json(cur_data if isinstance(cur_data, dict) else {}),
+                    length=12)
+            except (TypeError, ValueError):
+                patch_id = ""
+            compile_checks = [
+                f"py_compile:{rel}:ok" for rel in touched
+            ] if not compile_errs else [f"py_compile:{rel}:FAILED" for rel in touched]
+            self.state.setdefault("task_transactions", []).append({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "round": self.attempt,
+                "task": tid,
+                "task_semantic_id": str(task.get("semantic_task_id") or ""),
+                "patch_id": patch_id,
+                "base_workspace_revision": _base_rev(),
+                "result_workspace_revision": self._manifest_digest(getattr(self, "_wip_dir", None)),
+                "verification_evidence_ids": compile_checks + (
+                    ["materialization"] if cur_mat.get("written") else []),
+                "status": "escalated" if probs else "committed",
+                "reasked": reasked,
+                "problems": [str(p) for p in probs][:10],
+            })
+
         if not problems:
+            _ledger(cand, mat, [], False)
             return data
         self.log(
             f"        [任务事务点] {tid} 快检发现 {len(problems)} 个问题（租约 {len(lease)} / "
@@ -2973,6 +3141,8 @@ class Orchestrator:
                 f"        [任务事务点] {tid} 重问后残留 {len(problems)} 个问题 → 留痕升级"
                 f"（不阻塞后续施工图）：{problems[0][:160]}"
             )
+        # 重问后的最终事务边界（只记一条终态；首版快检通过已在前面提前记账返回）。
+        _ledger(cand, mat, problems, True)
         return data
     # ===================== G3/G4 结束 =====================
 
@@ -3873,7 +4043,14 @@ class Orchestrator:
             allowed_bins=VERIFY_ALLOWED_BINS,
             deny_patterns=VERIFY_DENY_PATTERNS,
             mock=mock,
+            project_type=self.project_type,
         )
+        # new 项目无仓库时，verify 内部建了 verify/base 空基线并按新增文件重新审计；
+        # 回写 patch_audit，让下游契约核对/评审看到的审计与物化用的同一份。
+        audit_used = report.pop("audit_for_state", None)
+        if isinstance(audit_used, dict):
+            self.state["patch_audit"] = audit_used
+            audit = audit_used
         report["mode"] = "mock" if mock else "real"
         report["elapsed_s"] = round(time.time() - started, 2)
         # 落盘后的第二道红线 + 记录卫生：
@@ -3901,6 +4078,9 @@ class Orchestrator:
             contract = verify_mod.contract_check(
                 work, list(report.get("materialized") or []), self.state.get("plan")
             )
+            # 规格§十八：显式留痕「契约路这轮真跑过」，Interface Freeze 双证据判定需要
+            # 区分「检查跑过且无问题(PROVEN)」与「检查根本没跑(UNPROVEN)」。
+            self.state["contract_checked"] = True
             self.state["contract_problems"] = list(contract.get("problems") or [])
             if contract.get("problems"):
                 self.log(
@@ -3918,6 +4098,9 @@ class Orchestrator:
             conformance = verify_mod.skeleton_conformance(
                 work, list(report.get("materialized") or []), self.state.get("skeleton")
             )
+            # 规格§十八：完整骨架一致性结果（含 by_file/mismatch）留给 Ontology Proof Gate
+            # 做 Interface Freeze 的**第二路证据**；{} 表示本轮无冻结基准（该路 UNPROVEN）。
+            self.state["skeleton_conformance"] = dict(conformance)
             if conformance.get("missing"):
                 # **不进 `contract_problems`（不判负）**：它核的是「骨架（方案期第二次调用）
                 # 与产物」的一致性，而骨架与方案本身可能互相不一致 —— 真机 20260927-123032：
@@ -5382,6 +5565,167 @@ class Orchestrator:
             "evidence_clean_reason": clean_reason,
         }
 
+    def _persist_ontology(self, graph: ontology.OntologyGraph, stage: str) -> None:
+        """把当前语义图存为只追加的新版本（runstore 只存储，不裁决）。
+
+        ``only`` 模式 / 无 run_dir 时安全跳过。版本描述符登记进 state，供 Transition
+        Record 与回放回答「这轮裁决基于哪一版语义图」。
+        """
+        if self.run_dir is None or self.mode == "only":
+            return
+        try:
+            descriptor = runstore.write_ontology(self.run_dir, graph.to_dict(), stage=stage)
+        except OSError as exc:
+            self.log(f"  [Ontology] 语义图版本落盘失败（不影响裁决）：{type(exc).__name__}")
+            return
+        self.state["ontology_revision"] = descriptor
+        history = self.state.setdefault("ontology_revisions", [])
+        history.append(descriptor)
+
+    def _proof_gate(self, *, blockers: list[str], plan_gap: bool,
+                    contract_problems: list[str]) -> dict:
+        """规格§二十/§四十五：构建 Requirement→Claim→PO 语义图并做机械三态裁决。
+
+        纯读 state / 纯函数（ontology + ontology_validate），不调用模型。
+        mock 运行不进本闸门（mock 只计划不执行，skipped 是其固有形态）。
+        """
+        scope = self.state.get("scope")
+        scope = scope if isinstance(scope, dict) else {}
+        # 以 Plan IR 的语义投影为底（Requirement/Claim/PO/Constraint/Invariant），
+        # 再叠加编译后 Task —— 与 P0-2 保持**同一张图、同一真源**，不另起炉灶。
+        ir = self.state.get("compiler_ir")
+        base = ir.get("ontology") if isinstance(ir, dict) else None
+        graph = ontology.OntologyGraph.from_dict(base) if isinstance(base, dict) else ontology.OntologyGraph()
+        if graph.get("req:root") is None:
+            ontology.build_requirement_projection(
+                graph, scope, original_requirement=self.requirement or ""
+            )
+        plan = self.state.get("plan")
+        tasks = (plan.get("tasks") or []) if isinstance(plan, dict) else []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            tid = str(task.get("semantic_task_id") or task.get("id") or "")
+            if not tid or graph.get(tid) is not None:
+                continue
+            graph.add(ontology.SemanticObject(
+                id=tid, type=ontology.TYPE_TASK, truth=ontology.TRUTH_DERIVED,
+                payload={
+                    "task_id": str(task.get("id") or ""),
+                    "title": str(task.get("title") or ""),
+                    "target_files": list(task.get("target_files") or []),
+                    "symbols": list(task.get("symbols") or []),
+                    "task_revision": task.get("task_revision") or 1,
+                    "supersedes": list(task.get("supersedes") or []),
+                },
+                provenance=[ontology.Provenance(source="taskcompiler", stage="compile_plan")],
+            ))
+            for req_id in (task.get("implements_requirements") or []):
+                if graph.get(str(req_id)) is not None:
+                    graph.relate(tid, "implements", str(req_id), truth=ontology.TRUTH_DERIVED)
+            for po_id in (task.get("proof_obligations") or []):
+                if po_id in graph.obligations:
+                    graph.relate(tid, "carries_obligation", str(po_id), truth=ontology.TRUTH_DERIVED)
+        verify_report = self.state.get("verify_report")
+        verify_report = verify_report if isinstance(verify_report, dict) else {}
+        ontology.evaluate_against_verify(
+            graph, verify_report, contract_problems=contract_problems,
+            skeleton_conformance=self.state.get("skeleton_conformance"),
+            contract_checked=bool(self.state.get("contract_checked")),
+            at=str(self.attempt or ""),
+        )
+        no_power = list(
+            ((verify_report.get("negative_control") or {}) or {}).get("no_power") or []
+        )
+        verdict = str(verify_report.get("verdict") or "skipped")
+        proof = ontology.release_proof_status(
+            semantic_pass=True,  # 问的是「机械证据是否齐备」，与语义建议解耦
+            mechanical_blockers=blockers,
+            verify_verdict=verdict,
+            obligations=list(graph.obligations.values()),
+            workspace_verified=verdict == "pass",
+            negative_control_no_power=no_power,
+            unresolved_contracts=[],  # 契约问题已在 blockers 中，避免双重计数
+            plan_gap=plan_gap,
+        )
+        # 语义图自身校验结果留痕（issues 派生视图 P1 使用，本轮只记录不重复裁决）。
+        self.state["ontology"] = graph.to_dict()
+        self.state["ontology_problems"] = ontology_validate.validate_all(graph)
+        self.state["proof_gate"] = proof
+        self._persist_ontology(graph, "review")
+        if proof["status"] != "PROVEN":
+            self.log(
+                f"  [ProofGate] status={proof['status']} can_pass={proof['can_pass']}"
+                f"（缺证 {len(proof['mandatory_missing'])} / 失败 {len(proof['failed'])}）"
+            )
+        return proof
+
+    def _project_failure_ontology(self, record: dict, led: dict) -> None:
+        """规格§二十四/二十六/二十七：开缺陷 + 归因 + 恢复策略投影到**同一张**语义图。
+
+        overlay 纪律：只追加、不裁决、不阻断路由（任何异常仅记日志）；mock 无图可投时
+        直接返回。Defect 的责任 Task 由 taskcompiler.resolve_bug_task 机械解析，
+        禁止按 T-id 猜；verify/traceback 类缺陷同时关联本轮 FAILED 的 PO。
+        """
+        try:
+            base = self.state.get("ontology")
+            if not isinstance(base, dict):
+                return
+            graph = ontology.OntologyGraph.from_dict(base)
+            plan = self.state.get("plan")
+            tasks = (plan.get("tasks") or []) if isinstance(plan, dict) else []
+            rows = [r for r in (self.state.get("defect_verdicts") or []) if isinstance(r, dict)]
+            rows_by_key = {diagnose.defect_key(r): r for r in rows}
+            failed_po_ids = [
+                po.id for po in graph.obligations.values()
+                if po.status == ontology.PO_STATUS_FAILED
+            ]
+            defect_ids: list[str] = []
+            resolutions: dict[str, dict] = {}
+            for key in sorted(str(k) for k in (led.get("open") or {}).keys()):
+                row = rows_by_key.get(key) or {}
+                mapping = taskcompiler.resolve_bug_task(row, tasks)
+                resolutions[key] = mapping
+                kind = str(row.get("kind") or "")
+                source = str(row.get("source") or "")
+                po_ids = failed_po_ids if (
+                    kind.startswith("traceback") or kind == "verify" or source == "verify"
+                ) else []
+                did = ontology.project_defect(
+                    graph, key=key, row=row,
+                    task_id=str(mapping.get("semantic_task_id") or ""),
+                    po_ids=po_ids,
+                )
+                defect_ids.append(did)
+            # 解析留痕：matched_by/candidates 供 issues 派生视图与人工审计（不改变路由）
+            self.state["defect_task_resolution"] = resolutions
+
+            failure = record.get("failure") if isinstance(record.get("failure"), dict) else {}
+            ftype = str(failure.get("type") or "")
+            if ftype:
+                fid = ontology.failure_id(self.attempt, ftype)
+                rid = "rec:" + ontology.stable_hash(
+                    ontology.canonical_json([fid, int(self.attempt or 0)]), length=12
+                )
+                ontology.project_recovery(
+                    graph, rid=rid,
+                    recovery=record.get("recovery") or {},
+                    round_no=int(self.attempt or 0),
+                )
+                ontology.project_failure(
+                    graph, fid=fid, failure=failure,
+                    round_no=int(self.attempt or 0),
+                    defect_ids=defect_ids, recovery_id=rid,
+                )
+                self.state["recovery_trace"] = ontology.trace_recovery_owner(graph, fid)
+                self.state["ontology_failure_id"] = fid
+
+            self.state["ontology"] = graph.to_dict()
+            self.state["ontology_problems"] = ontology_validate.validate_all(graph)
+            self._persist_ontology(graph, "recovery")
+        except Exception as exc:  # noqa: BLE001 —— overlay 永不阻断主路由
+            self.log(f"  [Ontology] Failure 投影失败（不影响裁决）：{type(exc).__name__}: {exc}")
+
     def _normalize_review(self, review: dict) -> tuple[list[str], list[str], list[str], bool]:
         """把评审的返工项按作用域分三档；全是 needs_external 时强制放行（防止无意义空转）。
 
@@ -5498,6 +5842,14 @@ class Orchestrator:
         # ==================================================== 第三层：确定性裁决（纯函数单一真源）
         # verdict 只是语义层的**建议**；最终去向由机械事实 + 建议按 diagnose.review_decision
         # 的固定规则算出。规则不要散在编排器里（历史上散在 5 段 if 中，改动容易只改一半）。
+        # Proof Gate（规格§二十）：mock 运行只计划不执行，skipped 是固有形态，不进闸门；
+        # 真机运行必须凭机械证据 PROVEN 才能 pass —— verify skipped 时语义 pass 也翻回 rework_dev。
+        proof = None
+        if not isinstance(self.client, MockClient):
+            proof = self._proof_gate(
+                blockers=list(blockers), plan_gap=bool(gap_files),
+                contract_problems=list(facts["contract_problems"]),
+            )
         decision = diagnose.review_decision(
             semantic_verdict=semantic_verdict,
             blocked=bool(blockers),
@@ -5506,6 +5858,7 @@ class Orchestrator:
             plan_gap=bool(gap_files),
             verify_pass=str(facts.get("verify_verdict") or "") == "pass",
             evidence_clean=bool(facts.get("evidence_clean")),
+            proof=proof,
         )
         action = decision["action"]
         review["verdict"] = decision["verdict"]
@@ -5566,6 +5919,25 @@ class Orchestrator:
                 f"  [机制] 机械证据全绿 + verify pass → 评审的 {len(in_material)} 项实现层返工项"
                 "降级为残留风险，强制 pass 进人工审核闸门"
             )
+        elif action in (diagnose.DECISION_PROOF_UNPROVEN, diagnose.DECISION_PROOF_FAILED):
+            # Proof Gate 翻回 rework_dev：给实现轮一条**可执行**的整改内容，
+            # 否则空 in_material 会让返工无的放矢（真机 121404：verify skipped 后
+            # 评审走完流程，缺陷直到交付才暴露）。
+            if proof:
+                bucket = (proof["failed"] if action == diagnose.DECISION_PROOF_FAILED
+                          else proof["mandatory_missing"])
+                head = "机械验证失败" if action == diagnose.DECISION_PROOF_FAILED else "缺少必需机械证据"
+                in_material.append(
+                    f"修复：{head}（UNPROVEN_REQUIRED_EVIDENCE）—— "
+                    + "；".join(str(x) for x in bucket[:4])
+                    + "。请补齐：物化工作区可运行、测试/入口命令真实执行且断言成立"
+                      "（verify skipped / dev self_check / WAIVED 都不能算 PROVEN）"
+                )
+            reasons.append(decision["reason"])
+            self.log(
+                "  [ProofGate] 必需机械证据不成立 → 翻回 rework_dev"
+                f"（action={action}）"
+            )
 
         # 入口纠正本身不翻转 verdict，但必须留痕（旧版这条原因错嵌在漏项分支里，一并归位）。
         if entry_hit and action not in (diagnose.DECISION_PLAN_ARCH,):
@@ -5578,6 +5950,8 @@ class Orchestrator:
         review["residual_risks"] = residual
         review["required_fixes_detail"] = detail
         review["reasons"] = reasons
+        # Proof Gate 裁决随评审产物留痕（mock 运行为 None）。
+        review["proof_status"] = proof
         return in_material, architect, external, forced_pass
 
     # ------------------------------------------------------------------ 状态持久化
@@ -5630,6 +6004,22 @@ class Orchestrator:
             self._presence.stage = self.cursor
         runstore.write_state(self.run_dir, self._snapshot())
         self._write_prd()
+        # 规格§三十九：issues 是 ontology/state 的**派生视图**，每次持久化都即时重算覆盖 —
+        # 不让「state 已 degraded/failure、issues.json 还停在上一版」。pause/end 另有全量。
+        self._refresh_issues()
+
+    def _refresh_issues(self) -> None:
+        """即时重算并落盘 issues 派生视图（json/jsonl/md）。纯派生、重算即覆盖。
+
+        任何失败都**不阻断**主流水线（issues 只是诊断展示层，不是语义真源，规格§三十八）。
+        """
+        if self.run_dir is None or self.mode == "only":
+            return
+        try:
+            collected = issues_mod.collect_issues(self._snapshot(), self.run_id)
+            issues_mod.write_issues(self.run_dir, self.run_id, collected)
+        except (OSError, ValueError, TypeError) as exc:
+            self.log(f"  [issues] 派生视图刷新失败（不影响运行）：{type(exc).__name__}")
 
     def _start_presence(self) -> None:
         """起在场标记（幂等）。写入失败不该影响流水线本身。"""
@@ -5857,6 +6247,25 @@ class Orchestrator:
         不再需要翻日志。
         """
         ir = self.state.get("compiler_ir")
+        # 规格§三十五：Transition Record 带上语义坐标 —— 基于哪一版语义图、哪个工作区
+        # revision、哪些 PO/证据没过、恢复原因。语义图只在真机 Proof Gate 后存在，
+        # 缺省一律安全留空（旧 run / mock 不受影响）。overlay 读取永不阻断路由。
+        ont_desc = self.state.get("ontology_revision")
+        ontology_version = str(ont_desc.get("revision_id") or "") if isinstance(ont_desc, dict) else ""
+        workspace_revision = ""
+        po_ids: list[str] = []
+        ev_ids: list[str] = []
+        try:
+            ont_state = self.state.get("ontology")
+            if isinstance(ont_state, dict):
+                graph_now = ontology.OntologyGraph.from_dict(ont_state)
+                workspace_revision = str(graph_now.head_revision() or "")
+                for po in graph_now.obligations.values():
+                    if po.required and po.status != ontology.PO_STATUS_PROVEN:
+                        po_ids.append(po.id)
+                        ev_ids.extend(e for e in po.evidence_ids if e)
+        except (TypeError, ValueError, KeyError):
+            pass
         rec = {
             "seq": len(self.state.get("transitions") or []) + 1,
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -5870,6 +6279,13 @@ class Orchestrator:
             "task_version": planir.tasks_digest(
                 ir if isinstance(ir, dict) and ir.get("units") else (self.state.get("plan") or {})
             ),
+            # Ontology 语义坐标（规格§三十五）：回放「为什么回 dev」能直接定位
+            # defect → violates PO → failed evidence → recovery，而不只是一个 reason 字符串。
+            "ontology_version": ontology_version,
+            "workspace_revision": workspace_revision,
+            "proof_obligation_ids": sorted(set(po_ids))[:20],
+            "evidence_ids": sorted(set(ev_ids))[:20],
+            "recovery_reason": str(reason or ""),
             "review_due_reason": due_reason,
         }
         self.state.setdefault("transitions", []).append(rec)
@@ -6247,6 +6663,8 @@ class Orchestrator:
             "action", "retry_owner"
         )
         self.state.setdefault("failure_history", []).append(history_rec)
+        # Ontology overlay：本轮开缺陷 → Defect、归因 → Failure、策略 → Recovery（只投影不裁决）
+        self._project_failure_ontology(record, led)
         for line in diagnose.render(record):
             self.log(line)
         if record["needs_human"]:
@@ -6460,7 +6878,9 @@ class Orchestrator:
             # 裁决一致性：判据**现算**（人工可能直接编辑了 02-pm.json），与 PM 返工、
             # 作业层 gateway 用同一份 prompts.pm_decision_conflicts。
             conflicts = self._pm_decision_conflicts()
-            if left["pending"] or left["vague"] or conflicts:
+            # 跨字段同级事实矛盾（规格§三十三）：优先级仲裁后仍对立的 CONTRADICTION
+            contradictions = self._claim_contradictions()
+            if left["pending"] or left["vague"] or conflicts or contradictions:
                 bits: list[str] = []
                 if left["pending"]:
                     bits.append("未裁决的未决项：" + "；".join(left["pending"][:4]))
@@ -6471,6 +6891,15 @@ class Orchestrator:
                         "裁决与需求/验收自相矛盾（一律以裁决为准，或直接编辑产物消除矛盾）："
                         + "；".join(prompts.pm_decision_conflict_lines(conflicts)[:4])
                     )
+                if contradictions:
+                    lines = []
+                    for item in contradictions[:4]:
+                        fact_txt = " ⨯ ".join(
+                            f"{f['where']}「{f['text']}」（{f['polarity']}）"
+                            for f in item.get("facts", [])
+                        )
+                        lines.append(f"同级事实冲突[{ '/'.join(item.get('sources') or []) }]：{fact_txt}")
+                    bits.append("事实同级冲突且无法按优先级裁决（必须人工选定，不允许猜）：" + "；".join(lines))
                 spec = flow.gate_spec("pm")
                 return Interrupt(
                     stage,
@@ -6513,6 +6942,50 @@ class Orchestrator:
         scope = prompts.normalize_pm_questions(self.state.get("scope"))
         merged = prompts.apply_pm_decisions(scope, self.pm_decisions)
         return prompts.pm_decision_conflicts(merged)
+
+    def _claim_contradictions(self) -> list[dict[str, Any]]:
+        """规格§三十三：跨字段**同级**事实矛盾（CONTRADICTION 阻断，不猜赢家）。
+
+        流程：``prompts.claim_conflict_groups`` 机械发现极性翻转的事实组 →
+        ``ontology.reconcile_claims`` 按事实优先级仲裁：
+
+          * 不同级（人工裁决 vs PM 推断 / 高优先 vs 低优先）⇒ 高者胜，低者记
+            ``state.claim_conflicts_resolved``（不因字段先后翻转）；
+          * 最高层同级仍对立 ⇒ 返回阻断项，PM 闸门暂停交人工。
+
+        现算（人工可能直接改过产物），与 ``_pm_decision_conflicts`` 同纪律。
+        """
+        scope = prompts.normalize_pm_questions(self.state.get("scope"))
+        scope = prompts.apply_pm_decisions(scope, self.pm_decisions)
+        intake = prompts.apply_intake_decisions(
+            self.state.get("intake") or {}, self.intake_decisions
+        )
+        rows = prompts.intake_items(intake)
+        blocking: list[dict[str, Any]] = []
+        resolved: list[dict[str, Any]] = []
+        for gi, group in enumerate(prompts.claim_conflict_groups(scope, rows)):
+            claims = [
+                {"id": f["id"], "subject": f"conflict-group-{gi}",
+                 "polarity": f["polarity"], "source": f["source"], "truth": f["truth"]}
+                for f in group
+            ]
+            verdict = ontology.reconcile_claims(claims)
+            if verdict["contradictions"]:
+                blocking.append({
+                    "reason": "same_level_conflict",
+                    "sources": sorted({str(f.get("source") or "") for f in group}),
+                    "facts": [
+                        {"where": f.get("where") or "", "text": f.get("text") or "",
+                         "source": f.get("source") or "",
+                         "polarity": "肯定" if f.get("polarity") == 1 else "否定"}
+                        for f in group
+                    ],
+                })
+            else:
+                resolved.extend(verdict["overridden"])
+        # 高优先级覆盖记录留痕（只追加，供 issues 派生视图/回放）
+        self.state["claim_conflicts_resolved"] = resolved
+        return blocking
 
     def _should_pause(self, stage: str) -> bool:
         """兼容旧签名的薄包装：等价于「该阶段之后是否会 interrupt」。"""

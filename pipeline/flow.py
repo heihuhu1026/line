@@ -350,6 +350,16 @@ def validate() -> list[str]:
             if not isinstance(fn, str) or not fn.startswith("_"):
                 problems.append(f"游标 {node} 的处理函数名 {fn!r} 不像私有方法名")
 
+    # 7) Ontology Schema Guardian（规格§五十八）：本体登记表（predicate 白名单 /
+    #    PO verifier / 证据 kind / Invariant 可执行检查 / 版本号）自洽性在**启动期**
+    #    就核 —— 漏登记一个谓词或 verifier，不等真机跑到第 6 轮、这里直接报错。
+    try:
+        from . import ontology
+    except ImportError:  # 极端裁剪场景没有本体模块时不拖垮 flow 自身校验
+        ontology = None  # type: ignore[assignment]
+    if ontology is not None:
+        problems.extend(f"Ontology Schema：{p}" for p in ontology.schema_self_check())
+
     return problems
 
 

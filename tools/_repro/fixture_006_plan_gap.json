@@ -1,0 +1,34 @@
+{
+  "id": "fixture-006-plan-gap",
+  "source_run": "",
+  "derived_from": ["规格§三十五 Transition；diagnose.PLAN_GAP 责任表"],
+  "description": "缺陷指向方案根本没规划的文件（plan_gap）：Proof Gate 记 UNPROVEN（plan_gap 是缺证不是失败证据），语义评审即使想 pass 也必须回到架构方案补规划（rework_architect / plan_rework_architect），责任 planning_failure/architect，恢复阶段 architect_plan。",
+  "scenario": "plan_gap",
+  "input": {
+    "release": {
+      "semantic_pass": true,
+      "verify_verdict": "skipped",
+      "workspace_verified": false,
+      "plan_gap": true
+    },
+    "review": {
+      "semantic_verdict": "pass",
+      "blocked": false,
+      "has_in_material": true,
+      "has_architect_fixes": true,
+      "plan_gap": true
+    },
+    "reason_code": "plan_gap"
+  },
+  "expect": {
+    "proof_status": "UNPROVEN",
+    "proof_code": "required_proof_unproven",
+    "reason_contains": "plan_gap",
+    "can_pass": false,
+    "decision": "rework_architect",
+    "decision_action": "plan_rework_architect",
+    "failure_type": "planning_failure",
+    "owner_role": "architect",
+    "recovery_stage": "architect_plan"
+  }
+}

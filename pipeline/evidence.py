@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Iterable
+
+from . import ontology
 
 #: 判定"这条用例对着这条验收标准"的两个条件：重合词数 ≥ MIN 且 **覆盖率 ≥ RATIO**。
 #:
@@ -125,6 +128,62 @@ def delivery_evidence(
         # 匹配是启发式：写进产物里，免得有人拿它当"已核对"的证据
         "match_note": "验收标准 ↔ 用例的匹配为关键词启发式（重合 ≥2 个词），仅供人工定位，不作为判定依据",
     }
+
+
+# ----------------------------------------------------------------- Ontology Evidence（规格§三十二）
+#: 与 ontology.EVIDENCE_KINDS 同一份口径（机械/执行/规则类可 PROVEN；human_confirmation 只能 ASSERTED）。
+def make_evidence(
+    kind: str,
+    source: str,
+    *,
+    status: str = ontology.PO_STATUS_UNPROVEN,
+    claim_ids: Iterable[str] | None = None,
+    proof_obligation_ids: Iterable[str] | None = None,
+    workspace_revision: str = "",
+    artifact_revision: str = "",
+    command: str = "",
+    exit_code: int | None = None,
+    stdout_hash: str = "",
+    stderr_hash: str = "",
+    digest: str = "",
+    created_at: str = "",
+    truth: str | None = None,
+    evidence_id: str = "",
+) -> dict[str, Any]:
+    """构造一条与 ``ontology.EvidenceRecord`` 同形的证据 dict（纯函数，可直接 JSON 化）。
+
+    真值纪律在这里机械落实，调用方不能靠措辞抬级：
+
+      * ``human_confirmation`` 永远是 ``ASSERTED``（规格§四十六：人工确认不是 PROVEN）；
+      * 其余证据默认 ``DERIVED``；只有真实命令/机械检查的调用方才允许显式传
+        ``truth=PROVEN``（且 ``ontology_validate`` 还会复核 command/exit_code/checker）。
+    """
+    if kind == "human_confirmation":
+        truth = ontology.TRUTH_ASSERTED
+    elif truth is None:
+        truth = ontology.TRUTH_DERIVED
+    if not evidence_id:
+        evidence_id = "ev:" + ontology.stable_hash(
+            [kind, source, command, workspace_revision, digest], length=12
+        )
+    record = ontology.EvidenceRecord(
+        id=evidence_id,
+        kind=str(kind or ""),
+        source=str(source or ""),
+        status=str(status or ontology.PO_STATUS_UNPROVEN),
+        claim_ids=[str(x) for x in (claim_ids or [])],
+        proof_obligation_ids=[str(x) for x in (proof_obligation_ids or [])],
+        workspace_revision=str(workspace_revision or ""),
+        artifact_revision=str(artifact_revision or ""),
+        command=str(command or ""),
+        exit_code=exit_code,
+        stdout_hash=str(stdout_hash or ""),
+        stderr_hash=str(stderr_hash or ""),
+        digest=str(digest or ""),
+        created_at=str(created_at or time.strftime("%Y-%m-%d %H:%M:%S")),
+        truth=truth,
+    )
+    return record.to_dict()
 
 
 def render_markdown(ev: dict[str, Any], *, limit: int = 12) -> str:

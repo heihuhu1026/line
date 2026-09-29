@@ -35,6 +35,9 @@ SUITES = [
     "smoke_prompts.py",   # 角色隔离：三类任务各自一套契约（结构性风险，必须常跑）
     "smoke_planir.py",    # 编译层：归一 / 符号解析 / 编译器
     "smoke_diagnose.py",  # 失败归因 + 缺陷台账
+    "smoke_ontology.py",  # Ontology Kernel：三级真值 / Proof Gate / 语义身份
+    "smoke_fixtures.py",  # 规格§四十九：_repro fixture 002–008 真机形态回放
+    "smoke_testcompiler.py",  # Test Compiler：PO→可执行场景 / 覆盖缺口 / 弱证据
     "smoke_mock.py",
     "smoke_console.py",   # 较慢：会起临时服务
 ]

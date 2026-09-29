@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import ontology
 from .config import MAX_TASKS_PER_FILE
 
 #: 单张施工图最多承载几个符号（与 dev 单轮输出能力匹配）
@@ -52,6 +53,7 @@ def compile_plan(
     max_symbols: int = MAX_SYMBOLS_PER_TASK,
     ir: Any = None,
     existing_files: set[str] | None = None,
+    previous_tasks: Any = None,
 ) -> dict:
     """编译入口（**带错误通道**）：返回 ``{"tasks": [...], "errors": [...]}``。
 
@@ -75,6 +77,10 @@ def compile_plan(
         tasks, errors = _compile_from_units(units, max_symbols=max_symbols)
     else:
         tasks, errors = _compile_from_changes(plan, max_symbols=max_symbols)
+    # Ontology 语义身份/版本链（规格§十四）：跨重编号稳定 + rework 修订可追。
+    if previous_tasks is None and isinstance(plan, dict):
+        previous_tasks = plan.get("tasks")
+    _annotate_semantic_revisions(tasks, previous_tasks)
     _annotate_create_owners(tasks, existing_files)
     return {"tasks": tasks, "errors": errors}
 
@@ -90,6 +96,130 @@ def compile_tasks(
     return compile_plan(
         plan, max_symbols=max_symbols, ir=ir, existing_files=existing_files
     )["tasks"]
+
+
+def _semantic_identity(task: dict) -> str:
+    """施工图的语义身份（规格§十四）：hash(目标文件 + 符号 + facet 内容)，不含 T-xx 编号。"""
+    return ontology.semantic_task_id(
+        task.get("target_files") or [],
+        task.get("symbols") or [],
+        [str(task.get("change") or ""), str(task.get("interface") or "")],
+    )
+
+
+def _annotate_semantic_revisions(tasks: list[dict], previous_tasks: Any) -> None:
+    """给每张施工图盖**跨轮稳定身份**与版本链（Ontology Kernel，规格§十四/J）。
+
+      * ``semantic_task_id``：只取决于 文件/符号/facet 内容 —— 架构师 rework 重编号
+        T-02→T-03 后身份不变，Defect/责任映射不断链；
+      * ``task_revision``：同一语义身份再次编译时 +1，首次为 1；
+      * ``supersedes``：记录上一版（及更早）施工图的 T-xx，纯溯源，不参与 DAG。
+    """
+    prev: dict[str, dict] = {}
+    for t in previous_tasks or []:
+        if isinstance(t, dict) and t.get("semantic_task_id"):
+            prev[str(t["semantic_task_id"])] = t
+    for task in tasks:
+        sid = str(task.get("semantic_task_id") or _semantic_identity(task))
+        task["semantic_task_id"] = sid
+        old = prev.get(sid)
+        if old is None:
+            task.setdefault("task_revision", 1)
+            task.setdefault("supersedes", [])
+            continue
+        task["task_revision"] = int(old.get("task_revision") or 1) + 1
+        chain: list[str] = []
+        old_id = str(old.get("id") or "")
+        if old_id:
+            chain.append(old_id)
+        for earlier in old.get("supersedes") or []:
+            if earlier not in chain:
+                chain.append(str(earlier))
+        task["supersedes"] = chain
+
+
+def resolve_bug_task(defect: Any, tasks: Any) -> dict:
+    """规格§二十八：把缺陷机械归到一张施工图（**禁止"看起来像 T-03"**）。
+
+    优先级逐级下降，命中即返回；同级多候选判 ``unresolved`` 不猜：
+
+      1. ``semantic_task_id`` 相等 **且** 符号属于该图（跨 rework 重编号不断链）；
+      2. legacy ``stable_id`` 相等且符号属于该图；
+      3. 文件命中且符号属于该图（file + symbol）；
+      4. 仅文件命中（file only）——同文件多图且无法再区分时也报候选，不强压第一张。
+
+    返回 ``{"task_id", "semantic_task_id", "matched_by", "candidates"}``；
+    无法定位时 ``task_id`` 为空、``matched_by="unresolved"``。
+    """
+    defect = defect if isinstance(defect, dict) else {}
+    task_list = [t for t in (tasks or []) if isinstance(t, dict)]
+
+    path = _norm(defect.get("path"))
+    raw_sym = str(defect.get("symbol") or "").strip()
+    sym = raw_sym.rsplit(".", 1)[-1]
+    defect_sid = str(defect.get("semantic_task_id") or "")
+    stable_hint = str(defect.get("stable_id") or "")
+
+    def _symbols_of(task: dict) -> set[str]:
+        return {str(s).strip().rsplit(".", 1)[-1] for s in (task.get("symbols") or []) if str(s).strip()}
+
+    def _files_of(task: dict) -> set[str]:
+        return {_norm(p) for p in (task.get("target_files") or []) if _norm(p)}
+
+    def _pick(matched: list[dict], require_symbol: bool) -> dict | None:
+        if not matched:
+            return None
+        if require_symbol and sym:
+            with_sym = [t for t in matched if sym in _symbols_of(t)]
+            if len(with_sym) == 1:
+                return with_sym[0]
+            if len(with_sym) > 1:
+                return {"ambiguous": [str(t.get("id") or "") for t in with_sym]}
+            return None
+        if len(matched) == 1:
+            return matched[0]
+        return {"ambiguous": [str(t.get("id") or "") for t in matched]}
+
+    def _answer(hit: dict | None, by: str) -> dict | None:
+        if isinstance(hit, dict) and "ambiguous" not in hit:
+            return {"task_id": str(hit.get("id") or ""),
+                    "semantic_task_id": str(hit.get("semantic_task_id") or ""),
+                    "matched_by": by, "candidates": []}
+        return None
+
+    def _ambiguous(hit: dict | None, by: str) -> dict | None:
+        if isinstance(hit, dict) and "ambiguous" in hit:
+            return {"task_id": "", "semantic_task_id": "",
+                    "matched_by": "ambiguous_" + by, "candidates": hit["ambiguous"]}
+        return None
+
+    # ① 语义身份 + 符号（最强证据；同 id 命中多张只可能是重复编译，歧义必须显报）
+    if defect_sid:
+        hit = _pick([t for t in task_list if t.get("semantic_task_id") == defect_sid], True)
+        ans = _answer(hit, "semantic_id+symbol") or _ambiguous(hit, "semantic_id")
+        if ans:
+            return ans
+    # ② legacy stable_id + 符号
+    if stable_hint:
+        hit = _pick([t for t in task_list if t.get("stable_id") == stable_hint], True)
+        ans = _answer(hit, "stable_id+symbol") or _ambiguous(hit, "stable_id")
+        if ans:
+            return ans
+    # ③ 文件 + 符号
+    if path and sym:
+        in_file = [t for t in task_list if path in _files_of(t)]
+        hit = _pick(in_file, True)
+        ans = _answer(hit, "file+symbol") or _ambiguous(hit, "symbol")
+        if ans:
+            return ans
+    # ④ 仅文件（同文件多图时不强压，交候选）
+    if path:
+        in_file = [t for t in task_list if path in _files_of(t)]
+        hit = _pick(in_file, False)
+        ans = _answer(hit, "file-only") or _ambiguous(hit, "file")
+        if ans:
+            return ans
+    return {"task_id": "", "semantic_task_id": "", "matched_by": "unresolved", "candidates": []}
 
 
 def _annotate_create_owners(tasks: list[dict], existing_files: set[str] | None) -> None:
@@ -302,6 +432,9 @@ def _compile_from_units(
                 # 跨轮**稳定身份**：task id 会被重编号（方案一重做就变），
                 # 「哪些图没变」与归因必须建在不随编号漂移的东西上（见 planir.stable_id）
                 "stable_id": f"{path}::{sorted(group)[0]}" if group else f"{path}::<whole-file>",
+                # Ontology：本图实现哪些 Requirement / 需对哪些 PO 交证据（planir 投影）。
+                "implements_requirements": list(unit.get("implements_requirements") or []),
+                "proof_obligations": list(unit.get("proof_obligation_ids") or []),
             }
             if test_hint:
                 task["test_hint"] = test_hint

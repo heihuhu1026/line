@@ -67,6 +67,10 @@ STAGE_STATE_KEY = dict(flow.STAGE_STATE_KEY)
 CALL_FIELDS: tuple[str, ...] = (
     # 身份与判别
     "kind", "at", "stage", "note", "mock",
+    # Ontology provenance（规格§五十七）：哪次产物 / 哪版语义图 / 哪个语义任务 ——
+    # 回答「review 为什么慢、是哪一轮、哪套 ontology/compiler、输入了哪个 artifact」。
+    # 旧记录与不适用行一律为 null（normalize 补列，读旧 jsonl 安全）。
+    "artifact_id", "ontology_revision", "task_semantic_id",
     # 模型与本次调度
     "tag", "role", "attempt", "num_ctx", "think", "prompt_version",
     "switched", "resident_before",
@@ -288,6 +292,94 @@ def write_state(run_dir: Path, state: dict) -> None:
 
 def read_summary(run_dir: Path) -> dict | None:
     return _read_json(Path(run_dir) / SUMMARY_NAME)
+
+
+# --------------------------------------------------------------------- Ontology 版本存储（规格§三十七）
+#: run 目录下的语义图版本区：``ontology/001-architect_plan.json`` … + ``latest.json`` 指针。
+#: runstore **只负责存取**，不在这里做任何 pass/fail 或语义裁决。
+ONTOLOGY_DIR = "ontology"
+ONTOLOGY_LATEST = "latest.json"
+_ONTOLOGY_FILE_RE = re.compile(r"^(\d+)-([a-z0-9_]+)\.json$")
+
+
+def _ontology_base(run_dir: str | Path) -> Path:
+    return Path(run_dir) / ONTOLOGY_DIR
+
+
+def _ontology_revisions(run_dir: str | Path) -> list[int]:
+    base = _ontology_base(run_dir)
+    revs: list[int] = []
+    if base.is_dir():
+        for path in base.glob("*.json"):
+            m = _ONTOLOGY_FILE_RE.match(path.name)
+            if m:
+                revs.append(int(m.group(1)))
+    return sorted(revs)
+
+
+def latest_ontology_revision(run_dir: str | Path) -> dict[str, Any]:
+    """最新语义图版本描述符（``{revision, revision_id, stage, file, created_at}``）；无则 ``{}``。"""
+    pointer = _read_json(_ontology_base(run_dir) / ONTOLOGY_LATEST)
+    return pointer if isinstance(pointer, dict) else {}
+
+
+def write_ontology(
+    run_dir: str | Path, payload: Any, *, stage: str = "", note: str = ""
+) -> dict[str, Any]:
+    """把一次语义图（``OntologyGraph.to_dict()``）存为**只追加**的新版本，返回版本描述符。
+
+    存储层不解释内容：payload 原样放进信封的 ``graph`` 键。版本号按目录内现有文件
+    单调 +1（与阶段序号解耦 —— 同一阶段可因 rework 存多个语义版本），并刷新
+    ``latest.json`` 指针。
+    """
+    base = _ontology_base(run_dir)
+    rev = (revs[-1] + 1) if (revs := _ontology_revisions(run_dir)) else 1
+    stem = re.sub(r"[^a-z0-9_]+", "_", str(stage or "snapshot").lower()).strip("_") or "snapshot"
+    file_name = f"{rev:03d}-{stem}.json"
+    revision_id = f"ont:{rev:04d}:{stem}"
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    envelope = {
+        "revision": rev,
+        "revision_id": revision_id,
+        "stage": str(stage or ""),
+        "note": str(note or ""),
+        "created_at": created_at,
+        "schema_version": (payload.get("schema_version") if isinstance(payload, dict) else ""),
+        "rules_version": (payload.get("rules_version") if isinstance(payload, dict) else ""),
+        "graph": payload,
+    }
+    write_json(base / file_name, envelope)
+    descriptor = {
+        "revision": rev,
+        "revision_id": revision_id,
+        "stage": str(stage or ""),
+        "file": f"{ONTOLOGY_DIR}/{file_name}",
+        "created_at": created_at,
+    }
+    write_json(base / ONTOLOGY_LATEST, descriptor)
+    return descriptor
+
+
+def read_ontology(run_dir: str | Path, revision: str | int = "latest") -> dict[str, Any] | None:
+    """读指定语义图版本信封；缺省读 latest。旧 run / 未启用本体时返回 ``None``。
+
+    ``revision`` 接受：``""`` / ``"latest"`` / 整数 / ``"7"`` / ``"ont:0007:review"``。
+    """
+    base = _ontology_base(run_dir)
+    if revision in ("", "latest"):
+        pointer = _read_json(base / ONTOLOGY_LATEST)
+        if not isinstance(pointer, dict) or not pointer.get("file"):
+            return None
+        return _read_json(Path(run_dir) / str(pointer["file"]))
+    if isinstance(revision, int):
+        num = revision
+    else:
+        m = re.match(r"^(?:ont:)?0*(\d+)(?::|$)", str(revision))
+        if not m:
+            return None
+        num = int(m.group(1))
+    hits = list(base.glob(f"{num:03d}-*.json"))
+    return _read_json(hits[0]) if hits else None
 
 
 # --------------------------------------------------------------------- 阶段快照

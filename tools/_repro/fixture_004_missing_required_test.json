@@ -1,0 +1,33 @@
+{
+  "id": "fixture-004-missing-required-test",
+  "source_run": "20260929-121404",
+  "derived_from": ["规格§二十/§四十五；真机 121404 31 用例全 regression"],
+  "description": "verify verdict=pass 但只有入口冒烟（python main.py 退出码 0），没有 pytest/unittest 断言型证据：behavior 义务必须保持 UNPROVEN（rc=0 不是行为证明），Proof Gate 以 required_proof_unproven 阻断 pass，回 dev 补断言。",
+  "scenario": "behavior_coverage",
+  "input": {
+    "scope": {
+      "functional_requirements": [
+        {"id": "FR-01", "description": "记账主流程在命令行端到端跑通",
+         "acceptance": ["自动化测试覆盖记账主流程并全部通过"]}
+      ]
+    },
+    "verify_report": {
+      "verdict": "pass",
+      "materialized": ["main.py"],
+      "commands": [
+        {"status": "ok", "command": "python main.py", "exit_code": 0,
+         "stdout_tail": "ok", "stderr_tail": "", "source": "entry"}
+      ]
+    }
+  },
+  "expect": {
+    "unproven_po_kinds": ["behavior"],
+    "no_proven_behavior": true,
+    "proof_status": "UNPROVEN",
+    "proof_code": "required_proof_unproven",
+    "can_pass": false,
+    "decision": "rework_dev",
+    "decision_action": "proof_gate_unproven",
+    "recovery_stage": "dev"
+  }
+}

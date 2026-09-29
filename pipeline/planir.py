@@ -38,6 +38,7 @@ import json
 import os
 from typing import Any
 
+from . import ontology
 from . import symbols as symbol_resolver
 
 #: 编译器**输入契约**版本。见模块 docstring 的「冻结时机」。
@@ -277,7 +278,8 @@ def _symbol_sort_key(order: dict[str, tuple[int, int]]):
 
 
 def normalize_plan(
-    plan: Any, *, skeleton: Any = None, previous: Any = None, file_imports: Any = None
+    plan: Any, *, skeleton: Any = None, previous: Any = None, file_imports: Any = None,
+    scope: Any = None, original_requirement: str = "", intake_rows: Any = None,
 ) -> dict:
     """`raw_plan` → `compiler_ir`。**纯函数**：同输入必得同输出（含 key 顺序）。
 
@@ -605,12 +607,83 @@ def normalize_plan(
         unit["source_task_ids"] = _dedup(unit["source_task_ids"])
         out_units.append(unit)
 
+    # ---------------------------------------------------------- Ontology 投影（规格§十二）
+    # 在 IR 定稿前叠加语义覆盖层（**不改任何既有 IR 字段**，旧消费者忽略新键即可）：
+    #   · Requirement(ASSERTED 用户 + DERIVED PM) → Claim → ProofObligation；
+    #   · 单元的 constraints → Constraint 对象；plan.invariants（若有）→ Invariant；
+    #   · requirement_unit_links 把 FR 确定性挂到文件（不猜，挂不上显式暴露）。
+    ont_graph = ontology.OntologyGraph()
+    links: dict[str, Any] = {"by_file": {}, "unlinked_requirements": [], "unlinked_files": []}
+    if scope is not None:
+        ontology.build_requirement_projection(
+            ont_graph, scope, original_requirement=str(original_requirement or "")
+        )
+        links = ontology.requirement_unit_links(scope, out_units)
+        # 规格§三十四：intake/PM 的背景与默认推断全部 DERIVED 上链；人工裁决才是 ASSERTED。
+        # intake_rows 由编排层经 prompts.intake_items 归一后传入（planir 不反向依赖 prompts）。
+        ontology.project_intake(
+            ont_graph, scope=scope, intake_rows=(intake_rows or ()),
+        )
+    for unit in out_units:
+        path = unit["file"]
+        link = (links.get("by_file") or {}).get(path) or {}
+        unit["implements_requirements"] = list(link.get("requirements") or [])
+        unit["proof_obligation_ids"] = list(link.get("proof_obligations") or [])
+        unit["claim_ids"] = list(link.get("claims") or [])
+        for idx_c, text in enumerate(unit.get("constraints") or []):
+            cid = f"cst:{ontology.stable_hash([path, idx_c, str(text)], length=10)}"
+            if ont_graph.get(cid) is None:
+                ont_graph.add(ontology.SemanticObject(
+                    id=cid, type=ontology.TYPE_CONSTRAINT, truth=ontology.TRUTH_DERIVED,
+                    payload={"file": path, "text": str(text)},
+                    provenance=[ontology.Provenance(source="architect", stage="architect_plan")],
+                ))
+    # 规格§十八：冻结接口 = 冻结骨架声明 ∩ 方案承诺符号。每个冻结符号一条双证据 PO；
+    # 骨架里有、方案没承诺的符号不冻结（两次 LLM 输出不一致不判实现缺陷，见 verify 注释）。
+    plan_file_symbols = {str(u.get("file") or ""): list(u.get("symbols") or []) for u in out_units}
+    frozen = ontology.freeze_symbols(skeleton, plan_file_symbols)
+    ontology.project_interface_freeze(ont_graph, frozen)
+    for idx_i, inv in enumerate((plan.get("invariants") or []) if isinstance(plan, dict) else []):
+        if isinstance(inv, dict):
+            inv_id = str(inv.get("id") or "")
+            inv_text = str(inv.get("text") or inv.get("rule") or inv.get("name") or "")
+            check_obj = inv.get("check") if isinstance(inv.get("check"), dict) else {}
+            check_id = str(inv.get("check_id") or (check_obj.get("check_id") if check_obj else "") or "")
+        else:
+            inv_id, inv_text, check_id, check_obj = "", str(inv), "", {}
+        if not inv_text:
+            continue
+        iid = f"inv:{ontology.stable_hash([idx_i, inv_text], length=10)}"
+        # 规格§九：must_not_break 必须能绑 executable check。显式 check/内置 id/名字含
+        # 内置 id 都解析为机械绑定；查无此检查的机械声明与纯人话不变量如实标注（不冒充）。
+        binding = ontology.bound_invariant_check({
+            "id": inv_id, "name": inv_text,
+            "check": (check_obj or {"type": "mechanical", "check_id": check_id} if check_id else {}),
+        })
+        ont_graph.add(ontology.SemanticObject(
+            id=iid, type=ontology.TYPE_INVARIANT, truth=ontology.TRUTH_DERIVED,
+            payload={
+                "text": inv_text, "check_id": str(binding.get("check_id") or check_id),
+                "executable": bool(binding.get("bound") and binding.get("known")),
+                "check": {
+                    "type": "mechanical" if binding.get("bound") else "prose",
+                    "check_id": str(binding.get("check_id") or check_id),
+                    "entry": str(binding.get("entry") or ""),
+                    "known": bool(binding.get("known")),
+                },
+            },
+            provenance=[ontology.Provenance(source="architect", stage="architect_plan")],
+        ))
+
     ir: dict[str, Any] = {
         "compiler_input_version": COMPILER_INPUT_VERSION,
         "plan_sources": {"changes": bool(changes), "draft_tasks": bool(draft)},
         "units": out_units,
         "conflicts": conflicts,
         "warnings": [w for u in out_units for w in (u.get("unresolved") or [])],
+        # Ontology Kernel 语义覆盖层（规格§三）：可 JSON 化；旧 run / 旧消费者无此键安全降级。
+        "ontology": ont_graph.to_dict(),
+        "ontology_links": links,
     }
     if isinstance(previous, dict) and previous.get("units"):
         ir["diff_vs_previous"] = diff_units(previous, ir)
@@ -660,17 +733,84 @@ def fingerprint(*, prompt_hash: str = "") -> dict:
     """
     here = os.path.dirname(os.path.abspath(__file__))
     compiler = hashlib.sha1()
-    for name in ("planir.py", "taskcompiler.py", "symbols.py"):
+    # ontology.py / ontology_validate.py 也是编译/裁决链的一部分（语义投影与纯函数闸门），
+    # 规则改动必须反映在 compiler_hash 里（规格§五十九：不造第二套 fingerprint）。
+    for name in ("planir.py", "taskcompiler.py", "symbols.py", "ontology.py", "ontology_validate.py"):
         try:
             with io.open(os.path.join(here, name), encoding="utf-8") as fh:
                 compiler.update(fh.read().encode("utf-8"))
         except OSError:
             continue
     compiler.update(COMPILER_INPUT_VERSION.encode("utf-8"))
+    compiler.update(ontology.ONTOLOGY_SCHEMA_VERSION.encode("utf-8"))
+    compiler.update(ontology.ONTOLOGY_RULES_VERSION.encode("utf-8"))
     return {
         "compiler_input_version": COMPILER_INPUT_VERSION,
+        "ontology_schema_version": ontology.ONTOLOGY_SCHEMA_VERSION,
+        "ontology_rules_version": ontology.ONTOLOGY_RULES_VERSION,
         "compiler_hash": compiler.hexdigest()[:12],
         "prompt_hash": str(prompt_hash or ""),
+    }
+
+
+# ---------------------------------------------------------- 骨架越权检测（规格§十三：方案层矛盾）
+def _skeleton_member_names(line: str) -> str:
+    """骨架一行（``class X(...)`` / ``def f(...)``）→ 对外符号名；非成员行返回空串。"""
+    text = str(line).strip()
+    if text.startswith("class "):
+        return text[len("class "):].split("(")[0].strip()
+    if text.startswith("def "):
+        return text[len("def "):].split("(")[0].strip()
+    return ""
+
+
+def skeleton_overreach(plan: Any, skeleton: Any) -> dict[str, Any]:
+    """冻结骨架相对方案声明的**越权**（开发无权修复的方案层矛盾），纯函数。
+
+    与 orchestrator._declared_vs_skeleton 的方向相反：那边查「方案声明了、骨架没有」，
+    这边查「骨架多出来」——第二次 LLM 调用不能私自扩大方案边界：
+
+      * ``extra_files``：骨架里出现、方案 changes 未规划的文件；
+      * ``extra_symbols``：文件方案已声明非空 symbols 时，骨架多出的类/模块函数
+        （方案 symbols 为空时骨架是**回填基准**，不算越权，见 _backfill_task_symbols）。
+    """
+    plan = plan if isinstance(plan, dict) else {}
+    skeleton = skeleton if isinstance(skeleton, dict) else {}
+    planned_paths: set[str] = set()
+    declared: dict[str, set[str]] = {}
+    for change in plan.get("changes") or []:
+        if not isinstance(change, dict) or not change.get("path"):
+            continue
+        path = str(change["path"]).replace("\\", "/")
+        planned_paths.add(path)
+        names = {
+            symbol_resolver.clean_symbol(s).rsplit(".", 1)[-1]
+            for s in (change.get("symbols") or [])
+            if symbol_resolver.clean_symbol(s)
+        }
+        if names:
+            declared[path] = names
+
+    extra_files: list[str] = []
+    extra_symbols: dict[str, list[str]] = {}
+    for raw_path, lines in skeleton.items():
+        path = str(raw_path).replace("\\", "/")
+        if path not in planned_paths:
+            extra_files.append(path)
+            continue
+        planned_names = declared.get(path)
+        if planned_names is None:
+            continue  # 方案没声明 symbols：骨架是回填源，不判越权
+        extras: list[str] = []
+        for line in lines or []:
+            name = _skeleton_member_names(line)
+            if name and name not in planned_names:
+                extras.append(name)
+        if extras:
+            extra_symbols[path] = extras
+    return {
+        "extra_files": sorted(extra_files),
+        "extra_symbols": {k: sorted(v) for k, v in sorted(extra_symbols.items())},
     }
 
 
