@@ -222,6 +222,33 @@ def main() -> int:
     r6 = symbols.resolve(",", files=["cli.py"], index=idx_ff)
     check(not r6["resolved"] and "非法符号" in r6["reason"],
           "单个逗号 ⇒ 判非法、不进依赖图（真机 173023 就是这个）", str(r6))
+    # 真机 20260928-160609：架构师把 uses 写成 `db.py的add_record()`（中文「的」限定）。
+    # 旧逻辑 stem 前缀吃到扩展名的点，错切成成员 `py的add_record`，对基准必然判虚依赖 ——
+    # 该 run 第一轮 7 条阻断全是这种假冲突，白耗一次自纠。
+    r_cn = symbols.resolve("database.py的save_record(amount, note)", files=[], index=idx_ff)
+    check(r_cn["resolved"] and r_cn["candidates"] == ["database.py"] and r_cn["kind"] == "file",
+          "`database.py的save_record()` 认成文件限定成员（中文「的」等价于点号）", str(r_cn))
+    r_cn_bad = symbols.resolve("database.py的ghost", files=[], index=idx_ff)
+    check(not r_cn_bad["resolved"] and "ghost" in r_cn_bad["reason"]
+          and "py的" not in r_cn_bad["reason"],
+          "中文限定下成员不存在 ⇒ 判虚依赖且原因里是真实成员名（不再错切成 py的…）",
+          str(r_cn_bad))
+    r_dot_stem = symbols.resolve("database.save_record", files=[], index=idx_ff)
+    check(r_dot_stem["resolved"] and r_dot_stem["candidates"] == ["database.py"],
+          "stem 点号式 `database.save_record` 不回归（扩展名点号豁免只挡文件全名形态）",
+          str(r_dot_stem))
+    ir_cn = planir.normalize_plan(
+        {
+            "changes": [{"path": "x.py"}, {"path": "y.py"}],
+            "tasks": [{"id": "T-01", "target_files": ["x.py"], "symbols": ["run"],
+                       "contracts": {"uses": ["y.py的Y.go()"]}, "change": "x"}],
+        },
+        skeleton={"y.py": ["class Y", "    def go()"]},
+    )
+    ux_cn = [u for u in ir_cn["units"] if u["file"] == "x.py"][0]
+    check(ux_cn["depends_on_files"] == ["y.py"] and not ux_cn["unresolved"],
+          "中文「的」形态端到端真能建出依赖边（否则假阻断会把方案打回返工）",
+          str(ux_cn["depends_on_files"]) + str(ux_cn["unresolved"]))
     ir_ff = planir.normalize_plan(
         {
             "changes": [{"path": "x.py"}, {"path": "y.py"}],
@@ -291,7 +318,8 @@ def main() -> int:
           "只有 changes 时如实标注（双源是过渡形态，必须可见）",
           str(only_changes["plan_sources"]))
     fp = planir.fingerprint()
-    check(len(str(fp.get("compiler_hash"))) == 12 and fp.get("compiler_input_version") == "1",
+    check(len(str(fp.get("compiler_hash"))) == 12
+          and fp.get("compiler_input_version") == planir.COMPILER_INPUT_VERSION,
           "指纹含 compiler_hash（规则改了必然变）", str(fp))
 
     print("== ⑥b 字符串字段与书写归一（真机 110402 的两个内容 bug） ==")

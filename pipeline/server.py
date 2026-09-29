@@ -1384,6 +1384,10 @@ class Handler(BaseHTTPRequestHandler):
         artifact = (runstore.latest_artifacts(run_dir) or {}).get("pm")
         merged = 0
         if isinstance(artifact, dict):
+            # 与 _stage_pm 的 post 钩子同口径：旧 run 的快照可能是归一前落的（含技术实现类
+            # 问题 / 三列重复）。不归一就回写，会把脏数据重新固化进快照，续跑时覆盖干净的
+            # state（真机 run 20260928-180933：「数据库表结构」由此复活并下发给架构师）。
+            artifact = prompts_mod.normalize_pm_questions(artifact)
             # 并回产物走 `prompts.apply_pm_decisions`：它同时处理 open_questions（按问题文本）
             # 与两列**未明确项**（按条目文本，裁掉即从列里移除并进 confirmed_facts）。
             # 这里原先自己写了一遍只认 open_questions 的循环 —— 两处口径分头维护，

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .budget import distill_json, truncate_text
 from .config import MAX_PLAN_TASKS
@@ -108,7 +108,8 @@ SYSTEM: dict[str, str] = {
         "  3. 不编造需求里没提到的事实、功能、约束。特别注意：本次**没有提供任何存量代码**，"
         "你无从知道真实的模块与文件结构，impact_areas 只能写**能力域**"
         "（如「用户输入处理」「渲染管线」），严禁编造具体文件路径、类名或目录结构；"
-        "需要依据代码才能判断的事情，写成 open_questions 并给出默认取值。\n"
+        "需要依据代码才能判断的事情（数据怎么存、表/字段/类型/精度、框架与库、缓存等技术"
+        "实现）是下游架构师/开发的职责，**不要写进 open_questions 让业务方回答**。\n"
         "执行步骤（按序完成，不要跳步）：\n"
         "  1. 通读需求，提取全部明确信息；\n"
         "  2. 找出所有未明确、有歧义、缺失的信息，整理成未决清单；\n"
@@ -131,23 +132,30 @@ SYSTEM: dict[str, str] = {
         "每条都要能被**独立验证**，禁止「通过测试用例验证」这类同义反复；\n"
         "  · priority 取值与含义：high＝不做则需求不成立；medium＝影响核心体验，本次应完成；low＝可延后。\n"
         "未决信息（最容易被忽视、也最致命）：\n"
-        "  · 需求没说清、有歧义、或你自行做了默认假设的地方，**全部**进 open_questions，不得遗漏；\n"
+        "  · **准入范围**：open_questions 只收「只有业务/需求方才能拍板、且答案会改变功能"
+        "行为或验收标准」的问题（业务规则、流程取舍、输入合法性边界、异常时的业务处置等）；\n"
+        "  · **禁止技术实现类问题**：存储/表结构/字段与数据类型/主键索引/浮点精度/时间戳/"
+        "框架选型/缓存/事务等，业务方回答不了也不该回答 —— 由架构师、开发按默认工程实践"
+        "自行决定，一律不进未决清单；\n"
+        "  · 需求没说清、有歧义、或你自行做了默认假设的**业务**问题，**全部**进 open_questions，不得遗漏；\n"
         "  · 每条必须给 recommendation（你建议怎么定）与 assumed_answer（未获人工确认时下游按此推进的默认取值）。"
         "只提问题不给答案的条目是无效的 —— 下游拿不到答案只能各自脑补，会产出需求里根本没写的东西；\n"
         "  · severity **必填**，只有两档：high＝猜错会导致大范围返工或方案推翻；"
         "low＝猜错只需小范围调整。拿不准时不要轻易标 high；\n"
-        "  · why_it_matters **必填**：说清这条为什么会影响范围或实现；\n"
+        "  · why_it_matters **必填**：说清这条为什么会影响**业务范围或验收**（不要写技术理由）；\n"
         "  · impact_if_wrong 说明猜错后的具体影响；\n"
-        "  · unknowns 与 clarifying_questions **两个都要填**，内容与 open_questions 一一对应"
-        "（供人工快速扫读），但答案落在 open_questions 的 recommendation / assumed_answer。\n"
+        "  · unknowns 与 clarifying_questions 只允许填 open_questions **没有覆盖**的点，"
+        "**严禁把 open_questions 里的同一话题换个说法再写一遍**（系统会自动折叠重复项并剔除"
+        "技术类问题）；没有额外未明确点时两列都给空数组 []。\n"
         "输出前自检（逐条核对后再输出）：\n"
         "  1. 是否写了技术方案、代码思路或任务拆解？有则删除；\n"
         "  2. in_scope 与 out_of_scope 是否完全互斥、无重叠？\n"
         "  3. 每条功能需求的 acceptance 是否都能转成测试用例？有没有「体验好」「速度快」这类模糊说法？\n"
-        "  4. 所有未决项都进 open_questions 了吗？每条都有 recommendation 与 assumed_answer 吗？\n"
+        "  4. 所有**业务**未决项都进 open_questions 了吗？每条都有 recommendation 与 assumed_answer 吗？\n"
         "  5. priority / severity 的取值是否都在规定选项内？\n"
         "  6. 是否编造了需求里没有的内容（尤其具体模块名、文件名，以及**没有依据的数字指标**）？\n"
-        "  7. clarifying_questions 与 unknowns 是否都填了、且与 open_questions 一一对应？\n" + _TAIL
+        "  7. open_questions 里有没有技术实现类问题（存储/表结构/类型精度/框架等）？有则删除；"
+        "unknowns / clarifying_questions 是否与 open_questions 话题重复？重复则只保留在 open_questions？\n" + _TAIL
     ),
     # 注意：本阶段是三个档位里上下文最紧的（num_ctx 8192 = system + 代码片段 + 3072 输出），
     # system 每涨 100 token，架构师就少看约 230 字符的代码。因此这里的纪律要写全但要写短。
@@ -594,6 +602,152 @@ def pm_vague_text(item: Any) -> str:
     return str(item or "").strip()
 
 
+#: PM 未决问题里的**技术实现类**高置信信号（真机 20260928-172150：PM 把「数据库表结构」
+#: 「浮点数精度处理」这类纯技术决策抛给业务方裁决）。这些是架构师/开发的职责，不该占
+#: 人工闸门。词表刻意只收高置信词 —— 「是否记录创建时间」这类业务可见性的边界问题不抓，
+#: 避免误杀真正需要业务拍板的问题。console.html 的 renderPmQuestions 里有同口径 JS 一份，
+#: 改词表两处一起改。
+PM_TECHNICAL_HINTS: tuple[str, ...] = (
+    "表结构", "建表", "表名", "字段名", "字段类型", "数据类型", "主键", "外键",
+    "数据库索引", "索引设计", "schema", "浮点数", "浮点精度", "精度问题",
+    "存储方式", "存储格式", "技术选型", "什么框架", "哪个框架", "缓存策略",
+    "事务隔离", "sql语句", "sql 语句", "table structure", "primary key",
+    "foreign key", "data type", "float precision",
+)
+
+#: 问法归一要剥的疑问前缀（长的在前，避免「是否」先吃掉「是否需要」的头部后语义变化）。
+_PM_Q_STRIP_PREFIXES: tuple[str, ...] = (
+    "是否需要", "需不需要", "要不要", "是否要", "是否", "需要", "能不能", "可否", "请问",
+)
+_PM_Q_DROP_CHARS = "？?，,。.、；;：:‘’'\"“” \t\r\n"
+
+#: 跨列同义改写的相似度阈值（归一文本上的字符级 LCS 占比，顺序敏感）。
+#: 真机 172150 校准：重复的主体是 unknowns 列与 open_questions 标题**全等**、以及
+#: clarifying 的加长问法（子串判据覆盖），这两类在到达 LCS 之前已判重。0.75 只额外抓
+#: 「仅差一两个字」的近同构改写；不能更低 —— 「金额格式校验」与「金额上限校验」
+#: （共享「金额…校验」）LCS 有 0.67，那是两个不同业务问题，绝不能折叠。
+#: console.html 的 pmSim 是同一份 LCS 算法，改阈值/算法两处一起改。
+_PM_Q_DUP_RATIO = 0.75
+
+
+def _pm_q_norm(text: Any) -> str:
+    """把问法归一为可比较的键：小写、剥疑问前缀、去标点与空白。"""
+    s = str(text or "").strip().lower()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _PM_Q_STRIP_PREFIXES:
+            if s.startswith(prefix):
+                s = s[len(prefix):]
+                changed = True
+    return "".join(ch for ch in s if ch not in _PM_Q_DROP_CHARS)
+
+
+def _pm_q_lcs_len(a: str, b: str) -> int:
+    """字符级最长公共子序列长度（短中文问法，长度都 <50，O(mn) 开销可忽略）。"""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b, 1):
+            cur.append(prev[j - 1] + 1 if ca == cb else max(prev[j], cur[j - 1]))
+        prev = cur
+    return prev[-1]
+
+
+def _pm_q_similar(a: str, b: str) -> bool:
+    """两个归一问法是否指向同一话题：全等 / 互为子串 / LCS 相似度达标。"""
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    return (2 * _pm_q_lcs_len(a, b) / (len(a) + len(b))) >= _PM_Q_DUP_RATIO
+
+
+def normalize_pm_questions(
+    scope: Any, *, log: Callable[[str], None] | None = None
+) -> Any:
+    """PM 未决项的确定性准入：**折叠跨列重复、剔除技术实现类问题**。
+
+    真机 20260928-172150：提示词曾要求 unknowns / clarifying_questions 与 open_questions
+    「一一对应」，6 个问题在裁决页出现 18 次；其中还混着表结构/浮点精度等技术决策。
+    提示词约束不是唯一防线 —— ``_stage_pm`` 落库前与 ``pm_unresolved_items`` 判据读取时
+    都过本函数（旧 run 的产物也能被兜住）。
+
+    - open_questions 行内按归一问法去重；技术类（命中 ``PM_TECHNICAL_HINTS``）剔除；
+    - unknowns / clarifying_questions 中与保留 open_questions 同话题的折叠，两列之间也去重；
+    - 只在字段已存在时写回，不凭空补字段。
+    """
+    if not isinstance(scope, dict):
+        return scope
+    out = dict(scope)
+    folded = 0
+    dropped_tech: list[str] = []
+
+    def is_technical(text: str) -> bool:
+        low = text.lower()
+        return any(hint in low for hint in PM_TECHNICAL_HINTS)
+
+    kept_rows: list[dict] = []
+    kept_keys: list[str] = []
+    for row in out.get("open_questions") or []:
+        if not isinstance(row, dict):
+            kept_rows.append(row)
+            continue
+        question = str(row.get("question") or "").strip()
+        if not question:
+            kept_rows.append(row)
+            continue
+        if is_technical(f"{question} {row.get('why_it_matters') or ''}"):
+            dropped_tech.append(question)
+            continue
+        key = _pm_q_norm(question)
+        if key and any(_pm_q_similar(key, k) for k in kept_keys):
+            folded += 1
+            continue
+        kept_rows.append(row)
+        kept_keys.append(key)
+    if "open_questions" in out:
+        out["open_questions"] = kept_rows
+
+    # 两列 vague 各自对 open_questions 折叠，且跨两列互不再重复
+    vague_keys = list(kept_keys)
+    for vague_field in PM_VAGUE_FIELDS:
+        if vague_field not in out:
+            continue
+        kept: list[Any] = []
+        for item in out.get(vague_field) or []:
+            text = pm_vague_text(item)
+            if not text:
+                continue
+            if is_technical(text):
+                dropped_tech.append(text)
+                continue
+            key = _pm_q_norm(text)
+            if key and (
+                any(_pm_q_similar(key, k) for k in kept_keys)
+                or any(_pm_q_similar(key, k) for k in vague_keys)
+            ):
+                folded += 1
+                continue
+            kept.append(item)
+            vague_keys.append(key)
+        out[vague_field] = kept
+
+    if (folded or dropped_tech) and log is not None:
+        bits: list[str] = []
+        if folded:
+            bits.append(f"折叠 {folded} 条与 open_questions 重复的未明确项")
+        if dropped_tech:
+            sample = "；".join(dropped_tech[:3])
+            bits.append(
+                f"忽略 {len(dropped_tech)} 条技术实现类问题（{sample}… 交架构师/开发自行决定，不占人工裁决）"
+            )
+        log("  [PM] 未决问题准入：" + "；".join(bits))
+    return out
+
+
 def apply_pm_decisions(scope: Any, decisions: Any, *, overwrite: bool = False) -> Any:
     """同上，对象是 PM 的 ``open_questions`` **以及两列未明确项**。
 
@@ -830,12 +984,14 @@ def pm_assumptions_block(scope: Any) -> str:
     if not isinstance(scope, dict):
         return ""
     items = [q for q in (scope.get("open_questions") or []) if isinstance(q, dict)]
-    if not items:
+    facts = [str(x or "").strip() for x in (scope.get("confirmed_facts") or []) if str(x or "").strip()]
+    if not items and not facts:
         return ""
     # 已裁决的不再以「问题 + 建议 + 默认取值」的问答形式流转 —— 那样下游（和评审）
     # 会继续把它当未决项反复提出。裁决结果直接作为确定结论给出，未裁决的才走默认假设。
     decided: list[str] = []
     pending: list[str] = []
+    decided_keys: set[str] = set()
     for q in items:
         question = str(q.get("question") or "").strip()
         if not question:
@@ -843,6 +999,7 @@ def pm_assumptions_block(scope: Any) -> str:
         decision = str(q.get("final_decision") or "").strip()
         if decision:
             decided.append(f"- {question} → 已裁决：{decision}")
+            decided_keys.add(question)
             continue
         pending.append(f"- {question}")
         rec = str(q.get("recommendation") or "").strip()
@@ -851,6 +1008,17 @@ def pm_assumptions_block(scope: Any) -> str:
             pending.append(f"  建议：{rec}")
         if ans:
             pending.append(f"  本次默认按此执行：{ans}")
+    # unknowns / clarifying_questions 两列在人工裁决后会被 apply_pm_decisions 折叠进
+    # confirmed_facts 并从原列移除 —— 只渲染 open_questions 会让这些裁决**到不了下游**。
+    # 真机 run 20260928-180933：人工裁决「交易时间=需要」已落进 confirmed_facts，
+    # 但方案输入里该事实出现 0 次，最终表结构没有时间字段，直接违背裁决。
+    # 按 fact_key（：/→ 前的问题文本）与上面已渲染的 open_question 决定去重。
+    for text in facts:
+        key = fact_key(text)
+        if not key or key in decided_keys:
+            continue
+        decided_keys.add(key)
+        decided.append(f"- {text}")
     blocks: list[str] = []
     if decided:
         blocks.append("【PM 未决项（已由人工裁决，以下是**确定结论**，直接采纳）】\n" + "\n".join(decided))
@@ -1738,13 +1906,54 @@ def _infer_symbols_from_changes(task: dict, changes: Any) -> list[str]:
     return out[:8]
 
 
-def task_focus_block(task: Any, changes: Any = None) -> str:
+def _import_hints_from_uses(uses: Any) -> list[dict]:
+    """把 contracts.uses 的点号引用（``db.Database.insert`` / ``cli.add``）
+    翻成结构化 import 提示（按模块去重）：``[{"module", "names", "stmt"}]``。
+
+    真机 run 20260928-200631：T-01 的 uses 写了 ``cli.add/cli.list/cli.remove``，
+    但 7B 按符号分块产出 main.py 时不写任何 import，五轮恒定 NameError；
+    uses 信息本来就摆在施工图里，只是没被翻译成「你要写这行 import」。
+
+    返回结构化记录而不是成品语句：渲染侧要按**环 / 缺失契约 / 自导入**分三类措辞
+    （真机 20260928-221831：无条件"文件头必须"既逼出了 errors↔cli 环形导入，
+    又在 verify 已报符号缺失时与缺陷单自相矛盾）。
+    """
+    if not isinstance(uses, (list, tuple)):
+        return []
+    by_module: dict[str, list[str]] = {}
+    order: list[str] = []
+    for raw in uses:
+        parts = [p.strip() for p in str(raw or "").split(".") if p.strip()]
+        if not parts or not parts[0].isidentifier():
+            continue
+        module = parts[0]
+        if module not in by_module:
+            by_module[module] = []
+            order.append(module)
+        if len(parts) >= 2 and parts[1].isidentifier() and parts[1] not in by_module[module]:
+            by_module[module].append(parts[1])
+    out: list[dict] = []
+    for module in order:
+        names = by_module[module]
+        stmt = f"from {module} import {', '.join(names)}" if names else f"import {module}"
+        out.append({"module": module, "names": names, "stmt": stmt})
+    return out
+
+
+#: 可执行入口文件名（与 architect 提示词里点名的三种对齐）。
+_ENTRY_FILE_NAMES = ("main.py", "__main__.py", "run.py")
+
+
+def task_focus_block(task: Any, changes: Any = None, hint_ctx: Any = None) -> str:
     """**单张施工图**（按 task 分派时，dev 一次调用只做这一张）。
 
     为什么要有它：方案里的 `tasks[]` 此前只是给 `covers_tasks` 用的**记账标签**，
     dev 一次拿到整个方案的所有任务，靠两遍模式自己消化 —— 7B 单轮写不完就写浅、漏任务。
     按 task 分派后，dev 的权威来源收敛成这一张图：**不再需要需求原文与 PRD**，
     因为施工图里已经写清了要定义什么符号、对外接口是什么、依赖谁、怎么验收。
+
+    `hint_ctx`：``tasktype.import_hint_context`` 算出的 import 清单校对上下文
+    （环 / verify 已报缺失契约）。没有就退回无条件强制（首轮没有 verify 证据）。
     """
     if not isinstance(task, dict) or not (task.get("id") or task.get("title")):
         return ""
@@ -1769,6 +1978,45 @@ def task_focus_block(task: Any, changes: Any = None) -> str:
             "\n    （方案未显式声明 symbols；以上是从 changes.approach 推断的候选名 —— "
             "**务必按这些名字定义**，否则别的施工图 import 不到）"
         )
+    import_hints = _import_hints_from_uses(contracts.get("uses"))
+    # ---- import 清单合理性校对（hint_ctx；真机 20260928-221831 的两类死法）----
+    tid = str(task.get("id") or "")
+    ctx = hint_ctx if isinstance(hint_ctx, dict) else {}
+    own_modules = {
+        str(p).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        for p in (task.get("target_files") or [])
+        if str(p).endswith(".py")
+    }
+    cyclic_modules = set((ctx.get("cyclic_modules") or {}).get(tid) or [])
+    missing_pairs = {
+        (str(m), str(n)) for m, n in (ctx.get("missing_pairs") or []) if m and n
+    }
+    mandatory, cyclic_hints = [], []
+    for h in import_hints:
+        module, names, stmt = h["module"], h["names"], h["stmt"]
+        if module in own_modules:
+            # 自己导自己：uses 抄串了（如 errors.py 的 uses 写 errors.xxx），强制写出
+            # 这种 import 毫无意义，直接丢，不占注意力。
+            continue
+        if module in cyclic_modules:
+            cyclic_hints.append(h)
+            continue
+        missing_here = {n for n in names if (module, n) in missing_pairs}
+        if missing_here:
+            # verify 已报对方模块当前没定义这些符号：由**负责该模块的任务**补齐。
+            # 本任务保留这行 import，但**严禁**改名/加别名/删名迷信式修复
+            # （真机里模型改出 `delete as delete_record`，缺陷原封不动）。
+            stmt += (
+                f"  ⚠ verify 已报 {module}.py 当前没定义 "
+                f"{'、'.join(sorted(missing_here))}：由负责 {module}.py 的任务在模块级补齐；"
+                "本任务**原样保留这行 import，不许改名、加别名或删名**。"
+            )
+        mandatory.append(stmt)
+    entry_targets = [
+        str(p)
+        for p in (task.get("target_files") or [])
+        if str(p).replace("\\", "/").rsplit("/", 1)[-1] in _ENTRY_FILE_NAMES
+    ]
     lines = [
         f"【本次只做这一个任务：{task.get('id') or '?'} · {task.get('title') or ''}】",
         "只产出下面 target_files 里这些文件的 edit；**其他任务的文件一个都不要碰**"
@@ -1779,6 +2027,26 @@ def task_focus_block(task: Any, changes: Any = None) -> str:
         f"- 对外签名：{task.get('interface') or '（未声明）'}",
         "- 跨文件契约 · 依赖谁：",
         _listing(contracts.get("uses")),
+    ]
+    if mandatory:
+        # 不把 uses 翻译成明确的 import 语句，7B 按符号分块产出时只会写裸函数体，
+        # 文件头一个 import 都没有（真机 run 20260928-200631：main.py 五轮 NameError）。
+        lines.append(
+            "- ⚠ 文件头部**必须**先写这些 import（上面 uses 引用的符号都在兄弟模块里，"
+            "不 import 运行即 NameError；add/full_symbol 是整文件内容，import 要和函数定义一起产出）："
+        )
+        lines.extend(f"    · `{stmt}`" for stmt in mandatory[:8])
+    if cyclic_hints:
+        # 环形依赖不能在文件头互相 import（真机 errors↔cli：运行即 ImportError）。
+        lines.append(
+            "- ⚠ 以下 uses 与兄弟任务**互相依赖成环**，**禁止**在文件头直接 import（会触发环形导入）："
+        )
+        for h in cyclic_hints[:6]:
+            lines.append(
+                f"    · `{h['stmt']}` —— 改用函数内延迟导入（用到时再 `from {h['module']} import ...`），"
+                "或只通过参数接收调用方传进来的对象；不要在模块顶层引用它。"
+            )
+    lines += [
         "- 跨文件契约 · 提供什么给别人：",
         _listing(contracts.get("exposes")),
         f"- 数据结构：{task.get('data_model') or '（未声明）'}",
@@ -1788,6 +2056,20 @@ def task_focus_block(task: Any, changes: Any = None) -> str:
         _listing(task.get("acceptance")),
         f"- **验收命令（运行验证会真的跑它）**：{task.get('test_hint') or '（未声明 —— 请补一条可执行命令）'}",
     ]
+    if entry_targets:
+        # 入口守卫在分图模式下反复丢：模型把 main.py 当普通函数库交，三个裸函数定义完
+        # 静默 rc=0（真机 run 20260928-200631 最终 verify/work/main.py 即此形态）。
+        lines.append(
+            "- ⚠ **本张图产出的是可执行入口文件**（"
+            + "、".join(entry_targets)
+            + "），除函数定义外**必须同时满足**："
+            "① 文件头写齐全部 import（含上一条列出的兄弟模块符号）；"
+            "② 文件末尾保留入口守卫 `if __name__ == \"__main__\":`，"
+            "在守卫里调用入口函数（如 `main()` / `run(...)`）；"
+            "③ 直接 `python "
+            + entry_targets[0].replace("\\", "/").rsplit("/", 1)[-1]
+            + " ...` 运行时必须真正进入分发逻辑，不能「定义完函数就退出」。"
+        )
     if task.get("depends_on"):
         lines.append(
             f"- 前置任务（已完成，可直接用它们的成果）："
@@ -2126,16 +2408,133 @@ def _test_repair_block(repair: list[str] | None) -> str:
     )
 
 
+def test_view_block(view: Any) -> str:
+    """测试专用视图（P1-1）：**行为 / 验收 / 接口 / 变更符号 / 契约**，默认不含代码正文。
+
+    旧实现把整份 implementation（真机实测占 prompt ≈66%）端给测试，但写测试真正需要的
+    是「要验证什么行为、怎么调、改了哪些符号、跨文件契约是什么」—— 这五样体积小、信息密度高。
+    代码正文改为**按需**：只有命令/行为无法从接口理解时，由重问通道把相关函数正文补进来
+    （见 parts_test 的 code_on_demand）。
+    """
+    view = view if isinstance(view, dict) else {}
+    lines = ["【测试视图（默认不含代码正文；按这些信息设计用例，不要臆测实现内部）】"]
+
+    behaviors = view.get("behaviors") or []
+    if behaviors:
+        lines.append("■ 要验证的行为：")
+        for item in behaviors[:12]:
+            if isinstance(item, dict):
+                bid = str(item.get("id") or "").strip()
+                title = str(item.get("title") or "").strip()
+                acc = item.get("acceptance")
+                head = f"  · {bid + ' ' if bid else ''}{title}".rstrip()
+                lines.append(head)
+                if isinstance(acc, list):
+                    for a in acc[:4]:
+                        if str(a).strip():
+                            lines.append(f"      验收：{str(a).strip()[:120]}")
+                elif str(acc or "").strip():
+                    lines.append(f"      验收：{str(acc).strip()[:120]}")
+            elif str(item).strip():
+                lines.append(f"  · {str(item).strip()[:140]}")
+
+    acceptance = view.get("acceptance") or []
+    if acceptance:
+        lines.append("■ 每张施工图的验收口径：")
+        for item in acceptance[:10]:
+            if isinstance(item, dict):
+                tid = str(item.get("task") or "").strip()
+                text = str(item.get("acceptance") or "").strip()
+                if text:
+                    lines.append(f"  · {tid + '：' if tid else ''}{text[:140]}")
+
+    interfaces = view.get("interfaces") or {}
+    if isinstance(interfaces, dict) and interfaces:
+        lines.append("■ 可调用接口（签名以此为准；构造参数/必填参数必须照此调用）：")
+        for path, members in list(interfaces.items())[:20]:
+            lines.append(f"  · {path}")
+            for sig in (members or [])[:12]:
+                lines.append(f"      {str(sig)[:120]}")
+
+    symbols = view.get("symbols") or []
+    if symbols:
+        lines.append("■ 本轮变更的符号（测试要覆盖的对象）：")
+        for item in symbols[:12]:
+            if isinstance(item, dict):
+                path = str(item.get("path") or "").strip()
+                syms = [str(s) for s in (item.get("symbols") or []) if str(s).strip()]
+                if syms:
+                    lines.append(f"  · {path}：{', '.join(syms[:10])}")
+            elif str(item).strip():
+                lines.append(f"  · {str(item).strip()[:120]}")
+
+    contracts = view.get("contracts") or []
+    if contracts:
+        lines.append("■ 跨文件契约（exposes=本图对外提供；uses=依赖别的图提供）：")
+        for item in contracts[:10]:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get("task") or "").strip()
+            exposes = [str(s) for s in (item.get("exposes") or []) if str(s).strip()]
+            uses = [str(s) for s in (item.get("uses") or []) if str(s).strip()]
+            interface = str(item.get("interface") or "").strip()
+            if not (exposes or uses or interface):
+                continue
+            lines.append(f"  · {tid}" + (f"：{interface[:80]}" if interface else ""))
+            if exposes:
+                lines.append(f"      exposes：{', '.join(exposes[:8])}")
+            if uses:
+                lines.append(f"      uses：{', '.join(uses[:8])}")
+    return "\n".join(lines)
+
+
 def parts_test(
     requirement: str,
     scope: Any,
     plan: Any,
-    impl: Any,
-    excerpts_text: str,
+    impl: Any = None,
+    excerpts_text: str = "",
     fixes: list[str] | None = None,
     api_digest: dict | None = None,
     repair: list[str] | None = None,
+    *,
+    test_view: dict | None = None,
+    code_on_demand: str = "",
 ) -> list[str]:
+    """组装测试阶段 prompt。
+
+    传入 ``test_view`` 时走 P1-1 新通道：**不再喂 implementation 全文与代码片段**，
+    只给行为/验收/接口/变更符号/契约视图；``code_on_demand`` 非空时（命令自检重问通道）
+    才把相关函数正文作为「按需拉取的代码」补进来。不传 ``test_view`` 时保留旧通道
+    （兼容手工复跑脚本）。
+    """
+    if test_view is not None:
+        blocks = [
+            _requirement_block(requirement),
+            _upstream("产品经理验收标准", scope, str_tokens=110, list_items=8),
+            pm_assumptions_block(scope),
+            _upstream("架构师方案（验收依据）", plan, str_tokens=180, list_items=14),
+            # 接口摘要仍然保留：新建项目里它是测试知道「类/函数怎么调」的唯一依据，
+            # 视图里的 interfaces 与它同源但视图做了截断，完整摘要继续 pin 在前面。
+            api_digest_block(api_digest or {}),
+            test_view_block(test_view),
+        ]
+        # 按需代码：只有自检发现「命令/行为无法只凭接口理解」时才由编排层补正文。
+        if code_on_demand:
+            blocks.append(
+                "【按需拉取的相关函数正文（你之前无法只凭接口写出可执行命令，"
+                "这些是机制按问题定位到的最小相关代码；仍不要索要无关文件）】\n"
+                + code_on_demand
+            )
+        blocks += [
+            _feedback_block("评审要求补测项", fixes),
+            _test_repair_block(repair),
+            "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。"
+            "依据上方行为与接口设计即可，不要臆测未给出的实现内部；"
+            "若某个行为确实无法从接口理解，在 coverage_gaps 里点名「需要哪个文件的哪个函数正文」。",
+        ]
+        return blocks
+
     return [
         _requirement_block(requirement),
         _upstream("产品经理验收标准", scope, str_tokens=110, list_items=8),
@@ -2333,10 +2732,13 @@ def _verify_view(
     facts = verify_facts(report, plan, impl)
     if only_failed and not commands and not facts and report.get("verdict") != "fail":
         return None
+    # 「失败：`<整条命令>`」与下面 commands 段重复（还常把整段 -c 脚本再贴一遍），
+    # 是 bugfix prompt 逐轮膨胀的来源之一 —— 只留接口/空跑等**增量**判负理由。
+    problems = [p for p in (report.get("problems") or []) if not str(p).startswith("失败：")]
     return {
         "verdict": report.get("verdict", ""),
         "summary": report.get("summary", ""),
-        "problems": list(report.get("problems") or [])[:6],
+        "problems": problems[:6],
         "notes": list(report.get("notes") or [])[:5],
         # **归因**：哪些失败是「测试命令自身不可执行 / 拿不到可运行证据」造成的。
         # 这是测试层缺陷 —— 开发改不动测试命令，据此要求改实现只会把对的改坏
@@ -2477,7 +2879,16 @@ def parts_review(
         ),
         falsify_block(),
         rationalization_block(),
-        "【任务】判定交付是否可接受，输出 verdict 与必改项。",
+        # 建议⑫ 三层评审 · 第二层（唯一一次语义 LLM）：机械证据已 pin 在上方，
+        # 只问机器证明不了的问题；verdict 是**建议**，第三层确定性裁决会结合机械证据终判。
+        "【任务】你是评审三层中的**语义层**（整条流水线唯一一次语义判定）。"
+        "上方补丁审计 / 运行验证 / 契约核对 / 工程红线 / 逐项验收都是**已成立的机械事实**，"
+        "不要重复主张、不要凭措辞翻案；你只需回答机器证明不了的三件事："
+        "①这轮做得对不对（行为是否符合验收，而非代码风格偏好）；"
+        "②风险是不是真风险、属于哪一层（in_material 本轮可改 / architect 只有方案层能改 / "
+        "needs_external 需外部环境或人工确认）；③有没有机械证据覆盖不到的遗漏。"
+        "输出 verdict（pass / rework_dev / rework_architect 的**建议**）与必改项明细；"
+        "机制会结合机械证据做最终裁决，与机械证据冲突的 verdict 会被改判。",
     ]
 
 
@@ -2519,15 +2930,20 @@ SYSTEM_NEW: dict[str, str] = {
         "  · open_questions 每项 {question, why_it_matters, recommendation, assumed_answer, "
         "impact_if_wrong, severity}：recommendation 是你的专业建议，"
         "assumed_answer 是人工未确认时下游默认按此执行的取值 —— **只提问题不给默认取值是无效条目**；"
-        "severity 取 high|low，表示「猜错要不要停下来确认」；\n"
-        "  · unknowns / clarifying_questions 填对应问题原文（供人工扫读），须与 open_questions 对应。\n"
+        "severity 取 high|low，表示「猜错要不要停下来确认」；"
+        "**只准提业务/需求方才能拍板的问题**（业务规则、流程取舍、输入合法性边界、异常时的"
+        "业务处置）；存储/表结构/字段类型/精度/框架/缓存等技术实现问题一律不提，交架构/开发决定；\n"
+        "  · unknowns / clarifying_questions 只填 open_questions **未覆盖**的点，"
+        "同一话题严禁换个说法重复填写（重复项与技术类问题会被系统自动折叠/剔除）；"
+        "没有额外未明确点时两列都给空数组 []。\n"
         "执行步骤：① 通读需求，提取全部明确信息；② 识别未明确、有歧义、缺失的信息，整理成未决清单；"
         "③ 为每条未决问题给出建议与默认取值；④ 拆解功能需求并逐条写可验证的验收标准；"
         "⑤ 对照下方自检后输出 JSON。\n"
         "自检：① 有没有写技术方案或技术选型？② in_scope 与 out_of_scope 互斥吗？"
-        "③ 每条功能都有可验证的 acceptance 吗？④ 每条未决问题都给了默认取值吗？"
+        "③ 每条功能都有可验证的 acceptance 吗？④ 每条**业务**未决问题都给了默认取值吗？"
         "⑤ priority / severity 都在规定选项内吗？⑥ 有没有编造需求里没有的内容（尤其没有依据的数字）？"
-        "⑦ 输出是纯 JSON 吗？\n" + _TAIL
+        "⑦ open_questions 里有没有技术实现类问题、三列之间有没有同一话题重复？"
+        "⑧ 输出是纯 JSON 吗？\n" + _TAIL
     ),
     # 注意：与二开版同样的上下文约束（14B 只有 8K）。新建项目的池子为空，
     # 省下了代码片段预算，但仍不要把 system 写得过长。

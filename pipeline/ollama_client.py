@@ -40,6 +40,12 @@ _DONE_REASON_LENGTH = "length"
 #: 夹住，抬不出上下文。真机 `20260928-000351`：`num_ctx=24576`、prompt 才 4016
 #: ⇒ 余量约 20k，却因为"只准抬一次"在 12288 就放弃 —— **限制根本不是上下文**。
 _MAX_ESCALATIONS = 3
+#: 开发角色的 role 前缀（与 config.py 的 ModelSpec.role 对齐；MockClient 也按它认开发）。
+#: 开发调用是**按任务分派**的：一次只产出一张施工图的补丁，正常体积几百~一两千 token。
+#: 撞满 6144 上限几乎只可能是「整份重写无关文件 / 复述 / 发散打转」，而不是真有那么长 ——
+#: 真机 run 20260928-200631：dev 截断后走加码路线（6144 加到 12288），白等 11.1 分钟 / 24.5k tok。
+#: 所以开发截断先**压低**上限逼短；即便之后要恢复加码，也不许超过它的基础 num_predict。
+_DEV_ROLE_PREFIX = "开发"
 #: 判定「输出陷入重复」后下压到的输出上限下限（逼它写短，而不是给更多空间重复）。
 _MIN_PREDICT = 512
 #: 判定重复时只看结尾这么多字符 —— 重复循环的表现是**尾部**在打转。
@@ -65,6 +71,14 @@ _DEGENERATE_NGRAM = 12
 _DEGENERATE_NGRAM_SHARE = 0.5
 #: n-gram 判据只看尾部这么多字符（够看出支配性，又不至于被前面的正常代码稀释）。
 _DEGENERATE_NGRAM_WINDOW = 2000
+#: **中文清单循环**判据：专抓"清单逐轮微变"式脏重复 —— 真机 20260928-221831 的 test 轮
+#: （同一份「输入、异常、输出、…、数据库操作日志格式」清单反复枚举，连接处插入新词）。
+#: 周期判据要求两轮逐字相等、12-gram 支配要求固定串占比，都被微变绕过；但在中文尾段里
+#: 高频三字片段（数据库、库操作…）的**重复出现率**会异常高：真机样本 0.915，
+#: 全部历史正常中文产物上界仅 0.648。只在 CJK 占比够高的尾段启用（英文/代码词汇分布不同）。
+_DEGEN_CJK_RATIO = 0.3
+_DEGEN_CJK_MIN_LEN = 600
+_DEGEN_CJK_TRIGRAM_DUP = 0.8
 
 
 def _looks_degenerate(text: str) -> bool:
@@ -94,6 +108,14 @@ def _looks_degenerate(text: str) -> bool:
             len(set(lines)) / len(lines) < _DEGENERATE_DISTINCT
         ):
             return True
+    # 中文「清单逐轮微变」循环（见常量注释）：尾段 CJK 占比高时，
+    # 三字片段的重复出现率超阈即判。
+    if len(body) >= _DEGEN_CJK_MIN_LEN:
+        cjk = sum(1 for ch in body if "一" <= ch <= "鿿")
+        if cjk / len(body) >= _DEGEN_CJK_RATIO:
+            grams = [body[i : i + 3] for i in range(len(body) - 2)]
+            if grams and 1 - len(set(grams)) / len(grams) >= _DEGEN_CJK_TRIGRAM_DUP:
+                return True
     # 字符级兜底（单行 / 无换行的 JSON 也要能判出来）。
     # 周期**逐个试**而不是按固定步长扫：重复单元的长度是任意的（实测 58 个字符），
     # 按 10 的倍数扫会全部错过。代价由下面的**廉价预筛**压住 —— 先比尾部相邻两轮，
@@ -122,6 +144,16 @@ def _looks_degenerate(text: str) -> bool:
 #: 抬高输出上限时给 num_ctx 留的余量（token）。prompt 已占掉一部分，上限只能取剩下的再减它 ——
 #: 不留余量的话请求会顶到 ctx，ollama 会按 ctx 静默截断 prompt，症状比截断输出更难查。
 _CTX_SAFETY_MARGIN = 256
+
+#: Ollama 发现生成陷入重复循环时主动中止，HTTP 500 body 含此标记（实测原文
+#: "prediction aborted, token repeat limit reached"，真机 run 20260928-180933 的 dev 轮）。
+#: 原样重试（同 prompt、同采样）大概率在同一处再陷循环 —— 必须**改采样**再试：
+#: 提高 repeat_penalty + 微抬温度打散循环。只给一次（再失败说明 prompt/上下文本身诱发重复，
+#: 应交由上层暂停并留痕，而不是无限烧算力）。
+_REPEAT_ABORT_MARK = "token repeat limit"
+_REPEAT_ABORT_MAX_RETRY = 1
+_REPEAT_ABORT_PENALTY = 1.15
+_REPEAT_ABORT_TEMP_BUMP = 0.15
 
 
 def _parse_json(content: str) -> Any:
@@ -207,6 +239,8 @@ class OllamaClient:
         failed: list[dict] = []  # 未通过契约的那些原始输出也要留档（诊断提示词问题时最关键）
         # 本次实际使用的输出上限。撞到它被截断时会**调高**再试 —— 同上限重试是确定性白费。
         limit = num_predict or spec.num_predict
+        # 开发角色的加码硬顶：截断压短一次后即使恢复加码，也不许超过这个初始上限。
+        base_limit = limit
         escalations = 0  # 已抬高上限的次数（上限见 _MAX_ESCALATIONS）
         # 已「压低上限」的次数（退化路径）。**必须单独计数**：压低不动 `escalations`，
         # 拿它当"第一次"的判据会一路压到 `_MIN_PREDICT`（6144→3072→1536→…→512）——
@@ -239,8 +273,58 @@ class OllamaClient:
             if spec.think is not None:
                 payload["think"] = spec.think
 
+            # HTTP 层失败以前在 traces/llm-calls 里**零留痕**（埋点都在成功返回之后），
+            # 真机那次 500 事后连请求规模都复盘不了。这里对 500「token repeat limit」做
+            # 一次内联的**改采样**重试（同 attempt 计数，不侵占契约重试名额）；
+            # 无论成功失败，每次 HTTP 尝试都经 notify 即时上账。
+            req_payload: dict[str, Any] = payload
+            repeat_retries = 0
             t0 = time.time()
-            resp = self._request("/api/chat", payload)
+            while True:
+                try:
+                    resp = self._request("/api/chat", req_payload)
+                    break
+                except OllamaError as exc:
+                    wall = time.time() - t0
+                    msg = str(exc)
+                    repeat_abort = _REPEAT_ABORT_MARK in msg.lower()
+                    notify(
+                        {
+                            "tag": spec.tag,
+                            "role": spec.role,
+                            "num_ctx": spec.num_ctx,
+                            "attempt": attempt,
+                            "attempts_planned": attempts,
+                            "attempt_failed": True,
+                            "wall_s": round(wall, 2),
+                            "output_tokens": 0,
+                            "prompt_est_tokens": estimate_tokens(prompt),
+                            "num_predict": limit,
+                            "done_reason": "http_500_repeat_abort" if repeat_abort else "http_error",
+                            "schema_errors": [msg[:300]],
+                            "http_error": msg[:500],
+                            "raw_tail": "",
+                        }
+                    )
+                    if repeat_abort and repeat_retries < _REPEAT_ABORT_MAX_RETRY:
+                        repeat_retries += 1
+                        new_temp = min(spec.temperature + _REPEAT_ABORT_TEMP_BUMP, 1.0)
+                        req_payload = {
+                            **payload,
+                            "options": {
+                                **payload["options"],
+                                "repeat_penalty": _REPEAT_ABORT_PENALTY,
+                                "temperature": new_temp,
+                            },
+                        }
+                        emit(
+                            "        [降载重试] 服务端中止生成（token repeat limit reached）"
+                            f"→ repeat_penalty={_REPEAT_ABORT_PENALTY}、"
+                            f"temperature {spec.temperature}→{new_temp}，原 prompt 重试"
+                        )
+                        t0 = time.time()
+                        continue
+                    raise
             wall = time.time() - t0
 
             message = resp.get("message", {}) or {}
@@ -344,7 +428,12 @@ class OllamaClient:
                 failed.append({"attempt": attempt, "errors": [detail], "raw": content[-3000:]})
                 last_errors = [detail]
                 room = spec.num_ctx - prompt_tokens - _CTX_SAFETY_MARGIN
-                if _looks_degenerate(content) and lowered == 0 and limit > _MIN_PREDICT:
+                dev_role = spec.role.startswith(_DEV_ROLE_PREFIX)
+                if (
+                    (_looks_degenerate(content) or dev_role)
+                    and lowered == 0
+                    and limit > _MIN_PREDICT
+                ):
                     lowered += 1
                     # 重复循环：同 prompt 抬高上限必在同一处再陷，只是把白等放大一倍。
                     # 改成**压低**上限逼它写短，并明确告诉它"你在重复"（换条件重试才有意义）。
@@ -354,11 +443,22 @@ class OllamaClient:
                     # 真机 `20260928-000351` 就是压到 6144//2 后仍截断，报错里留下
                     # `num_predict=1536`（=6144//4 再压一次）；越压越写不完是必然的。
                     limit = max(_MIN_PREDICT, limit // 2)
-                    last_errors = [
-                        detail,
-                        "上次输出陷入**重复循环**：同一段内容反复写，撞上限也没写完。"
-                        "请只输出**最小合法**的 JSON —— 不要重复条目、不要复述输入、不要扩写。",
-                    ]
+                    if _looks_degenerate(content):
+                        last_errors = [
+                            detail,
+                            "上次输出陷入**重复循环**：同一段内容反复写，撞上限也没写完。"
+                            "请只输出**最小合法**的 JSON —— 不要重复条目、不要复述输入、不要扩写。",
+                        ]
+                    else:
+                        # 开发按任务分派：一张施工图的补丁正常只有几百~一两千 token，
+                        # 撞满 6144 不是"内容真的长"，而是整份重写/复述/发散。加码只会把
+                        # 白等翻倍（真机 run 20260928-200631：12288 满额 319s 仍是断 JSON）。
+                        last_errors = [
+                            detail,
+                            f"你在**单个任务**上写得过多，撞满了输出上限（当前压到 {limit} tok）。"
+                            "只输出本任务 target_files 的最小合法 JSON：只放本任务的 edits，"
+                            "**不要整份重写其它文件**、不要复述输入、不要解释。",
+                        ]
                     _report(last_errors)
                     _pre_retry()
                     continue
@@ -374,8 +474,19 @@ class OllamaClient:
                         f"\n最后一次原始输出尾部：\n{content[-700:]}"
                     )
                 raised = min(max(limit * 2, limit + 2048), room)
+                if dev_role:
+                    # 开发不许多加码：压短后恢复最多回到基础上限（6144），
+                    # 再截断就判发散放弃 —— 12288/20161 的长烧只属于架构/方案类长输出角色。
+                    raised = min(raised, base_limit)
                 if raised <= limit:
                     _giveup(last_errors)
+                    if dev_role:
+                        raise OllamaError(
+                            f"{spec.tag} 开发输出在基础上限 {base_limit} tok 内仍连续截断："
+                            "判定为整份重写/发散打转（单任务补丁不应这么长），已停止加码烧算力 —— "
+                            "请检查施工图是否过大（考虑拆任务）或把产物压短。"
+                            f"\n最后一次原始输出尾部：\n{content[-700:]}"
+                        )
                     raise OllamaError(
                         f"{spec.tag} 输出被截断，且没有上下文余量可抬高上限："
                         f"prompt 已占 {prompt_tokens} tok / num_ctx={spec.num_ctx} / "

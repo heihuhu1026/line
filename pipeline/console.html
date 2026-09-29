@@ -2400,17 +2400,67 @@ function renderPmQuestions(){
   const snap = ((d.stages) || []).find(s => s.stage === "pm");
   const art = snap && snap.artifact;
   const card = $("d-pmq-card");
-  const qs = (art && art.open_questions) || [];
+  // 与 prompts.py normalize_pm_questions **同口径**的页面端兜底（Python 落库/判据是主入口，
+  // 这里只为让准入规则之前产生的旧 run 在页面上也不出现重复/技术类问题；改规则两处同步）。
+  const PM_TECH_HINTS = ["表结构","建表","表名","字段名","字段类型","数据类型","主键","外键",
+    "数据库索引","索引设计","schema","浮点数","浮点精度","精度问题","存储方式","存储格式",
+    "技术选型","什么框架","哪个框架","缓存策略","事务隔离","sql语句","sql 语句",
+    "table structure","primary key","foreign key","data type","float precision"];
+  const PM_Q_PREFIX = ["是否需要","需不需要","要不要","是否要","是否","需要","能不能","可否","请问"];
+  const pmNormQ = t => {
+    let s = String(t || "").trim().toLowerCase();
+    let grow = true;
+    while(grow){ grow = false;
+      for(const p of PM_Q_PREFIX){ if(s.startsWith(p)){ s = s.slice(p.length); grow = true; break; } }
+    }
+    return s.replace(/[\s？?，,。.、；;：:'‘’“”"]/g, "");
+  };
+  const pmSim = (a, b) => {
+    if(!a || !b) return false;
+    if(a === b || a.includes(b) || b.includes(a)) return true;
+    // 字符级 LCS 占比（短中文问法；与 prompts.py _pm_q_similar 同算法同阈值 0.75：
+    // 全等/子串已在前面判掉，这里只抓仅差一两个字的近同构改写，防止误折叠不同业务问题）
+    const m = a.length, n = b.length;
+    const dp = Array.from({length: m + 1}, () => new Array(n + 1).fill(0));
+    for(let i = 1; i <= m; i++) for(let j = 1; j <= n; j++)
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+    return (2 * dp[m][n]) / (m + n) >= 0.75;
+  };
+  const pmIsTech = t => { const s = String(t || "").toLowerCase(); return PM_TECH_HINTS.some(h => s.includes(h)); };
+
+  const rawQs = (art && art.open_questions) || [];
+  const rawVague = [];
   // 「未明确项」：PM 自己标了"这里没弄清楚"、**没给建议值**的条目（unknowns /
   // clarifying_questions）。它们与 open_questions 同属"还不是陈述" —— 强控要求人工
   // 逐条给出结论，裁决后从这两列移除并进 confirmed_facts（见 prompts.apply_pm_decisions）。
-  const vague = [];
   ["unknowns", "clarifying_questions"].forEach(k => {
     ((art && art[k]) || []).forEach(x => {
       const ref = String((x && (x.item || x.question || x.text)) || x || "").trim();
-      if(ref) vague.push({field: k, ref});
+      if(ref) rawVague.push({field: k, ref});
     });
   });
+  let pmFolded = 0, pmTech = 0;
+  const qs = [];
+  const qKeys = [];
+  rawQs.forEach(row => {
+    const ref = String((row && row.question) || "").trim();
+    if(!ref){ qs.push(row); return; }
+    if(pmIsTech(ref + " " + ((row && row.why_it_matters) || ""))){ pmTech++; return; }
+    const key = pmNormQ(ref);
+    if(key && qKeys.some(k => pmSim(key, k))){ pmFolded++; return; }
+    qs.push(row); qKeys.push(key);
+  });
+  const vague = [];
+  const vKeys = qKeys.slice();
+  rawVague.forEach(v => {
+    if(pmIsTech(v.ref)){ pmTech++; return; }
+    const key = pmNormQ(v.ref);
+    if(key && vKeys.some(k => pmSim(key, k))){ pmFolded++; return; }
+    vague.push(v); vKeys.push(key);
+  });
+  const pmFilterNote = (pmFolded || pmTech)
+    ? `<div class="note">已自动折叠 ${pmFolded} 条与上面重复的条目、忽略 ${pmTech} 条技术实现类问题`
+      + `（存储/表结构/类型精度等由架构师、开发自行决定，不占业务裁决）。</div>` : "";
   const total = qs.length + vague.length;
   const st = d.state || {};
   // 同补强卡片：只有运行停在 PM 闸门上时才可裁决；已走过就展示历史记录（只读）。
@@ -2456,12 +2506,12 @@ function renderPmQuestions(){
 
   const decidedCount = qs.filter(q => decidedOf(q)).length + vague.filter(v => vagueDecided(v)).length;
   $("d-pmq-mode").textContent = active ? "待你裁决" : "已完成 · 历史记录（只读）";
-  $("d-pmq-hint").innerHTML = active
+  $("d-pmq-hint").innerHTML = (active
     ? `PM 给出的是<b>建议 / 默认取值</b>。逐条裁决后，裁决值会并回 PM 产物（<code>NN-pm.json</code>），
        下游拿到的就是<b>确定结论</b>，不会再把这些问一遍。留空不落盘。<br>
        未裁决 / 未明确项<b>一条不剩</b>之后才能继续往下走（强控：往下流的必须是陈述）。`
     : `该阶段已走过，下面是<b>当时的裁决记录（只读）</b>：共 ${total} 项、${decidedCount} 项有人工裁决。
-       需要改动请用左侧「打回重跑本阶段」从 PM 重来。`;
+       需要改动请用左侧「打回重跑本阶段」从 PM 重来。`) + pmFilterNote;
 
   qs.forEach(q => {
     const ref = String(q.question || "");

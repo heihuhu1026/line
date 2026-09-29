@@ -352,6 +352,38 @@ def main() -> int:
             "裁决写入 open_questions.final_decision",
         )
 
+        print("\n== PM 保存裁决时对旧 run 脏快照先归一（BUG-A 第三通道）")
+        # 旧 run 的 NN-pm 快照可能是归一钩子收口前落的（含技术实现类问题）。保存裁决时
+        # 若不归一就回写，会把脏数据重新固化，续跑覆盖干净 state（真机 180933 即此路径）。
+        raw_pm = {
+            "open_questions": [
+                {"question": "数据库表结构", "recommendation": "x", "assumed_answer": "y",
+                 "severity": "low"},
+            ],
+            "unknowns": ["数据库表结构", "交易时间要不要记录"],
+            "clarifying_questions": [],
+        }
+        runstore.save_artifact(Path(root) / run_id, "pm", raw_pm, note="pre-normalize-raw")
+        code, raw_saved = call(
+            port, f"/api/runs/{run_id}/pm-decisions",
+            {"decisions": [{"kind": "pm_question", "ref": "交易时间要不要记录",
+                            "decision": "需要"}]},
+            "POST",
+        )
+        check(code == 200 and raw_saved.get("merged") == 1,
+              "unknowns 条目裁决并回（merged=1）", f"HTTP {code} {raw_saved.get('merged')}")
+        raw_detail = call(port, f"/api/runs/{run_id}")[1]
+        raw_art = (next((s for s in raw_detail["stages"] if s["stage"] == "pm"), None) or {}
+                   ).get("artifact") or {}
+        raw_titles = [str(q.get("question")) for q in (raw_art.get("open_questions") or [])
+                      if isinstance(q, dict)]
+        raw_unknowns = [str(x) for x in (raw_art.get("unknowns") or [])]
+        check("数据库表结构" not in raw_titles and "数据库表结构" not in raw_unknowns,
+              "保存裁决时先归一：技术问题没有被重新固化进快照",
+              f"{raw_titles} / {raw_unknowns}")
+        check(any("交易时间要不要记录：需要" == str(f) for f in (raw_art.get("confirmed_facts") or [])),
+              "业务裁决折叠进 confirmed_facts（下游拿得到）", str(raw_art.get("confirmed_facts"))[:160])
+
         print("\n== PRD 查看与编辑")
         code, prd_saved = call(port, f"/api/runs/{run_id}/prd", {"content": "# 人工改写的 PRD\n\n测试内容"}, "POST")
         check(code == 200, "保存人工改写的 prd.md", f"HTTP {code}")

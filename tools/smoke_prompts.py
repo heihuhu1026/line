@@ -184,6 +184,112 @@ def main() -> int:
           "两档返工不可混为一谈")
     check(prompts.prompt_version("nope") == "nope.v0", "未登记阶段仍退回 v0")
 
+    print("== 6. PM 未决问题准入：折叠三列重复 + 剔除技术实现类（真机 20260928-172150） ==")
+    from pipeline.orchestrator import pm_unresolved_items  # noqa: E402
+
+    def q(title, **kw):
+        row = {"question": title, "why_it_matters": "", "recommendation": "x",
+               "assumed_answer": "默认", "severity": "low"}
+        row.update(kw)
+        return row
+
+    pm_scope = {
+        "open_questions": [
+            q("数据库表结构", why_it_matters="需要确定字段名称和约束条件"),
+            q("金额格式校验"),
+            q("备注长度限制"),
+            q("序号有效性判断"),
+            q("浮点数精度处理"),
+            q("是否记录创建时间"),
+            q("金额格式校验？"),  # 行内近重复（仅差问号）
+        ],
+        "unknowns": ["数据库表结构", "金额格式校验", "备注长度限制",
+                     "序号有效性判断", "浮点数精度处理", "是否记录创建时间"],
+        "clarifying_questions": [
+            "数据库表结构", "是否允许负数金额", "是否限制备注字符数",
+            "序号是否必须为整数", "是否需要处理浮点数精度问题", "是否需要记录创建时间",
+        ],
+    }
+    logs: list[str] = []
+    z = prompts.normalize_pm_questions(dict(pm_scope), log=logs.append)
+    titles = [r["question"] for r in z["open_questions"]]
+    check("数据库表结构" not in titles and "浮点数精度处理" not in titles,
+          "技术实现类问题不进人工裁决（表结构/浮点精度）", str(titles))
+    check("金额格式校验" in titles and "备注长度限制" in titles
+          and "序号有效性判断" in titles and "是否记录创建时间" in titles,
+          "业务问题一律保留（业务规则/输入边界/业务可见性的创建时间）", str(titles))
+    check(titles.count("金额格式校验") == 1,
+          "open_questions 行内归一去重（「金额格式校验？」折叠）", str(titles))
+    check(z["unknowns"] == [],
+          "unknowns 与 open_questions 全等重复全部折叠", str(z["unknowns"]))
+    cq = z["clarifying_questions"]
+    check("数据库表结构" not in cq and "是否需要处理浮点数精度问题" not in cq,
+          "两列未明确项里的技术类同样剔除", str(cq))
+    check("是否需要记录创建时间" not in cq,
+          "疑问前缀归一后折叠（是否记录创建时间 ↔ 是否需要记录创建时间）", str(cq))
+    check("是否允许负数金额" in cq and "序号是否必须为整数" in cq
+          and "是否限制备注字符数" in cq and len(cq) == 3,
+          "词序交错/字面不像的改写宁可漏判也不误杀（新提示词下新 run 不再产生此形态）",
+          str(cq))
+    # 安全边界：字面相近的**两个不同业务问题**绝不能被折叠（阈值存在的意义）
+    distinct = prompts.normalize_pm_questions({"open_questions": [
+        q("金额格式校验"), q("金额上限校验"),
+    ]})
+    check(len(distinct["open_questions"]) == 2,
+          "「金额格式校验」与「金额上限校验」是两个业务问题，不得误折叠",
+          str([r["question"] for r in distinct["open_questions"]]))
+    near = prompts.normalize_pm_questions({"open_questions": [
+        q("金额格式校验"), q("金额的格式校验"),
+    ]})
+    check(len(near["open_questions"]) == 1,
+          "仅差一个虚词的近同构问法要折叠（阈值 0.75 的正向覆盖）",
+          str([r["question"] for r in near["open_questions"]]))
+    check(any("折叠" in m for m in logs) and any("技术实现类" in m for m in logs),
+          "准入动作在日志留痕（折叠/忽略了什么，人工可见）", str(logs))
+    pending = pm_unresolved_items(pm_scope, [])
+    check(len(pending["pending"]) == 4 and len(pending["vague"]) == 3,
+          "闸门判据按准入后的口径计数（旧 run 18 条 → 业务 4 问 + 残余改写 3 条）",
+          str(pending))
+    # 边界：非 dict / 空 dict / 缺字段都不炸，且不凭空补字段
+    check(prompts.normalize_pm_questions("x") == "x", "非 dict 原样返回")
+    empty = prompts.normalize_pm_questions({})
+    check(isinstance(empty, dict) and not empty, "空 dict 不凭空补字段", str(empty))
+    bare = prompts.normalize_pm_questions({"open_questions": []})
+    check(bare["open_questions"] == [] and "unknowns" not in bare,
+          "原本没有的两列不会被新建", str(bare))
+    sys_pm = prompts.system_prompt("pm", "second", tasktype.FEATURE)
+    check("一一对应" not in sys_pm and "技术实现类" in sys_pm and "空数组" in sys_pm,
+          "二开 PM 提示词已取消三列一一对应、写明技术类禁问与空数组约定")
+    sys_pm_new = prompts.system_prompt("pm", "new", tasktype.FEATURE)
+    check("技术实现" in sys_pm_new and "空数组" in sys_pm_new,
+          "新建 PM 提示词同步同口径约束")
+
+    print("== 6b. confirmed_facts 必须随裁决下发（真机 20260928-180933 BUG-B） ==")
+    # 人工对 unknowns 的裁决被 apply_pm_decisions 折叠进 confirmed_facts 后，
+    # 渲染只遍历 open_questions ⇒ 裁决「交易时间=需要」到不了架构师。
+    scope_facts = {"confirmed_facts": ["是否记录交易时间：需要", "多币种：暂不支持"]}
+    blk_f = prompts.pm_assumptions_block(scope_facts)
+    check("是否记录交易时间：需要" in blk_f and "多币种：暂不支持" in blk_f,
+          "open_questions 空、只有 confirmed_facts 时仍渲染（不提前返回空串）", blk_f[:120])
+    check("确定结论" in blk_f, "裁决事实进入「确定结论」分区")
+    scope_dup = {
+        "open_questions": [
+            {"question": "是否记录交易时间", "final_decision": "需要", "confirmed": True},
+        ],
+        "confirmed_facts": ["是否记录交易时间：需要"],
+    }
+    blk_dup = prompts.pm_assumptions_block(scope_dup)
+    check(blk_dup.count("是否记录交易时间") == 1,
+          "同一问题在 open_questions 与 confirmed_facts 各一份时只渲染一次（按 fact_key 去重）",
+          str(blk_dup.count("是否记录交易时间")))
+    applied = prompts.apply_pm_decisions(
+        {"open_questions": [], "unknowns": ["是否记录交易时间"], "clarifying_questions": []},
+        [{"ref": "是否记录交易时间", "decision": "需要"}],
+    )
+    blk_a = prompts.pm_assumptions_block(applied)
+    check("是否记录交易时间：需要" in blk_a,
+          "unknowns 裁决折叠成 confirmed_facts 后照样到下游", blk_a[:120])
+
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0
 

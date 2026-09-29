@@ -207,6 +207,20 @@ def main() -> int:
         check(audit10["edits"][0]["status"] == "new_file_syntax_error",
               "单块写残仍判出（既有能力不许退化）", str(audit10["edits"][0]["status"]))
 
+        print("== ⑩ full_symbol 残片在物化前拦截（真机 20260928-200631 双转义 \\n 写残） ==")
+        ok_block = "def f(a, b):\n    return a + b\n"
+        check(patches.check_symbol_block_content(ok_block, "m.py", "f") is None,
+              "合法 full_symbol 块通过")
+        indented = "\n".join("    " + ln for ln in ok_block.splitlines()) + "\n"
+        check(patches.check_symbol_block_content(indented, "m.py", "f") is None,
+              "被模型整体缩进一层的块 dedent 后通过（不误报）")
+        broken = "def f(a, b):\\n    return a + b\\n"  # 字面反斜杠+n：压成一行 → 语法错
+        prob = patches.check_symbol_block_content(broken, "m.py", "f")
+        check(prob is not None and "f" in prob and "full_symbol" in prob,
+              "双转义残片在 dev 自检阶段就被拦下（不等 verify py_compile）", str(prob))
+        check(patches.check_symbol_block_content("@@ -1 +1 @@\n-x\n+y", "m.py", "f") is None,
+              "diff 形态不交给本检查（跳过）")
+
         print("== ⑧ 定位函数：歧义 / 找不到一律返回 None（不猜位置） ==")
         locate = patches._locate_span
         lines8 = ["x = 1", "", "x = 1", ""]

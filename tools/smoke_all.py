@@ -24,6 +24,7 @@ SUITES = [
     # 静态检查排在真机之前最便宜的位置：真机 `20260928-095848` 里"补漏符号"整条机制
     # 因为一个 `NameError` 空转了 5/5 张图，而 ruff 的 F821 一行就定位到它。
     "check_lint.py",
+    "check_contracts.py",  # Schema Guardian：Prompt 声明 ↔ Schema 允许 ↔ 代码消费 三方对账
     "smoke_recovery.py",
     "smoke_rules.py",
     "smoke_client.py",

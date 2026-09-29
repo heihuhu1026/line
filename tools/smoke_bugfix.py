@@ -287,6 +287,40 @@ def main() -> int:
     check(tasktype._match_known("pkg/mod.py", ["cli.py"]) == "pkg/mod.py",
           "本来就相对的路径仍可用末尾两段兜底")
 
+    print("== 7. 评审逗号串 path 必须拆开（真机 20260928-180933 BUG-G） ==")
+    # 评审把多个文件写进一条返工项："[文件 cli.py,db.py,main.py] …"。不拆时 affected
+    # 里出现一个不存在的假路径，「只重做受影响施工图」的分派整体失效，退化成两遍整体重写。
+    check(
+        tasktype._split_paths("cli.py，db.py;main.py、test_cases.py")
+        == ["cli.py", "db.py", "main.py", "test_cases.py"],
+        "半角/中文逗号、分号、顿号都拆",
+        str(tasktype._split_paths("cli.py，db.py;main.py、test_cases.py")),
+    )
+    check(tasktype._split_paths("a.py, a.py,,b.py") == ["a.py", "b.py"],
+          "保序去重、空段丢弃", str(tasktype._split_paths("a.py, a.py,,b.py")))
+    plan_g = {"tasks": [
+        {"id": "T-01", "target_files": ["main.py"]},
+        {"id": "T-02", "target_files": ["db.py"]},
+        {"id": "T-03", "target_files": ["cli.py"]},
+    ]}
+    rep_g = tasktype.bug_report_from_state(
+        {"verify_report": {"commands": [], "problems": [], "materialized": []}, "test_report": {}},
+        ["[文件 cli.py,db.py,main.py] 修 NameError"],
+        plan=plan_g,
+    )
+    check({"cli.py", "db.py", "main.py"} <= set(rep_g["affected"]),
+          "逗号串 affected 拆成三个真实文件（不是一个假路径）", str(sorted(rep_g["affected"])))
+    by_g = rep_g.get("by_task") or {}
+    check({"T-01", "T-02", "T-03"} <= set(by_g),
+          "三张施工图都被分派（不再因交集为空退化成整批重写）", str(sorted(by_g)))
+    items_g = tasktype.defect_items(
+        {"verify_report": {"commands": []}},
+        ["[文件 cli.py,db.py] 补 import"],
+    )
+    review_paths = sorted({i["path"] for i in items_g if i.get("source") == "review"})
+    check(review_paths == ["cli.py", "db.py"],
+          "评审返工项按逗号串每文件一条缺陷项", str(review_paths))
+
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0
 

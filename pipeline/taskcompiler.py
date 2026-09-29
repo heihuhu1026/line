@@ -46,29 +46,33 @@ def _chunk(items: list[str], size: int) -> list[list[str]]:
     return [items[i: i + size] for i in range(0, len(items), size)] or [[]]
 
 
-def compile_tasks(
+def compile_plan(
     plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK, ir: Any = None
-) -> list[dict]:
-    """从 **compiler_ir** 确定性生成 tasks。
+) -> dict:
+    """编译入口（**带错误通道**）：返回 ``{"tasks": [...], "errors": [...]}``。
 
-    优先读 IR（`planir.normalize_plan` 的产物）—— 合并 / 清洗 / 冲突解决**已经做完**，
-    这里只做**拆分与编号**。没有 IR 时退回直接读 `plan["changes"]`（兼容旧调用点与单测）。
-
-    规则（全部可预测、可断言）：
-      ① 每个 unit 至少一张图；没声明 symbols 时整文件一张；
-      ② 符号数超过 `max_symbols` 就切分，保证单轮写得完；
-      ③ 单文件天然只由它自己的图覆盖（不会触发"同一文件被多张图覆盖"的告警）；
-      ④ 依赖优先用方案声明的 `depends_on`（按 unit 翻译成新编号）；没有声明的挂到
-         前一张图 ⇒ 保住"先建文件、后引用接口"的线性次序；
-      ⑤ `test_hint` 优先用 IR 里那条（方案阶段补的施工图字段），否则机械生成
-         `python -c "import <module>"` —— 不再指望模型填，它**从来没填过**。
+    ``tasks`` 始终按硬约束生成（单张符号数绝不超 ``max_symbols``）；当一个文件需要的
+    图数超过 ``MAX_TASKS_PER_FILE``（即符号总量超过 单图上限×单文件图数上限）时，
+    **不靠放宽单图大小消化**（那会产出 dev 单轮写不完的图 —— 旧 ``_split_groups``
+    的真实 bug：9/10 个符号被切成 5 个一张），而是照常切出合格的图、同时在 ``errors``
+    里报 ``task_capacity_exceeded`` —— 由上游 Design Gate 决定回架构师重拆还是转人工，
+    绝不带一张超限的图进开发。
     """
     units = [
         u for u in ((ir or {}).get("units") or []) if isinstance(u, dict) and _norm(u.get("file"))
     ]
     if units:
-        return _compile_from_units(units, max_symbols=max_symbols)
-    return _compile_from_changes(plan, max_symbols=max_symbols)
+        tasks, errors = _compile_from_units(units, max_symbols=max_symbols)
+    else:
+        tasks, errors = _compile_from_changes(plan, max_symbols=max_symbols)
+    return {"tasks": tasks, "errors": errors}
+
+
+def compile_tasks(
+    plan: Any, *, max_symbols: int = MAX_SYMBOLS_PER_TASK, ir: Any = None
+) -> list[dict]:
+    """兼容包装：只要施工图（容量错误走 :func:`compile_plan` 的 ``errors``）。"""
+    return compile_plan(plan, max_symbols=max_symbols, ir=ir)["tasks"]
 
 
 def _dedup(items: Any) -> list[str]:
@@ -83,14 +87,17 @@ def _dedup(items: Any) -> list[str]:
 
 
 def _split_groups(symbols: list[str], max_symbols: int) -> list[list[str]]:
-    """切分大小同时受两个上限约束：单张不超过 `max_symbols`（写得完），
-    且**同一文件的图数不超过 `MAX_TASKS_PER_FILE`**（避免同一文件被反复改动）。
-    后者优先：真机 192001 里 `command.py` 被 3 张图覆盖，直接引发合并 / anchor 冲突。
+    """按**单张符号上限**硬切：单张绝不超过 `max_symbols`（dev 单轮写得完的前提）。
+
+    刻意不再为了迁就 `MAX_TASKS_PER_FILE` 而放宽单张大小 —— 旧实现
+    ``size=max(max_symbols, ceil(n/MAX_TASKS_PER_FILE))`` 在 9/10 个符号时会切出
+    5 个符号一张的图，直接违反单图 ≤4 的约束，且没有任何错误通道。
+    单文件图数超限（需要的图 > `MAX_TASKS_PER_FILE`）改由
+    :func:`_compile_from_units` 产出 ``task_capacity_exceeded`` 错误，交给 Design Gate。
     """
     if not symbols:
         return [[]]
-    size = max(max_symbols, -(-len(symbols) // MAX_TASKS_PER_FILE))
-    return _chunk(symbols, size)
+    return _chunk(symbols, max_symbols)
 
 
 def _acceptance_text(raw: Any, path: str, group: list[str]) -> str:
@@ -114,11 +121,17 @@ def _acceptance_text(raw: Any, path: str, group: list[str]) -> str:
     return f"{path} 可被导入，且承载 intent 描述的能力"
 
 
-def _compile_from_units(units: list[dict], *, max_symbols: int) -> list[dict]:
+def _compile_from_units(
+    units: list[dict], *, max_symbols: int
+) -> tuple[list[dict], list[dict]]:
+    """返回 ``(tasks, errors)``：tasks 永远满足单图符号上限；
+    单文件图数超 ``MAX_TASKS_PER_FILE`` 时在 errors 里登记容量错误（图仍照常切出）。"""
     tasks: list[dict] = []
+    errors: list[dict] = []
     seq = 0
     id_map: dict[str, list[str]] = {}
-    pending: list[tuple[dict, list[str]]] = []
+    file_tasks: dict[str, list[str]] = {}
+    pending: list[tuple[dict, list[str], dict]] = []
     for unit in units:
         path = _norm(unit.get("file"))
         symbols = [str(s).strip() for s in (unit.get("symbols") or []) if str(s).strip()]
@@ -130,8 +143,49 @@ def _compile_from_units(units: list[dict], *, max_symbols: int) -> list[dict]:
             for key in ("interface", "contracts", "data_model", "constraints", "unresolved_uses")
             if unit.get(key) not in (None, "", [], {})
         }
+        groups = _split_groups(symbols, max_symbols)
+        if len(groups) > MAX_TASKS_PER_FILE:
+            # 容量冲突**显式报错**：该文件的符号总量装不进「最多 N 张图 × 每张 M 个符号」。
+            # 正确解法在方案层（重拆到更多文件 / 调整文件边界），编译器无权替架构师做这个决定。
+            errors.append(
+                {
+                    "code": "task_capacity_exceeded",
+                    "file": path,
+                    "symbols": len(symbols),
+                    "tasks_needed": len(groups),
+                    "max_tasks_per_file": MAX_TASKS_PER_FILE,
+                    "max_symbols_per_task": max_symbols,
+                    "detail": (
+                        f"{path} 声明 {len(symbols)} 个符号，按单图 ≤{max_symbols} 需要 "
+                        f"{len(groups)} 张图，超过单文件上限 {MAX_TASKS_PER_FILE} 张"
+                        f"（容量 {MAX_TASKS_PER_FILE * max_symbols} 个符号）"
+                        " —— 需架构师重拆文件边界或合并符号"
+                    ),
+                }
+            )
+        # 自依赖在 planir 合并前已取证（unit.self_depends）：这是方案层硬错误，
+        # 不把该 id 再映成边（否则会同文件多图时凭空造出反向边），只登记错误交 Design Gate。
+        self_ids = set(_dedup(unit.get("self_depends")))
+        for sid in sorted(self_ids):
+            errors.append(
+                {
+                    "code": "self_dependency",
+                    "file": path,
+                    "task": sid,
+                    "detail": f"{path} 的施工图 {sid} 在 depends_on 里声明了它自己（任务不能自依赖）",
+                }
+            )
         new_ids: list[str] = []
-        for group in _split_groups(symbols, max_symbols):
+        # 只保留**跨 unit** 的 draft 依赖参与建边：
+        #  · 自依赖（self_ids）：方案硬错误，上面已登记，且不能映成边（多图时会造幻影反向边）；
+        #  · 同一 unit 内部的 draft 互依（T-02/T-03 合并后符号被重新分组，对应关系已不存在）：
+        #    静默丢弃 —— 组间顺序由「同文件顺序边」承担，映成"所有组互依"反而会造假环。
+        source_ids = set(_dedup(unit.get("source_task_ids")))
+        raw_deps = [
+            d for d in _dedup(unit.get("depends_on"))
+            if d not in self_ids and d not in source_ids
+        ]
+        for group in groups:
             seq += 1
             tid = f"T-{seq:02d}"
             new_ids.append(tid)
@@ -154,32 +208,218 @@ def _compile_from_units(units: list[dict], *, max_symbols: int) -> list[dict]:
             for key, val in hints.items():
                 task.setdefault(key, val)
             tasks.append(task)
-            pending.append((task, _dedup(unit.get("depends_on"))))
+            file_tasks.setdefault(path, []).append(tid)
+            pending.append((task, raw_deps, unit))
         for key in _dedup([*(unit.get("source_task_ids") or []), str(unit.get("stable_id") or "")]):
             id_map.setdefault(key, []).extend(new_ids)
-    # 依赖翻译：原 draft id → 新编号（挂到该 unit 的**全部**图上，即"整个 unit 完成"）
-    for task, deps in pending:
-        mapped: list[str] = []
+    tasks, dep_errors = _assemble_dependency_dag(tasks, pending, id_map, file_tasks)
+    errors.extend(dep_errors)
+    return tasks, errors
+
+
+def _assemble_dependency_dag(
+    tasks: list[dict],
+    pending: list[tuple[dict, list[str], dict]],
+    id_map: dict[str, list[str]],
+    file_tasks: dict[str, list[str]],
+) -> tuple[list[dict], list[dict]]:
+    """装配执行 DAG 的边并做三项机械校验，最后 Kahn 拓扑排序输出施工图顺序。
+
+    边的**唯一来源**（不再有人为的"每张图默认依赖前一张"线性链）：
+      ① draft 显式 depends_on（原 id 经 id_map 映到编译后编号，挂在该 unit 的全部图上）；
+      ② planir 机械推出的 ``depends_on_files``（contract ∪ symbol；二开再 ∪ 现存 import 图）
+         —— 整个前置文件 unit 的图全部完成，本 unit 才能施工；
+      ③ 同文件多图：后者在前者的成果上继续（同一产物文件，顺序即真实依赖）。
+
+    三项校验（出错只登记、不偷偷改图）：依赖目标必须存在 / 不能自依赖（取证在 planir）/
+    不能有环。环与未知依赖都交 Design Gate 回架构师，绝不把 DAG 悄悄重新串成线。
+    """
+    errors: list[dict] = []
+    order_index = {str(t.get("id")): i for i, t in enumerate(tasks)}
+    unknown: dict[str, list[str]] = {}
+    # 边 → 人话来源（真机 20260928-160609：只报「T-02 → T-03 → T-02」模型根本不知道
+    # 哪条边是自己 depends_on 声明的、哪条是编译器加的同文件顺序边，无从下手打断环）。
+    edge_src: dict[tuple[str, str], list[str]] = {}
+
+    def _note(src: str, dst: str, why: str) -> None:
+        bucket = edge_src.setdefault((src, dst), [])
+        if why not in bucket:
+            bucket.append(why)
+
+    # 编译后编号 → 模型原图任务 id（编号会重排，给模型看的指引必须能对回它自己的图）。
+    source_of: dict[str, list[str]] = {}
+    for task, deps, unit in pending:
+        path = _norm(unit.get("file"))
+        tid = str(task.get("id"))
+        src_ids = [str(x) for x in _dedup(unit.get("source_task_ids"))]
+        if src_ids:
+            source_of[tid] = src_ids
+        edges: set[str] = set()
         for dep in deps:
-            mapped.extend(id_map.get(dep, []))
-        # **必须滤掉自引用**：多张原图合并进同一 unit 时，合并后的图天然会"依赖自己"
-        # （真机形态：T-02 与 T-03 都改 cli.py，T-03 声明依赖 T-02，两者合成一张图后
-        # 就变成 T-03 → T-03）。自引用会让拓扑排序退化、也让"前置任务"这句话变成噪音。
-        task["depends_on"] = [d for d in _dedup(mapped) if d != task["id"]]
-    prev = ""
-    for task in tasks:
-        if not task["depends_on"] and prev:
-            task["depends_on"] = [prev]
-        prev = task["id"]
-    return tasks
+            mapped = id_map.get(dep)
+            if mapped:
+                for dst in mapped:
+                    _note(
+                        tid,
+                        dst,
+                        f"方案声明（原图任务 {'、'.join(src_ids) or tid} 的 depends_on 含 {dep}）",
+                    )
+                edges.update(mapped)
+            else:
+                # 依赖目标不存在：旧实现静默丢弃，dev 于是看不到前置文件、
+                # 拓扑排序也把它当"无依赖" —— 方案里的拼写错误（真机：引号污染的 T-06）
+                # 直到运行时才炸。显式登记 unknown_dependency。
+                unknown.setdefault(dep, [])
+                if path not in unknown[dep]:
+                    unknown[dep].append(path)
+        for dep_file in (unit.get("depends_on_files") or []):
+            # 方案外文件（未改动的现存文件等）没有编译节点：无排序意义，忽略。
+            mapped_files = file_tasks.get(_norm(dep_file), [])
+            for dst in mapped_files:
+                _note(tid, dst, f"跨文件引用推出（{_norm(dep_file)}：contracts.uses / 现存 import）")
+            edges.update(mapped_files)
+        same = file_tasks.get(path, [])
+        pos = same.index(tid)
+        if pos > 0:
+            _note(tid, same[pos - 1], f"同文件顺序边（{path} 内编译器按施工图顺序自动添加）")
+            edges.add(same[pos - 1])
+        # 合并导致的机械自引用（T-02/T-03 同文件合并后 T-03→T-02 变成自己）在此滤掉：
+        # 那不是模型错误，与 planir 取证的 draft 显式自依赖（self_dependency）区分开。
+        edges.discard(tid)
+        task["depends_on"] = sorted(edges, key=lambda d: order_index.get(d, 1 << 30))
+    for dep, declared_by in sorted(unknown.items()):
+        errors.append(
+            {
+                "code": "unknown_dependency",
+                "dep": dep,
+                "declared_by": declared_by,
+                "detail": (
+                    f"施工图声明依赖不存在的任务 `{dep}`（声明方：{'、'.join(declared_by)}）"
+                    " —— 依赖目标必须存在（id 拼写 / 引号污染 / 引用了被删掉的图？）"
+                ),
+            }
+        )
+    ordered, in_cycle = _topo_order(tasks)
+    if in_cycle:
+        cyc = _find_one_cycle(in_cycle, tasks)
+        cyc = cyc or sorted(in_cycle)
+        cycle_edges: list[dict[str, Any]] = []
+        has_draft_edge = False
+        for a, b in zip(cyc, cyc[1:]):
+            whys = edge_src.get((a, b), [])
+            if not whys:
+                whys = ["来源未知（编译器内部）"]
+            if any("方案声明" in w for w in whys):
+                has_draft_edge = True
+            cycle_edges.append({"from": a, "to": b, "sources": whys})
+        id_hint = "；".join(
+            f"{tid} 对应原图 {'、'.join(sids)}" for tid, sids in sorted(source_of.items())
+            if tid in set(in_cycle)
+        )
+        if has_draft_edge:
+            howto = (
+                "打断方法：删除或改向环上标为「方案声明」的那条 depends_on —— "
+                "被依赖的底层模块（如数据库）不得反向依赖调用方；"
+                "「同文件顺序边」由编译器自动添加、不能直接删，需靠重新拆分文件或调整任务排列消除。"
+            )
+        else:
+            howto = (
+                "环上**没有**你显式声明的依赖，全部是编译器自动添加的同文件顺序/跨文件引用边："
+                "请重新拆分文件边界，或调整任务在方案中的排列顺序，打断同文件图序。"
+            )
+        detail = (
+            "依赖图存在环："
+            + " → ".join(cyc)
+            + " —— 环上的施工图互相等待，无法决定施工顺序。各条边的来源：\n"
+            + "\n".join(f"  · {e['from']} → {e['to']}：{'；'.join(e['sources'])}" for e in cycle_edges)
+            + (f"\n编号对照：{id_hint}。" if id_hint else "")
+            + "\n"
+            + howto
+        )
+        errors.append(
+            {
+                "code": "dependency_cycle",
+                "tasks": sorted(in_cycle),
+                "cycle": cyc,
+                "cycle_edges": cycle_edges,
+                "source_tasks": {
+                    tid: source_of[tid] for tid in sorted(source_of) if tid in set(in_cycle)
+                },
+                "detail": detail,
+            }
+        )
+    return ordered, errors
 
 
-def _compile_from_changes(plan: Any, *, max_symbols: int) -> list[dict]:
+def _topo_order(tasks: list[dict]) -> tuple[list[dict], set[str]]:
+    """Kahn 拓扑排序（**稳定**：同等就绪度按编译编号序）。
+
+    返回 ``(排序后的施工图, 环上节点集合)``。环存在时不抛异常：环上节点按原序附在尾部
+    （best-effort，Design Gate 会据 dependency_cycle 阻断，绝不让流水线死循环）。
+    """
+    ids = [str(t.get("id")) for t in tasks]
+    by_id = dict(zip(ids, tasks))
+    deps_of = {
+        tid: {str(d) for d in (by_id[tid].get("depends_on") or []) if str(d) in ids}
+        for tid in ids
+    }
+    done: set[str] = set()
+    emitted: list[str] = []
+    while True:
+        ready = [tid for tid in ids if tid not in done and deps_of[tid] <= done]
+        if not ready:
+            break
+        pick = ready[0]  # ids 即编译编号序，取第一个 ⇒ 同输入必得同顺序
+        done.add(pick)
+        emitted.append(pick)
+    leftover = {tid for tid in ids if tid not in done}
+    ordered_ids = [*emitted, *(tid for tid in ids if tid in leftover)]
+    ordered = [by_id[tid] for tid in ordered_ids]
+    return ordered, leftover
+
+
+def _find_one_cycle(cycle_ids: set[str], tasks: list[dict]) -> list[str]:
+    """从环上节点里 DFS 摘出**一条**具体环（首尾同点，便于人工/架构师指认）；摘不到返回 []。"""
+    deps = {
+        str(t.get("id")): [
+            str(d) for d in (t.get("depends_on") or []) if str(d) in cycle_ids
+        ]
+        for t in tasks
+        if str(t.get("id")) in cycle_ids
+    }
+    color: dict[str, int] = {}
+    stack: list[str] = []
+
+    def _dfs(node: str) -> list[str] | None:
+        color[node] = 1
+        stack.append(node)
+        for nxt in deps.get(node, []):
+            if color.get(nxt) == 1:
+                return stack[stack.index(nxt):] + [nxt]
+            if color.get(nxt) != 2:
+                hit = _dfs(nxt)
+                if hit:
+                    return hit
+        stack.pop()
+        color[node] = 2
+        return None
+
+    for start in sorted(cycle_ids):
+        if color.get(start) != 2:
+            hit = _dfs(start)
+            if hit:
+                return hit
+    return []
+
+
+def _compile_from_changes(
+    plan: Any, *, max_symbols: int
+) -> tuple[list[dict], list[dict]]:
     """**兼容路径**：没有 IR 时直接读 `changes[]`（旧调用点与单测走这里）。"""
     plan = plan if isinstance(plan, dict) else {}
     changes = [c for c in (plan.get("changes") or []) if isinstance(c, dict) and c.get("path")]
     if not changes:
-        return []
+        return [], []
     units: list[dict] = []
     for change in changes:
         path = _norm(change.get("path"))

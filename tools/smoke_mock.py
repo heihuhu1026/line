@@ -311,6 +311,14 @@ def main() -> int:
             if not mock_rework and review_every == 1:
                 check(len(s["calls"]) == 8, "全程 8 次模型调用（intake + pm + dev 两遍…）", str(len(s["calls"])))
                 check(s["model_switches"] == 3, "单驻留切换 3 次（8B→14B→coder→14B）", str(s["model_switches"]))
+            if name == "review-every-2-cadence":
+                # 跳评轮（第 2 轮）之后的 dev 必须延续 BUGFIX 口径：真机 run 20260928-200631
+                # 漏标后默认回退 FEATURE，口径随节奏翻转，FEATURE 轮无视「禁止 add 整份」，
+                # 把上一轮修好的 import/守卫又整份覆盖回去，五轮不收敛。
+                _cad_state = runstore.read_state(result.run_dir)
+                _cad_kind = (_cad_state.get("artifacts") or {}).get("round_kind")
+                check(_cad_kind == "bugfix",
+                      "跳评后续轮口径 = bugfix（不退回 feature）", str(_cad_kind))
             if want_verdict == "needs_human":
                 check(s["needs_human"], "needs_human 已置位")
                 check((result.run_dir / runstore.HANDOFF_NAME).exists(), "生成 handoff.md 待人工清单")
@@ -599,6 +607,69 @@ def main() -> int:
         check(bool(amb_review.get("escalated_ambiguous")), "标记为分类矛盾")
         check(bool(amb_result.summary.get("needs_human")), "转人工裁决")
 
+        print("\n== force-review-events（建议⑬：节奏窗口外事件强制评审）")
+        from pipeline import diagnose as diag_mod
+
+        fe_orch = make(root, "force-events", client=MockClient(rework_first=0))
+        fe_orch.run(REQ)  # 停在人工审核闸门；state 里方案/验证等已齐
+        # 构造「上轮开着的缺陷，本轮逐项验收转绿」的台账行（key 直接取同一条 row）
+        green_row = {
+            "kind": "command", "check_id": "python -m unittest",
+            "path": "app.py", "symbol": "export", "what": "导出按钮用例失败",
+            "status": "green",
+        }
+        green_key = diag_mod.defect_key(green_row)
+        fe_orch.state["defect_verdicts"] = [green_row]
+        fe_orch.state["defect_ledger"] = {
+            "open": {green_key: {"status": "fail", "what": "导出按钮用例失败"}},
+            "fixed_verified": [], "fixed_detail": {},
+        }
+        fe_orch.attempt = 2
+        fe_orch.last_review_attempt = 1
+        fe_orch.review_every = 3
+        due, due_why = fe_orch._review_due(2)
+        check(not due, "第 2 轮节奏上不到期（every=3）", str((due, due_why)))
+        fe_events = fe_orch._force_review_events()
+        check("defect_closed" in fe_events, "开缺陷转绿 ⇒ defect_closed", str(fe_events))
+
+        # 回归：上轮已转绿这轮又红
+        red_row = dict(green_row, status="fail")
+        fe_orch.state["defect_verdicts"] = [red_row]
+        fe_orch.state["defect_ledger"] = {
+            "open": {},
+            "fixed_verified": [green_key],
+            "fixed_detail": {green_key: {"status": "green"}},
+        }
+        rg_events = fe_orch._force_review_events()
+        check("regression_recovered" in rg_events, "已转绿又变红 ⇒ regression_recovered", str(rg_events))
+
+        # 方案边界：与上次评审时记录的文件集合不同
+        fe_orch.state["defect_verdicts"] = []
+        fe_orch.state["defect_ledger"] = {"open": {}, "fixed_verified": [], "fixed_detail": {}}
+        fe_orch.state["last_review_plan_files"] = ["totally-other-file.py"]
+        pb_events = fe_orch._force_review_events()
+        check("plan_boundary_changed" in pb_events, "方案文件集合变化 ⇒ plan_boundary_changed",
+              str(pb_events))
+
+        # 高风险：被改符号有**存量上游**（in_this_round=False）
+        fe_orch.state["last_review_plan_files"] = sorted(fe_orch._plan_file_set())
+        fe_orch.state["verify_report"] = {"impact_audit": {"callers": [
+            {"symbol": "export", "file": "upstream_page.py", "in_this_round": False},
+        ]}}
+        hr_events = fe_orch._force_review_events()
+        check("high_risk_task_changed" in hr_events, "存量上游被波及 ⇒ high_risk_task_changed",
+              str(hr_events))
+
+        # 人工反馈本轮被消费
+        fe_orch.state["verify_report"] = {}
+        fe_orch.state["human_feedback_consumed_round"] = 2
+        hf_events = fe_orch._force_review_events()
+        check("human_feedback_resolved" in hf_events, "人工反馈本轮消费 ⇒ human_feedback_resolved",
+              str(hf_events))
+        # 无事件时不得强评
+        fe_orch.state["human_feedback_consumed_round"] = 1
+        check(fe_orch._force_review_events() == [], "无事件时不强制评审")
+
         print("\n== grounding（事实接地）")
         # mock 模式下接地校验是关的（产物是合成占位符，路径无意义），
         # 这里用非 mock 客户端 + 构造产物直接覆盖校验逻辑本身。
@@ -736,6 +807,63 @@ def main() -> int:
         restored._restore(new_state)
         check(restored.project_type == "new", "续跑沿用 project_type（不被 CLI 默认值覆盖）",
               restored.project_type)
+
+        print("\n== pm-normalize：首跑快照 / 续跑快照覆盖 两通道归一不回退（BUG-A） ==")
+        # 真机 run 20260928-180933：PM 违规吐出技术问题「数据库表结构」，post 钩子收口前，
+        # state 被归一了但 NN-pm 快照还是原始的；resume 时原始快照覆盖 state，脏问题复活
+        # 并下发架构师，白烧一整轮。
+        raw_pm_scope = {
+            "open_questions": [
+                {"question": "数据库表结构", "recommendation": "x", "assumed_answer": "y",
+                 "severity": "low", "why_it_matters": "确定字段"},
+                {"question": "金额格式校验", "recommendation": "建议两位小数", "assumed_answer": "两位",
+                 "severity": "low", "why_it_matters": "z"},
+            ],
+            "unknowns": ["数据库表结构", "金额格式校验"],
+            "clarifying_questions": [],
+        }
+
+        class RawPmClient(MockClient):
+            """PM 产物里故意带一条技术实现类问题（归一前的脏数据）。"""
+
+            def chat_json(self, spec, system, user, schema, num_predict=None, attempts=2,
+                          on_attempt=None, log=None):  # noqa: ARG002
+                data, meta = super().chat_json(spec, system, user, schema, num_predict, attempts)
+                if spec.role == "产品经理":
+                    data.update(json.loads(json.dumps(raw_pm_scope)))
+                return data, meta
+
+        pn_orch = make(root, "pm-normalize", client=RawPmClient(), pause_after=["pm"])
+        pn_res = pn_orch.run(REQ)
+        pn_dir = pn_res.run_dir
+        pn_titles = [
+            str(q.get("question")) for q in ((pn_orch.state.get("scope") or {}).get("open_questions") or [])
+            if isinstance(q, dict)
+        ]
+        check("数据库表结构" not in pn_titles and "金额格式校验" in pn_titles,
+              "通道①：首跑 state 已归一（技术问题剔除）", str(pn_titles))
+        pn_snap_art = (runstore.latest_artifacts(pn_dir) or {}).get("pm") or {}
+        pn_snap_titles = [str(q.get("question")) for q in (pn_snap_art.get("open_questions") or [])
+                          if isinstance(q, dict)]
+        check("数据库表结构" not in pn_snap_titles,
+              "通道①：落盘的 NN-pm 快照同样已归一（post 钩子在快照之前执行）", str(pn_snap_titles))
+
+        # 旧 run 的原始快照（归一前落盘）覆盖 state + 人工裁决：resume 后不许复活
+        runstore.save_artifact(pn_dir, "pm", json.loads(json.dumps(raw_pm_scope)), note="old-raw-snapshot")
+        pn_state = runstore.read_state(pn_dir)
+        pn_state["pm_decisions"] = [{"ref": "金额格式校验", "decision": "统一两位小数"}]
+        runstore.write_state(pn_dir, pn_state)
+        pn_restored = make(root, "pm-normalize-restore")
+        pn_restored.run_dir = pn_dir
+        pn_restored._restore(pn_state)
+        r_scope = pn_restored.state.get("scope") or {}
+        r_titles = [str(q.get("question")) for q in (r_scope.get("open_questions") or [])
+                    if isinstance(q, dict)]
+        check("数据库表结构" not in r_titles,
+              "通道②：resume 被原始快照覆盖后仍再归一一次（脏问题不复活）", str(r_titles))
+        check(any("金额格式校验：统一两位小数" == str(f) for f in (r_scope.get("confirmed_facts") or [])),
+              "通道②：人工裁决在读取时幂等并回（confirmed_facts 带最终结论）",
+              str(r_scope.get("confirmed_facts")))
 
         print("\n== patch-audit")
         from pipeline import patches
@@ -907,6 +1035,57 @@ def main() -> int:
         g = g_orch.run(REQ)
         check(g.paused and g.paused_after == "human_review", "到达人工审核闸门并暂停",
               f"paused={g.paused}/{g.paused_after}")
+        # 建议⑭ Transition Record：进闸门这一跳必须有因果记录（from/to/reason/版本摘要）
+        g_state = json.loads((g.run_dir / "state.json").read_text(encoding="utf-8"))
+        g_trans = (g_state.get("artifacts") or {}).get("transitions") or []
+        check(bool(g_trans) and g_trans[0]["from"] == "review"
+              and g_trans[0]["to"] == "human_review",
+              "transition：review -> human_review 已落库",
+              str(g_trans[:1]))
+        check(all(len(t.get("plan_version") or "") == 12 and len(t.get("task_version") or "") == 12
+                  for t in g_trans),
+              "transition 带 plan_version/task_version（12 位摘要）",
+              str([(t.get("plan_version"), t.get("task_version")) for t in g_trans]))
+        check(all(set(["attempt", "reason", "evidence", "defect_ids"]) <= set(t) for t in g_trans),
+              "transition 字段齐全（attempt/reason/evidence/defect_ids）")
+        # 建议⑰：Artifact 因果链 —— Plan→Patch→Verify→Review 逐环可追（artifact_id 与文件同名）
+        _snaps = {}
+        for p in sorted(g.run_dir.glob("*.json")):
+            if p.name == "state.json":
+                continue
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("artifact_id"):
+                # dev 同时有单次调用快照（kind=llm）与累积快照（kind=snapshot），
+                # 因果链里 verify 指向的是**累积**那一份：累积快照到达时覆盖前面的。
+                if obj.get("stage") == "dev" and (obj.get("meta") or {}).get("kind") == "snapshot":
+                    _snaps["dev"] = obj
+                else:
+                    _snaps.setdefault(obj.get("stage"), obj)
+        _dev_acc = next((o for n, o in _snaps.items() if n == "dev"
+                         and (o.get("meta") or {}).get("kind") == "snapshot"), None)
+        _plan, _verify, _review = _snaps.get("architect_plan"), _snaps.get("verify"), _snaps.get("review")
+        check(_plan is not None and _dev_acc is not None and _verify is not None and _review is not None,
+              "全链路快照齐备（plan / 累积 dev / verify / review）",
+              str(sorted(_snaps.keys())))
+        if _plan and _dev_acc:
+            check(_plan["artifact_id"] in (_dev_acc.get("caused_by") or []),
+                  "Patch←Plan：累积 dev 快照 caused_by 指向方案产物",
+                  str(_dev_acc.get("caused_by")))
+        if _dev_acc and _verify:
+            check(_dev_acc["artifact_id"] in (_verify.get("caused_by") or []),
+                  "Verify←Workspace：verify 快照 caused_by 指向被验证的累积补丁",
+                  str(_verify.get("caused_by")))
+        if _verify and _review:
+            check(_verify["artifact_id"] in (_review.get("caused_by") or []),
+                  "Defect←Verify：review 快照 caused_by 指向运行验证产物",
+                  str(_review.get("caused_by")))
+        check(all(isinstance(o.get("produced_by"), dict) and "stage" in o["produced_by"]
+                   and isinstance(o["produced_by"].get("attempt"), int)
+                   for o in (_plan, _dev_acc, _verify, _review) if o),
+              "各快照 produced_by 带 stage 与 attempt")
         check(
             any(p.name.endswith("-human_review.json") for p in g.run_dir.glob("*.json")),
             "闸门占位产物已落盘",
@@ -938,7 +1117,12 @@ def main() -> int:
         g2 = approve_human_review(g_orch, g2.run_dir)
         check(g2.summary["status"] == "done" and g2.summary["verdict"] == "pass",
               "二次通过审核后放行交付", f"{g2.summary['status']}/{g2.summary['verdict']}")
-        dev_traces = [t for t in runstore.read_traces(g2.run_dir) if t["stage"] == "dev"]
+        dev_traces = [
+            t for t in runstore.read_traces(g2.run_dir)
+            # 逐图施工时 trace 阶段名为 dev-T-xx（打回修复轮可能直接派给施工图），
+            # 人工反馈是按基础阶段 "dev" 注入、逐图调用同样带 pin —— 不能只认精确的 "dev"。
+            if t["stage"] == "dev" or str(t["stage"]).startswith("dev-")
+        ]
         check(any("人工审核打回" in (t.get("user") or "") for t in dev_traces),
               "打回意见注入到开发阶段 prompt")
 
@@ -1005,6 +1189,24 @@ def main() -> int:
         flush = [e for e in merged2["edits"] if e.get("anchor") == "    conn.commit()"]
         check(len(flush) == 1 and flush[0]["patch"] == "    _flush_v2(conn)\n",
               "同锚点的后写覆盖先写（去重语义不变）", str(flush))
+
+        # 跨任务累加：同键后写覆盖**内容**，但两张 covers_tasks 声明必须并集保留
+        # （真机 run 20260928-200631：T-02/T-03 都对 db.py 出 add/full_symbol/Database，
+        # T-03 顶掉 T-02 连带 covers 丢失 → 覆盖审计恒定报「T-02 未被任何补丁覆盖」）
+        _ta = {"edits": [{
+            "path": "db.py", "change_type": "add", "patch_mode": "full_symbol",
+            "target_symbol": "Database", "anchor": "", "patch": "class Database:\n    pass\n",
+            "covers_tasks": ["T-02"],
+        }]}
+        _tb = {"edits": [{
+            "path": "db.py", "change_type": "add", "patch_mode": "full_symbol",
+            "target_symbol": "Database", "anchor": "", "patch": "class Database:\n    ...\n",
+            "covers_tasks": ["T-03"],
+        }]}
+        _m = Orchestrator._merge_dev(_ta, _tb)
+        check(len(_m["edits"]) == 1, "同键仍合成一条（内容取后写）")
+        check(_m["edits"][0]["covers_tasks"] == ["T-02", "T-03"],
+              "两个任务的 covers 声明并集保留", str(_m["edits"][0].get("covers_tasks")))
 
         # ---------------------------------------------------------- 需求入口补强（intake）
         print("\n== intake-stage")
@@ -3432,6 +3634,94 @@ def main() -> int:
             "已经判失败的命令不再追问（不重复计问题）",
         )
 
+        # ④b 裸入口无参打印 Usage + rc=1：CLI 标准行为，不是产物崩溃（BUG-F）
+        # 真机 run 20260928-180933：main.py 无参 → 打印 Usage + return 1（argparse 式设计），
+        # verify 机械判「python main.py 失败（退出码 1）」并归因实现 —— 而真正该做的是
+        # 不计实现失败、但要求测试补带参数的真跑命令（无可运行证据，verdict 仍 fail）。
+        usage_root = root / "usage"
+        usage_repo = usage_root / "repo"
+        usage_repo.mkdir(parents=True, exist_ok=True)
+        # 多文件交付（runnability 判据只对 ≥2 个 .py 生效，单文件可能本来就是库模块）：
+        # 与真机同形（main.py + db.py），但文件本身是**干净**的 —— 唯一的「失败」就是
+        # 裸探针无参触发的 Usage 退出。
+        usage_impl = {"edits": [
+            {
+                "path": "main.py", "change_type": "add", "target_symbol": "main",
+                "patch": (
+                    "import sys\n\n\n"
+                    "def main(argv):\n"
+                    "    if len(argv) < 2:\n"
+                    "        print('Usage: main.py <command> [args]')\n"
+                    "        return 1\n"
+                    "    return 0\n\n\n"
+                    "if __name__ == '__main__':\n"
+                    "    sys.exit(main(sys.argv))\n"
+                ),
+            },
+            {
+                "path": "db.py", "change_type": "add", "target_symbol": "add_entry",
+                "patch": "def add_entry(amount, note):\n    return (amount, note)\n",
+            },
+        ]}
+        usage_audit = patches_mod.analyze_all(usage_repo, usage_impl)
+        usage_res = verify_mod.verify(
+            usage_root / "run", usage_repo, usage_impl, usage_audit, None,
+            enabled=True, timeout=30, max_commands=5,
+            skip_dirs=config_mod2.VERIFY_SKIP_DIRS,
+            allowed_bins=config_mod2.VERIFY_ALLOWED_BINS,
+            deny_patterns=config_mod2.VERIFY_DENY_PATTERNS,
+        )
+        probes = [c for c in usage_res["commands"] if c.get("source") == "probe"]
+        check(bool(probes) and probes[0]["status"] == "fail" and probes[0].get("exit_code") == 1,
+              "裸探针确实执行且拿到 rc=1（用例前提）", str(probes[:1]))
+        check(verify_mod.is_usage_exit(probes[0]), "无参 Usage + rc=1 被判为有意的参数守卫")
+        check(not any("退出码 1" in p for p in usage_res["problems"]),
+              "问题清单不再把 Usage 退出当成产物失败", str(usage_res["problems"])[:200])
+        check(usage_res.get("impl_fail") is False,
+              "实现侧无失败证据 ⇒ impl_fail=False（责任不推给开发）", str(usage_res.get("impl_fail")))
+        check(any("带参数" in str(t) for t in usage_res.get("test_defects") or []),
+              "诚实降级：test_defects 要求补带参数的真跑命令", str(usage_res.get("test_defects"))[:200])
+        check(usage_res["verdict"] == "fail",
+              "verdict 仍是 fail（没有可运行证据，不假装通过）", usage_res["verdict"])
+        crash_cmd = {
+            "source": "probe", "status": "fail", "exit_code": 1, "command": "python main.py",
+            "stdout_tail": "Usage: x",
+            "stderr_tail": "Traceback (most recent call last):\nNameError: name 'db' is not defined",
+        }
+        check(not verify_mod.is_usage_exit(crash_cmd),
+              "输出里有 traceback ⇒ 一律算实现失败（宁可漏豁免，不可洗绿崩溃）")
+
+        # ④c 同名入口但无守卫、空跑 rc=0 ⇒ 不算运行证据（真机 run 20260928-200631 假绿根因）
+        g6_root = root / "guard"
+        g6_root.mkdir(parents=True, exist_ok=True)
+        (g6_root / "main.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+        (g6_root / "db.py").write_text("class Database:\n    pass\n", encoding="utf-8")
+        g6_written = ["main.py", "db.py"]
+        g6_cmds = [
+            {"command": "python -m py_compile main.py db.py", "status": "ok", "source": "syntax"},
+            {"command": "python main.py", "status": "ok", "stdout_tail": "", "source": "probe"},
+        ]
+        g6_problems = verify_mod.runnability_problems(g6_root, g6_written, g6_cmds)
+        check(any("约定入口名文件" in p and "定义完函数就退出" in p for p in g6_problems),
+              "main.py 无守卫、空跑 rc=0 ⇒ 明确指出（不能再当 5/5 假绿）", str(g6_problems))
+        # 真机同形：守卫在兄弟文件 cli.py 里（意外写入），被跑的 main.py 依然无守卫
+        (g6_root / "cli.py").write_text(
+            "def add(a):\n    return a\n\nif __name__ == '__main__':\n    add(1)\n",
+            encoding="utf-8")
+        g6_problems2 = verify_mod.runnability_problems(
+            g6_root, g6_written + ["cli.py"], g6_cmds)
+        check(any("没有任何命令真正执行了交付物" in p for p in g6_problems2),
+              "守卫只存在于未被执行的兄弟文件 ⇒ 通用分支报无运行证据", str(g6_problems2))
+        # 正向对照：真跑带守卫的文件 / 有非空输出 ⇒ 有证据，不报
+        g6_ok = [{"command": "python cli.py", "status": "ok", "stdout_tail": "", "source": "probe"}]
+        check(verify_mod.runnability_problems(
+            g6_root, g6_written + ["cli.py"], g6_ok) == [],
+            "真跑带守卫入口 ⇒ 算运行证据")
+        g6_out = [{"command": "python -m pytest -q", "status": "ok",
+                   "stdout_tail": "5 passed", "source": "planned"}]
+        check(verify_mod.runnability_problems(g6_root, g6_written, g6_out) == [],
+              "非空 stdout（pytest）⇒ 也算运行证据")
+
         # ⑤ 返工退化：符号消失必须声明
         van_orch = make(root, "vanished")
         van_orch.state = {
@@ -3461,6 +3751,32 @@ def main() -> int:
             "显式声明过的消失不算退化（可能是刻意删除）",
             str(van_orch._audit_implementation()["vanished_symbols"]),
         )
+
+        # ⑤b 声明符号 vs 接口骨架：__main__ 入口守卫不算 gap（真机 20260928-180933 BUG-C）
+        # 方案常把 `if __name__ == '__main__':` 写进 changes[].symbols，但接口骨架只枚举
+        # class/def，不可能包含它 —— 连续误判白烧一次骨架冻结 + 一次方案返工。
+        for _guard in (
+            "if __name__ == '__main__':",
+            'if __name__ == "__main__":',
+            "if  __name__  ==  '__main__'",
+        ):
+            check(van_orch._is_main_guard_symbol(_guard),
+                  "各种写法的 __main__ 守卫都识别", _guard)
+        check(not van_orch._is_main_guard_symbol("def main()"),
+              "普通 main 函数不是守卫（不能放过真 gap）")
+        gd_orch = make(root, "main-guard-gap")
+        gd_orch.state = {"plan": {"changes": [
+            {"path": "main.py", "symbols": ["main", "if __name__ == '__main__':"]},
+            {"path": "other.py", "symbols": ["ghost_fn"]},
+        ]}}
+        _digest = {"main.py": ["def main()"], "other.py": ["def real()"]}
+        gaps_g = gd_orch._declared_vs_skeleton(_digest)
+        check(not any("__main__" in g for g in gaps_g),
+              "__main__ 守卫不判 skeleton gap", str(gaps_g))
+        check(any("ghost_fn" in g for g in gaps_g),
+              "基准里真没有的函数照判 gap（不能因为加豁免就放过）", str(gaps_g))
+        check(all("main.py: main" not in g for g in gaps_g),
+              "基准里有的 main 不误报", str(gaps_g))
 
         # ⑥ 补丁正文的裸 CR 归一
         # 模型想写 Python 的 `\r` 转义，却在 JSON 里只写了一个反斜杠 → 解码后变成**真回车**，
@@ -4101,64 +4417,94 @@ def main() -> int:
             str([p.get("source") for p in _planned2]),
         )
 
-        # ---------------------------------------------------------------- 兜底交付必须与「验证过的那份」等价
+        # 带参真跑入口必须在 planned 槽里排最前（真机 run 20260928-200631：
+        # `python main.py add 100.50 早餐` 被一串 `python -c "import db; ..."` 窄命令挤掉，
+        # CLI 真实行为一轮都没被验证过）。
+        _test_report_args = {
+            "automated_commands": [
+                {"command": 'python -c "import logic; logic.f(1)"'},
+                {"command": 'python -c "import logic; logic.f(2)"'},
+                {"command": 'python -c "import logic; logic.f(3)"'},
+                {"command": 'python -c "import logic; logic.f(4)"'},
+                {"command": 'python -c "import logic; logic.f(5)"'},
+                {"command": "python main.py add 100.50 早餐"},
+            ]
+        }
+        _planned_args = verify_mod.plan_commands(
+            ep_work, _written, _test_report_args, max_commands=5, impl=None
+        )
+        _planned_cmds = [str(p.get("command")) for p in _planned_args if p.get("source") == "planned"]
+        check("python main.py add 100.50 早餐" in _planned_cmds,
+              "带参真跑入口即使排在最后也不被窄命令挤出槽位", str(_planned_cmds))
+        check(_planned_cmds[0] == "python main.py add 100.50 早餐",
+              "带参入口稳定排序到 planned 最前（同档保持模型原序）", str(_planned_cmds))
+        check(
+            not any(" -c " in str(p.get("command"))
+                    and "main.py" in str(p.get("command"))
+                    for p in _planned_args),
+            "python -c 形态不被误判成入口（只导入不执行）")
+
+        # ---------------------------------------------------------------- 兜底交付 = 复制「被验证过的那份字节」
         # 真机 run snake-v2（2026-09-26）：第 3 轮 verify 判 pass（沙箱里 5 个文件、
         # main.py 真能开窗口），但兜底交付取的 20-dev.json 只有 4 条 edits —— 少了
         # game_logic.py，而 main.py 第一行就是 `from game_logic import GameLogic`。
         # 根因：**验证的对象（各轮累积合并后的实现）与交付的对象（某一个 dev 快照）
-        # 不是同一份**。交付前必须先核对，凑不齐就宁可不交 ——
-        # 一份「看着交付成功、实际缺文件」的产物比什么都不交更糟。
+        # 不是同一份**。建议⑮把它从「交付前核对、凑不齐就拒绝」升级为**结构消除**：
+        # pass 当时固化 verified_workspace，兜底交付只做「照清单逐字节复制」。
         gap_root = root / "last_good_gap"
         gap_repo = gap_root / "repo"
         gap_repo.mkdir(parents=True, exist_ok=True)
         gap_runs = gap_root / "runs"
         gap_run = gap_runs / "r1"
         gap_run.mkdir(parents=True, exist_ok=True)
-        runstore.write_json(
-            gap_run / "03-dev.json",
-            {
-                "stage": "dev",
-                "meta": {},
-                "artifact": {
-                    "edits": [
-                        {"path": p, "change_type": "add", "target_symbol": "x", "patch": f"# {p}\n"}
-                        for p in ("main.py", "ui.py", "ui_test.py", "game_logic_test.py")
-                    ]
-                },
-                "request_preview": "",
-            },
-        )
+        gap_work = gap_root / "work"
+        gap_files_src = {
+            "main.py": "from game_logic import GameLogic\n",
+            "ui.py": "# ui\n", "ui_test.py": "# ui test\n",
+            "game_logic_test.py": "# gl test\n",
+            "game_logic.py": "class GameLogic:\n    pass\n",
+        }
+        for _p, _txt in gap_files_src.items():
+            _fp = gap_work / _p
+            _fp.parent.mkdir(parents=True, exist_ok=True)
+            _fp.write_text(_txt, encoding="utf-8")
         gap_orch = make(gap_root, "runs", repo=gap_repo)
         gap_orch.run_id = "r1"
         gap_orch.run_dir = gap_run
         gap_orch.cursor = "done"
         gap_orch.status = "done"
+        _frozen = gap_orch._freeze_verified_workspace(
+            str(gap_work), {"materialized": list(gap_files_src), "summary": "pass smoke"}
+        )
+        check(_frozen is not None and len(_frozen["files"]) == 5,
+              "verify pass：5 个被验证文件固化进 verified_workspace",
+              str(None if _frozen is None else len(_frozen["files"])))
+        check((gap_run / "verified_workspace" / "game_logic.py").is_file(),
+              "固化区包含沙箱里有、dev 快照里会缺的 game_logic.py")
+        check(len(gap_orch.state.get("verified_digest") or "") == 12,
+              "verified_digest（12 位）已写入 state", str(gap_orch.state.get("verified_digest")))
         gap_orch.state["last_good"] = {
-            "file": "03-dev.json",
-            "seq": 3,
-            "audit": {},
-            # 那一轮**真正被验证过**的文件集合：比快照多一个 game_logic.py
-            "materialized": ["main.py", "ui.py", "ui_test.py", "game_logic_test.py", "game_logic.py"],
+            "verified_manifest_id": _frozen["manifest_id"],
+            "manifest_file": "verified_workspace/verified_manifest.json",
+            "verified_digest": _frozen["digest"],
+            "attempt": 1,
         }
         gap_out = gap_orch._deliver_last_good()
+        check(gap_out.get("delivered") and len(gap_out.get("files") or []) == 5,
+              "兜底交付：清单里 5 个文件全部落盘（旧事故里缺的那个不可能再缺）", str(gap_out)[:190])
         check(
-            not gap_out.get("delivered"),
-            "兜底版本凑不齐被验证过的文件集合时拒绝交付", str(gap_out)[:190],
+            all((gap_repo / p).read_text(encoding="utf-8") == txt for p, txt in gap_files_src.items()),
+            "交付字节与被验证字节逐文件相同（同一份对象）",
         )
-        check(
-            bool(gap_out.get("partial")) and gap_out.get("missing_vs_sandbox") == ["game_logic.py"],
-            "拒绝时明确指出缺的是哪个文件", str(gap_out.get("missing_vs_sandbox")),
-        )
-        check(
-            not (gap_repo / "main.py").exists(),
-            "拒绝时确实一个文件都没写进目标目录（不是写完再报）",
-        )
-        # 对照组：集合对得上就正常交付，证明不是无差别拒绝
-        gap_orch.state["last_good"]["materialized"] = [
-            "main.py", "ui.py", "ui_test.py", "game_logic_test.py",
-        ]
+        # 固化区被改动（缺文件 / 哈希不符）⇒ 整体拒绝、一个字都不写
+        gap_repo2 = gap_root / "repo2"
+        gap_repo2.mkdir(parents=True, exist_ok=True)
+        (gap_run / "verified_workspace" / "game_logic.py").unlink()
+        gap_orch.repo = str(gap_repo2)
         gap_out2 = gap_orch._deliver_last_good()
-        check(gap_out2.get("delivered"), "集合对得上时正常交付", str(gap_out2)[:190])
+        check(not gap_out2.get("delivered"),
+              "固化区缺文件时拒绝兜底交付", str(gap_out2.get("reason"))[:190])
+        check(not any(gap_repo2.glob("**/*.py")), "拒绝时目标目录一个文件都没写")
 
         # ---------------------------------------------------------------- dev 执行级自检
         # 真机三轮里 `python -m unittest game_logic_test` **一次都没通过**，而在此之前
@@ -4353,6 +4699,85 @@ def main() -> int:
         )["repaired"] == 0, "modify 补丁不碰")
         check(patches.repair_missing_imports({"edits": []}, None)["repaired"] == 0,
               "没有诊断时不动")
+
+        # ------------------------------------------------ 英文诊断 + 同批新建兄弟模块
+        # 真机 run 20260928-180933（BUG-D）：pyright 消息是英文 `"db" is not defined`，
+        # 旧正则只认中文「未定义」⇒ 一条都没补；且 db.py 是**同批 add**、尚未落盘，
+        # find_spec 找不到它 ⇒ 即便认了英文也会被当成不存在的模块跳过。
+        _diag_en = {"diagnostics": [
+            {"file": "cli.py", "line": 3, "rule": "reportUndefinedVariable",
+             "message": '"db" is not defined'},
+            {"file": "cli.py", "line": 4, "rule": "reportUndefinedVariable",
+             "message": '"sys" is not defined'},
+            {"file": "main.py", "line": 2, "rule": "reportUndefinedVariable",
+             "message": '"ghost_pkg_xyz" is not defined'},
+        ]}
+        _imp_en = {"edits": [
+            _add_edit("cli.py", "def run():\n    db.save(1)\n    sys.exit(0)\n"),
+            _add_edit("db.py", "def save(x):\n    return x\n"),
+            _add_edit("main.py", "def m():\n    ghost_pkg_xyz.do()\n"),
+        ]}
+        _fix_en = patches.repair_missing_imports(_imp_en, _diag_en)
+        check(_fix_en["repaired"] == 2,
+              "英文 is not defined 诊断也补；同批 add 的兄弟模块 db 也算可导入", str(_fix_en["detail"]))
+        _cli_body = _imp_en["edits"][0]["patch"]
+        check("import db" in _cli_body and "import sys" in _cli_body,
+              "补的是 db（同批兄弟）与 sys（标准库）", _cli_body.replace("\n", "|")[:80])
+        check("ghost_pkg_xyz" not in _imp_en["edits"][2]["patch"].splitlines()[0]
+              and not any(l.strip().startswith(("import ", "from "))
+                          for l in _imp_en["edits"][2]["patch"].splitlines()),
+              "既非标准库/已安装包、也非同批模块的名字 ⇒ 不硬插（不许 import 一个不存在的包）")
+
+        # 重问后整份 full_symbol 重写会把机械补进的 import 冲掉（BUG-E 的一环）：
+        # 再跑一次 repair 必须能把 import 重新补回来（这就是自检循环里「补完再补一次」的语义）。
+        _imp_en["edits"][0]["patch"] = "def run():\n    db.save(1)\n    sys.exit(0)\n"  # 模拟模型重吐的无 import 版本
+        _fix_en2 = patches.repair_missing_imports(_imp_en, _diag_en)
+        check(_fix_en2["repaired"] == 2,
+              "整份重写冲掉 import 后，二次 repair 重新补上（条数反弹不会误停）", str(_fix_en2["detail"]))
+
+        # ------------------------------------------------ 符号级 from x import y
+        # 真机 run 20260928-200631：main.py 用了 cli.py 定义的 add/remove，旧版只认
+        # 「未定义名=模块名」，五轮 NameError 修不好（机械补全只会连补 import sys）。
+        _diag_sym = {"diagnostics": [
+            {"file": "/work/main.py", "line": 4, "rule": "reportUndefinedVariable",
+             "message": '未定义 "add"'},
+            {"file": "main.py", "line": 6, "rule": "reportUndefinedVariable",
+             "message": '未定义 "remove"'},
+        ]}
+        _imp_sym = {"edits": [
+            _add_edit("cli.py", "def add(a, b):\n    return 1\n\ndef remove(r):\n    pass\n"),
+            _add_edit("main.py", "def main():\n    add(1, 2)\n    remove(3)\n"),
+        ]}
+        _fix_sym = patches.repair_missing_imports(_imp_sym, _diag_sym)
+        _main_body = _imp_sym["edits"][1]["patch"]
+        check("from cli import add, remove" in _main_body,
+              "兄弟模块定义的符号补成 from cli import ...（同一文件的两条诊断路径写法都聚合）",
+              str(_fix_sym["detail"]))
+        check(patches.repair_missing_imports(_imp_sym, _diag_sym)["repaired"] == 0,
+              "符号级补全同样幂等")
+        # 已有的 from-import 行：并入而不是新开一行
+        _imp_merge = {"edits": [_add_edit("m.py", "from cli import remove\nremove(1)\nadd(2)\n")]}
+        _diag_merge = {"diagnostics": [
+            {"file": "m.py", "line": 2, "rule": "reportUndefinedVariable",
+             "message": '未定义 "add"'}]}
+        patches.repair_missing_imports(
+            _imp_merge, _diag_merge,
+            local_modules={"cli"}, local_symbols={"add": "cli", "remove": "cli"},
+        )
+        check("from cli import remove, add" in _imp_merge["edits"][0]["patch"],
+              "仓库存量符号（local_symbols）也能补，并并入既有 from-import 行",
+              _imp_merge["edits"][0]["patch"].replace("\n", "|"))
+        # owner 是当前文件自己 / owner 不可导入 ⇒ 不硬补
+        _diag_self = {"diagnostics": [
+            {"file": "cli.py", "rule": "reportUndefinedVariable", "message": '未定义 "mystery"'}]}
+        check(patches.repair_missing_imports(
+            {"edits": [_add_edit("cli.py", "def add():\n    mystery()\n")]},
+            _diag_self, local_symbols={"mystery": "cli"},
+        )["repaired"] == 0, "符号归属当前文件自己 ⇒ 不补（不是 import 能解决的）")
+        check(patches.repair_missing_imports(
+            {"edits": [_add_edit("cli.py", "def add():\n    mystery()\n")]},
+            _diag_self, local_symbols={"mystery": "ghost_pkg"},
+        )["repaired"] == 0, "owner 不是可导入的兄弟模块 ⇒ 不补")
 
         # ------------------------------------------------------------ 常驻入口短超时
         # 真机 run snake-impfix 第 1 轮：`python main.py` 两条各卡满 180s（游戏主循环
@@ -4560,6 +4985,92 @@ def main() -> int:
               "逐张施工图的产物用独立快照名（不占 dev 阶段槽位）", str(pt_names[:5]))
         check(not [n for n in pt_names if n.endswith("-dev.json")],
               "逐张施工图的调用**不写** dev 阶段快照（只有累积实现才配 dev 快照）", str(pt_names[:5]))
+        # 建议⑰：逐图产物的因果元数据 —— produced_by 精确绑 task，artifact_id 与文件同名
+        _pt_snap = json.loads(
+            next(p for p in pt_run.glob("*dev-T-01.json")).read_text(encoding="utf-8")
+        )
+        check(
+            _pt_snap.get("produced_by", {}).get("stage") == "dev"
+            and _pt_snap["produced_by"].get("task") == "T-01",
+            "dev-T-01 快照 produced_by 绑定到 task T-01", str(_pt_snap.get("produced_by")),
+        )
+        check(
+            str(_pt_snap.get("artifact_id") or "").startswith(
+                next(p for p in pt_run.glob("*dev-T-01.json")).name.split("-dev-T-01")[0]
+            ) and _pt_snap["artifact_id"].endswith("-dev-T-01"),
+            "artifact_id 与快照文件同名（可反查）", str(_pt_snap.get("artifact_id")),
+        )
+        check(
+            pt_orch.state.get("artifact_chain", {}).get("dev_task:T-01") == _pt_snap["artifact_id"],
+            "artifact_chain 按 task 登记逐图产物（补漏要找上一版同 task 补丁）",
+            str(pt_orch.state.get("artifact_chain")),
+        )
+
+        # ---- 真机 20260928-160609：设计闸门拦截时不得提前开轮；显式 --from 重放不被顶部复核拦 ----
+        gt = make(root, "gate", client=MockClient())
+        gt.run_id = "20260928-gt"
+        gt.run_dir = root / "gate" / "20260928-gt"
+        gt.run_dir.mkdir(parents=True, exist_ok=True)
+        gt.state = {"plan": {"changes": [], "tasks": []}, "scope": {}}
+        gt._stage_plan = lambda *a, **k: gt.state.__setitem__(  # type: ignore[attr-defined]
+            "design_gate_blocked", [{"kind": "dependency_invalid", "detail": "环"}]
+        )
+        gt_nxt = gt._run_architect_plan()
+        check(gt_nxt == "dev" and gt.attempt == 0,
+              "设计闸门拦截时**不开轮**（attempt 不自增、不打「迭代 N」日志——真机在 dev 零产出时 attempt 已是 1）",
+              f"nxt={gt_nxt} attempt={gt.attempt}")
+        gt._stage_plan = lambda *a, **k: gt.state.pop("design_gate_blocked", None)  # type: ignore[attr-defined]
+        gt_nxt2 = gt._run_architect_plan()
+        check(gt_nxt2 == "dev" and gt.attempt == 1 and gt.state.get("round_kind"),
+              "闸门无阻断时方案阶段照常开第 1 轮", f"nxt={gt_nxt2} attempt={gt.attempt}")
+
+        # 构造一份**真的带环**的暂停态（两文件互相 depends_on），落盘成可续跑 run
+        rp = make(root, "resume", client=MockClient())
+        rp_run = root / "resume" / "20260928-rp"
+        rp_run.mkdir(parents=True, exist_ok=True)
+        rp.run_id, rp.run_dir = "20260928-rp", rp_run
+        rp.mode, rp.status, rp.cursor, rp.attempt = "full", "paused", "dev", 0
+        rp.paused_after = "architect_plan"
+        rp.state = {
+            "plan": {
+                "changes": [{"path": "a.py"}, {"path": "b.py"}],
+                "tasks": [
+                    {"id": "T-01", "target_files": ["a.py"], "symbols": ["A"], "depends_on": ["T-02"]},
+                    {"id": "T-02", "target_files": ["b.py"], "symbols": ["B"], "depends_on": ["T-01"]},
+                ],
+            },
+            "scope": {},
+            "skeleton": {"a.py": ["class A"], "b.py": ["class B"]},
+            "design_gate_blocked": [{"kind": "dependency_invalid", "detail": "旧阻断"}],
+        }
+        rp._persist()
+        # 原地续跑（什么都不改）：顶部强控复核重算编译链 → 环还在 → 必须**原地再停**，不开轮
+        rp2 = make(root, "resume", client=MockClient())
+        rp2.resume(rp_run)
+        _rp2_state = json.loads((rp_run / "state.json").read_text(encoding="utf-8"))
+        check(_rp2_state["status"] == "paused" and _rp2_state["attempt"] == 0
+              and _rp2_state["cursor"] == "dev",
+              "原地续跑且环未消除 ⇒ 复核拦截、继续暂停、attempt 仍为 0",
+              f"{_rp2_state['status']} attempt={_rp2_state['attempt']} cursor={_rp2_state['cursor']}")
+        # 显式 --from 重放：顶部**不复核**（旧方案不该在重放前拦一次），直接进入重放循环。
+        # 用哨兵异常标记「真的走进了 stage 循环」；被 _execute 兜底落成 stage_errors。
+        rp3 = make(root, "resume", client=MockClient())
+
+        class _ReplayEntered(RuntimeError):
+            pass
+
+        def _boom(stage: str) -> str:
+            raise _ReplayEntered(stage)
+
+        rp3._step = _boom  # type: ignore[method-assign]
+        rp3.resume(rp_run, from_stage="architect_plan", feedback="打断依赖环")
+        _rp3_state = json.loads((rp_run / "state.json").read_text(encoding="utf-8"))
+        check(any("ReplayEntered" in str(e.get("error")) for e in _rp3_state.get("artifacts", {}).get("stage_errors", [])),
+              "--from architect_plan 重放跳过顶部复核、真的进入重放循环（旧逻辑会拿旧方案复核后原地再停，重放走不到）",
+              str(_rp3_state.get("artifacts", {}).get("stage_errors")))
+        check("design_gate_blocked" not in (_rp3_state.get("artifacts") or {}),
+              "_rewind 清掉旧设计闸门标记（重放后由新一轮闸门重判）",
+              str(sorted((_rp3_state.get("artifacts") or {}).keys())))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

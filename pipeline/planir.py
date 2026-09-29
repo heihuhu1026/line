@@ -31,19 +31,24 @@ Compile Contract 与**冻结时机**
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
+import json
 import os
 from typing import Any
 
 from . import symbols as symbol_resolver
 
 #: 编译器**输入契约**版本。见模块 docstring 的「冻结时机」。
-COMPILER_INPUT_VERSION = "1"
+#: v2：units 增加 ``self_depends``（draft 自依赖取证）；``depends_on_files``
+#: 并入二开项目的**现存 import 边**（``file_imports``）。
+COMPILER_INPUT_VERSION = "2"
 
 __all__ = [
     "COMPILER_INPUT_VERSION",
     "normalize_plan",
+    "existing_import_edges",
     "drop_parent_symbols",
     "stable_id",
     "diff_units",
@@ -135,6 +140,90 @@ def stable_id(file: str, symbols: Any) -> str:
     return f"{_norm(file)}::{anchor}"
 
 
+def _dotted_module(path: str) -> str:
+    """`a/b.py` → `a.b`；`a/b/__init__.py` → `a.b`（包本身）。"""
+    p = _norm(path)
+    if p.endswith("/__init__.py"):
+        p = p[: -len("/__init__.py")]
+    elif p.endswith(".py"):
+        p = p[:-3]
+    return p.replace("/", ".")
+
+
+def existing_import_edges(files: Any, sources: Any) -> dict[str, list[str]]:
+    """二开项目：从**现存源码**的 import 语句机械推出方案内文件间的依赖边。
+
+    ``files``：本次方案涉及的文件（changes + draft target_files）；
+    ``sources``：``{相对路径: 现存源码正文}``（编排层从 repo 读，读不到的文件不给）。
+
+    返回 ``{path: [被它 import、且属于方案文件集的路径…]}``（有序去重）。只解析
+    ``import x`` / ``from x import y`` / 相对导入三种形态（AST，不靠正则猜）；
+    标准库 / 第三方 / 方案外文件天然不建边（模块表里没有对应节点）—— 未改动的
+    现存文件不产生任务，给它们建边没有任何排序意义。
+    """
+    planned = [_norm(p) for p in _as_list(files) if _norm(p)]
+    # dotted 模块 → 方案内文件（a/b.py 与 a/b/__init__.py 不可能同时存在；确定性取序）
+    module_of: dict[str, str] = {}
+    for p in sorted(planned):
+        module_of.setdefault(_dotted_module(p), p)
+
+    def _resolve_module(name: str) -> str:
+        """模块点号名 → 方案内文件；精确命中优先，再按最长前缀退（`a.b.c` → a/b.py）。"""
+        name = (name or "").strip().lstrip(".")
+        if not name:
+            return ""
+        if name in module_of:
+            return module_of[name]
+        parts = name.split(".")
+        while parts:
+            parts.pop()
+            hit = module_of.get(".".join(parts))
+            if hit:
+                return hit
+        return ""
+
+    edges: dict[str, list[str]] = {}
+    src = sources if isinstance(sources, dict) else {}
+    for path in planned:
+        text = src.get(path)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue  # 现存代码可能本身就编译不过：import 边是增强信号，不该因此崩编译链
+        mod = _dotted_module(path)
+        pkg_parts = mod.split(".")[:-1] if not path.endswith("/__init__.py") else mod.split(".")
+        found: set[str] = set()
+
+        def _add_module(name: str) -> None:
+            hit = _resolve_module(name)
+            if hit and hit != path:
+                found.add(hit)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    _add_module(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    # 相对导入：level=1 锚定当前包，每多一级再上溯一个包段
+                    up = node.level - 1
+                    base_parts = pkg_parts[: len(pkg_parts) - up] if up <= len(pkg_parts) else []
+                else:
+                    base_parts = []
+                mod_parts = (node.module or "").split(".") if node.module else []
+                base = ".".join([*base_parts, *mod_parts])
+                _add_module(base)
+                # `from pkg import sub` 里 sub 也可能是子模块（pkg/sub.py）
+                for alias in node.names:
+                    if alias.name != "*":
+                        _add_module(f"{base}.{alias.name}" if base else alias.name)
+        if found:
+            edges[path] = sorted(found)
+    return edges
+
+
 def _relative_name(sym: str, hit: dict) -> str:
     """去掉「文件限定」前缀：`a.run` → `run`、`cli.py.CLI.add` → `CLI.add`。
 
@@ -183,7 +272,9 @@ def _symbol_sort_key(order: dict[str, tuple[int, int]]):
     return key
 
 
-def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> dict:
+def normalize_plan(
+    plan: Any, *, skeleton: Any = None, previous: Any = None, file_imports: Any = None
+) -> dict:
     """`raw_plan` → `compiler_ir`。**纯函数**：同输入必得同输出（含 key 顺序）。
 
     冲突规则（全部显式规定，不留"看情况"）：
@@ -193,6 +284,11 @@ def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> 
          `{text, source}` 来源，出问题时能追溯到是哪张图提的要求；
       ③ **稳定排序**：draft task id → change.order → 符号字母序
          （**不依赖 dict 插入顺序** —— 那会让 IR 在等价输入下漂移）。
+
+    ``file_imports``：二开项目里由 :func:`existing_import_edges` 从**现存源码 AST**
+    机械推出的 ``{文件: [它 import 的方案内文件]}``。与契约解析出的依赖取并集，
+    使执行 DAG 的依赖来源为「contract ∪ symbol ∪ 现存 import 图」（新建项目没有
+    现存源码，不传即可 —— 不靠模型写路径）。
     """
     plan = plan if isinstance(plan, dict) else {}
     changes = [c for c in (plan.get("changes") or []) if isinstance(c, dict) and _norm(c.get("path"))]
@@ -233,6 +329,7 @@ def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> 
                 "constraints": [],
                 "test_hint": "",
                 "depends_on": [],
+                "self_depends": [],
                 "source_task_ids": [],
                 "uses_resolved": [],
                 "unresolved": [],
@@ -327,9 +424,16 @@ def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> 
                 str(s).strip() for s in _as_list(task.get("constraints")) if str(s).strip()
             )
             unit["_declared"].extend(buckets.get(f) or [])
-            unit["depends_on"].extend(
+            dep_ids = [
                 str(d).strip() for d in _as_list(task.get("depends_on")) if str(d).strip()
-            )
+            ]
+            unit["depends_on"].extend(dep_ids)
+            # **自依赖取证**：draft 图 T 声明 depends_on 含 T 自己，是方案层的硬错误，
+            # 编译器据此报 self_dependency。必须在合并前留证 —— 合并后只剩 unit 聚合，
+            # 无法区分「T-03→T-03（真错误）」与「T-02/T-03 同文件合并后 T-03→T-02
+            # 变成自引用（合并的机械副产物，应静默滤掉）」。
+            if tid and tid in dep_ids and tid not in unit["self_depends"]:
+                unit["self_depends"].append(tid)
             contracts = task.get("contracts")
             if isinstance(contracts, dict):
                 for key in ("uses", "exposes"):
@@ -348,6 +452,7 @@ def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> 
             )
 
     # ---------- 4) 逐 unit 定稿：最长匹配、去重、依赖解析、稳定排序
+    planned_files = set(files)
     out_units: list[dict] = []
     for path in sorted(units, key=lambda p: (units[p]["_order"], p)):
         unit = units[path]
@@ -380,22 +485,27 @@ def normalize_plan(plan: Any, *, skeleton: Any = None, previous: Any = None) -> 
         # 施工图的**禁止项**与 state 的 plan_unresolved（评审/人工据此判返工方案）。
         unit["unresolved_uses"] = [str(r.get("symbol")) for r in resolved if not r.get("resolved")]
         unit["contracts"]["uses"] = [str(r.get("symbol")) for r in resolved if r.get("resolved")]
-        # 依赖的**文件集合**（由符号解析推出，不是让模型写路径）
-        dep_files = sorted(
-            {
-                c
-                for row in resolved
-                if row.get("resolved")
-                for c in (row.get("candidates") or [])
-                if c != path
-            }
-        )
-        unit["depends_on_files"] = dep_files
+        # 依赖的**文件集合**：契约/符号解析推出的边 ∪ 二开现存源码的 import 边
+        # （都不是让模型写路径）。只连**本次方案内**文件 —— 未规划的现存文件没有
+        # 对应任务节点，边连过去既无排序意义也会污染执行 DAG。
+        dep_files = {
+            c
+            for row in resolved
+            if row.get("resolved")
+            for c in (row.get("candidates") or [])
+            if c != path
+        }
+        for c in (_as_list((file_imports or {}).get(path)) if isinstance(file_imports, dict) else []):
+            cand = _norm(c)
+            if cand and cand != path and cand in planned_files:
+                dep_files.add(cand)
+        unit["depends_on_files"] = sorted(dep_files)
         unit["stable_id"] = stable_id(path, unit["symbols"])
         unit["intent"] = _dedup_intents(unit["intent"])
         unit["acceptance"] = _dedup_intents(unit["acceptance"])
         unit["constraints"] = _dedup(unit["constraints"])
         unit["depends_on"] = _dedup(unit["depends_on"])
+        unit["self_depends"] = _dedup(unit["self_depends"])
         unit["source_task_ids"] = _dedup(unit["source_task_ids"])
         out_units.append(unit)
 
@@ -466,3 +576,74 @@ def fingerprint(*, prompt_hash: str = "") -> dict:
         "compiler_hash": compiler.hexdigest()[:12],
         "prompt_hash": str(prompt_hash or ""),
     }
+
+
+# ---------------------------------------------------------- Transition Record 版本摘要（建议⑭）
+def _stable_json(obj: Any) -> str:
+    """排序键、保证中文不转义的规范 JSON —— 给哈希用，避免键序/空白造成假版本漂移。"""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def plan_digest(plan: Any) -> str:
+    """方案（normalized plan）的 12 位短哈希：Transition Record 的 ``plan_version``。
+
+    只取决定「方案边界与口径」的骨架 —— changes（path/intent/approach/symbols）、
+    tasks（id/target_files/symbols/acceptance/interface/contracts/depends_on）、rollback；
+    rationale/summary 之类措辞不进哈希（文字润色不应让版本乱跳），但任何文件 / 符号 /
+    契约 / 验收 / 依赖变化必然改版本。
+    """
+    plan = plan if isinstance(plan, dict) else {}
+    changes = [
+        {
+            "path": str(c.get("path") or ""),
+            "intent": str(c.get("intent") or ""),
+            "approach": str(c.get("approach") or ""),
+            "symbols": sorted(str(s) for s in (c.get("symbols") or [])),
+        }
+        for c in (plan.get("changes") or [])
+        if isinstance(c, dict)
+    ]
+    tasks = [
+        {
+            "id": str(t.get("id") or ""),
+            "target_files": sorted(str(p) for p in (t.get("target_files") or [])),
+            "symbols": sorted(str(s) for s in (t.get("symbols") or [])),
+            "acceptance": str(t.get("acceptance") or ""),
+            "interface": str(t.get("interface") or ""),
+            "contracts": t.get("contracts") if isinstance(t.get("contracts"), dict) else {},
+            "depends_on": sorted(str(d) for d in (t.get("depends_on") or [])),
+        }
+        for t in (plan.get("tasks") or [])
+        if isinstance(t, dict)
+    ]
+    payload = {"changes": changes, "tasks": tasks, "rollback": str(plan.get("rollback") or "")}
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()[:12]
+
+
+def tasks_digest(tasks: Any) -> str:
+    """**编译后**施工图序列的 12 位短哈希：Transition Record 的 ``task_version``。
+
+    入参可以是编译产物 IR（``{"units": [...]}``）或 task 列表；字段口径与
+    :func:`plan_digest` 的 tasks 段一致（编译后若改写了 id/target_files 等，
+    这里与 plan_version 会不同 —— 这正是要留痕的差异）。
+    """
+    if isinstance(tasks, dict):
+        tasks = tasks.get("units") or tasks.get("tasks") or []
+    out = []
+    for t in (tasks or []):
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("id") or t.get("stable_id") or "")
+        contracts = t.get("contracts") if isinstance(t.get("contracts"), dict) else {}
+        out.append(
+            {
+                "id": tid,
+                "target_files": sorted(str(p) for p in (t.get("target_files") or [])),
+                "symbols": sorted(str(s) for s in (t.get("symbols") or [])),
+                "acceptance": str(t.get("acceptance") or ""),
+                "interface": str(t.get("interface") or ""),
+                "contracts": contracts,
+                "depends_on": sorted(str(d) for d in (t.get("depends_on") or [])),
+            }
+        )
+    return hashlib.sha1(_stable_json(out).encode("utf-8")).hexdigest()[:12]

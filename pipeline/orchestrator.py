@@ -199,6 +199,20 @@ MAX_TASK_SYMBOLS = 4    # 一个 task 最多定义几个顶层符号
 PLAN_CONTRACT_RETRIES = 2
 
 
+#: Design Gate（设计闸门）阻断后最多自纠几次。
+#:
+#: 阻断来源全是**机械判据**（见 ``_design_gate_blockers``）：编译器容量错误
+#: （单文件符号装不进图上限）、Plan IR 的产物内未解析符号、方案声明 vs 冻结接口基准
+#: 冲突。自纠顺序刻意与判据成本匹配：
+#:   1. 第一次若**只有**骨架冲突 ⇒ 先重新冻结一次骨架（骨架自身也是 14B 产物，
+#:      可能是它错，不该第一时间打扰架构师）；
+#:   2. 其余情况 ⇒ 带阻断清单回架构师重做一次方案（允许新增文件/重拆任务）。
+#: 之后仍阻断就**停人工闸门**，绝不带已知坏方案进 DEV（旧实现只打 warning，
+#: 真机 20260928-095848 因此 dev 怎么写都必被判负，白烧整轮）。
+#: 0 = 关闭自纠（阻断即停人工）。
+DESIGN_GATE_RETRIES = 2
+
+
 def pm_unresolved_items(scope: Any, decisions: Any = None) -> dict[str, list[str]]:
     """PM 产物里**尚未成为陈述**的条目：未裁决的 ``open_questions`` + 两列未明确项。
 
@@ -212,6 +226,9 @@ def pm_unresolved_items(scope: Any, decisions: Any = None) -> dict[str, list[str
     """
     if not isinstance(scope, dict):
         return {"pending": [], "vague": []}
+    # 先做确定性准入（折叠三列重复/剔除技术类）再并裁决：旧 run 的产物是在准入规则之前
+    # 落库的，这里兜住，保证页面、作业层（gateway）与闸门判据口径一致。
+    scope = prompts.normalize_pm_questions(scope)
     merged = prompts.apply_pm_decisions(scope, decisions or [])
     pending = [
         str(q.get("question") or "").strip()
@@ -348,6 +365,76 @@ class Orchestrator:
     # 分头维护必然漂移（这一整轮修的就是这类问题）。
 
     # ------------------------------------------------------------------ 埋点落盘
+    @staticmethod
+    def _safe_stage_stem(stage: str) -> str:
+        """把阶段名净化成合法文件名（逐图施工时 stage=dev-<task id>）。
+
+        正常 task id 形如 ``T-01``（编译期 _clean_task_id 已规范化），不受影响；
+        但脏 id（如 mock 占位符 ``<id>``）含 Windows 禁用字符 ``<>``，直接拼文件名会让
+        write_json 抛错并**静默丢掉整次调用的快照 / trace / llm-calls 记录**
+        （逐图调用外层有容错），人工反馈是否真的注入都无从核对 —— 这里统一兜底。
+        """
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(stage or "")).strip().rstrip(". ")
+        return stem or "stage"
+
+    # 建议⑰：产物因果链（轻量版，**不做** Event Sourcing）。
+    # 每个快照带 artifact_id / produced_by / caused_by，就能串起
+    # Requirement→Plan→Task→Patch→Workspace→Verify→Defect→Fix→Verify 做 replay。
+    _DEV_TASK_STAGE_RE = re.compile(r"^dev-(T-[0-9A-Za-z]+)(-repair)?$")
+
+    def _parse_produced(self, stage: str) -> tuple[str, str | None, bool]:
+        """把快照 stage 拆成 (逻辑阶段, task id, 是否补漏)。
+
+        形态：``dev`` / ``dev-T-01`` / ``dev-T-01-repair``；其余阶段（含第二次调用的
+        ``architect_skeleton``）逻辑阶段就是它自己、不绑 task。
+        """
+        m = self._DEV_TASK_STAGE_RE.match(str(stage or ""))
+        if m:
+            return "dev", m.group(1), bool(m.group(2))
+        return str(stage or ""), None, False
+
+    def _caused_by_keys(self, base_stage: str, task: str | None, is_repair: bool) -> list[str]:
+        """本产物的**直接上游**在 artifact_chain 里的键（取最近一次同键产物）。"""
+        if base_stage == "dev":
+            keys = ["architect_plan"]
+            # 返工轮的补丁是被评审缺陷打回的：Defect → Fix，评审快照就是缺陷出处。
+            if getattr(self, "fixes", None):
+                keys.append("review")
+            if task and is_repair:
+                keys.append(f"dev_task:{task}")  # 补漏的上一版同 task 补丁
+            return keys
+        return {
+            "pm": ["intake"],
+            "architect_assess": ["pm"],
+            "architect_plan": ["architect_assess", "review"],
+            "test": ["dev"],
+            "verify": ["dev"],
+            "review": ["verify"],
+            "human_review": ["review"],
+        }.get(base_stage, [])
+
+    def _provenance(self, stage: str) -> tuple[str, dict, list[str]]:
+        """生成 (artifact_id, produced_by, caused_by) 并登记进 state.artifact_chain。
+
+        ``artifact_id`` 与快照文件同名（``序号-stem``），天然唯一且可反查文件。
+        注意：必须在序号自增**之后**调用。
+        """
+        base_stage, task, is_repair = self._parse_produced(stage)
+        artifact_id = f"{self._seq:02d}-{self._safe_stage_stem(stage)}"
+        produced_by = {"stage": base_stage, "attempt": self.attempt}
+        if task:
+            produced_by["task"] = task
+        chain = self.state.setdefault("artifact_chain", {})
+        caused_by = [
+            str(chain[k]) for k in self._caused_by_keys(base_stage, task, is_repair)
+            if chain.get(k) and str(chain[k]) != artifact_id
+        ]
+        # 登记为「该逻辑阶段的最近产物」；逐图产物额外按 task 登记（补漏要找上一版）。
+        chain[base_stage] = artifact_id
+        if task:
+            chain[f"dev_task:{task}"] = artifact_id
+        return artifact_id, produced_by, caused_by
+
     def _record(
         self,
         stage: str,
@@ -358,6 +445,7 @@ class Orchestrator:
         system: str = "",
         raw_text: str = "",
         raw_thinking: str = "",
+        caused_by_extra: list[str] | None = None,
     ) -> None:
         """落阶段快照。**输入与输出都完整留存，不做截断**。
 
@@ -367,8 +455,18 @@ class Orchestrator:
         """
         self._seq += 1
         assert self.run_dir is not None
+        artifact_id, produced_by, caused_by = self._provenance(stage)
+        if caused_by_extra:
+            for aid in caused_by_extra:
+                if aid and aid not in caused_by:
+                    caused_by.append(str(aid))
         payload = {
             "stage": stage,
+            # 建议⑰：artifact_id / produced_by / caused_by 放快照顶层（与 meta 平级），
+            # 读取方不必钻进 meta 就能串因果链。
+            "artifact_id": artifact_id,
+            "produced_by": produced_by,
+            "caused_by": caused_by,
             "meta": meta,
             "artifact": artifact,
             # 完整用户输入（不再截断）
@@ -380,7 +478,9 @@ class Orchestrator:
             "response_text": raw_text,
             "response_thinking": raw_thinking,
         }
-        runstore.write_json(self.run_dir / f"{self._seq:02d}-{stage}.json", payload)
+        runstore.write_json(
+            self.run_dir / f"{self._seq:02d}-{self._safe_stage_stem(stage)}.json", payload
+        )
         with (self.run_dir / "llm-calls.jsonl").open("a", encoding="utf-8") as fh:
             # 规整成固定列（见 runstore.CALL_FIELDS）：列一定在，聚合脚本可以无条件取；
             # 不加这一层的话列集由 meta 的构造点隐式决定，缺列只有到聚合时才发现。
@@ -407,8 +507,14 @@ class Orchestrator:
         if self.run_dir is None:
             return
         self._seq += 1
+        artifact_id, produced_by, caused_by = self._provenance("dev")
         payload = {
             "stage": "dev",
+            # 建议⑰：累积实现快照同样挂因果链；chain["dev"] 指向它 ——
+            # test / verify 的 caused_by 因此精确指到「被验证的这批累积补丁」。
+            "artifact_id": artifact_id,
+            "produced_by": produced_by,
+            "caused_by": caused_by,
             "meta": {"note": "dev-accumulated", "kind": "snapshot"},
             "artifact": artifact,
             "request_preview": "",
@@ -551,6 +657,8 @@ class Orchestrator:
         extra = self.human_feedback.get(stage)
         if extra:
             pinned.append(prompts.human_feedback_block(extra))
+            # 建议⑬：本轮消费了人工反馈（如人工审核打回后的修复），事件强制评审要用。
+            self.state["human_feedback_consumed_round"] = self.attempt
         if stage != "pm":  # PM 是第一个阶段，此时还没有人工输入
             block = prompts.human_facts_block(self._human_facts())
             if block:
@@ -1023,7 +1131,16 @@ class Orchestrator:
     def _stage_pm(self, requirement: str) -> Any:
         # 复用上游补强产物：PM 不必再重新解析原始需求。
         # 人工裁决已并回补强产物本身（final_decision），这里整份注入即可。
-        self.state["scope"] = self._call("pm", prompts.parts_pm(requirement, self.state.get("intake")))
+        # 确定性准入：折叠三列重复、剔除技术实现类问题（真机 172150：同一问题出现 3 遍、
+        # 混进表结构/浮点精度）。提示词只是第一道防线，**必须在 post 钩子里、落快照之前**
+        # 归一 —— 否则 02-pm.json 存的是原始产物，续跑时 _restore 拿快照覆盖 state，
+        # 被剔除的技术问题原样复活（真机 run 20260928-180933：归一后的 state 被
+        # 含 5 条问题的快照覆盖，「数据库表结构」重新下发给下游）。
+        self.state["scope"] = self._call(
+            "pm",
+            prompts.parts_pm(requirement, self.state.get("intake")),
+            post=lambda data: prompts.normalize_pm_questions(data, log=self.log),
+        )
         return self.state["scope"]
 
     def _stage_assess(self, requirement: str) -> Any:
@@ -1136,21 +1253,93 @@ class Orchestrator:
                 " → 降级为提示（跨文件契约比对将无从下手，已记入 plan_contract_gaps）"
             )
         self.state["plan"] = self._normalize_plan_ids(self.state["plan"])
+        self._finalize_plan_compilation()
+        # ---- Design Gate：进开发前的唯一机械闸门（容量 / 虚依赖 / 骨架冲突）
+        # mock 路径在上面已提前返回；parts / pin 是首版方案的同一份上下文，闸门返工复用。
+        self._run_design_gate(parts, pin)
+        return self.state["plan"]
+
+    def _finalize_plan_compilation(self, *, freeze: bool = True) -> list[dict]:
+        """方案定稿后的**确定性编译链**（可重复执行，Design Gate 自纠/续跑复核共用）：
+
+            [冻结接口基准] → Plan IR（normalize）→ Task Compiler **无条件**编译
+
+        返回编译器的错误清单（容量类）。为什么从 ``_stage_plan`` 抽出来：闸门自纠
+        （架构师返工后）与人工闸门续跑强控都要对（可能被改过的）方案重跑这同一条链，
+        两处各写一份迟早漂移。
+
+        ``freeze=False`` 供续跑强控复核：复用 state 里已冻结的骨架，**不触发模型调用**
+        （人工没让重跑方案阶段，不该偷跑一次 14B；骨架类阻断请走 ``--from architect_plan``）。
+
+        重入时先清掉上一轮的派生产物（skeleton_gaps / plan_unresolved / plan_conflicts /
+        plan_compile_errors），否则旧轮残留会被新一轮误读为当前问题。
+        """
+        self.state.pop("skeleton_gaps", None)
+        self.state.pop("plan_unresolved", None)
+        self.state.pop("plan_conflicts", None)
+        self.state["plan_compile_errors"] = []
         # 方案定稿前**冻结接口基准**。顺序很关键：它是 Plan IR 的符号索引来源 ——
         # `CLI.add` 这类"类.方法"只有靠它才能与 `db.insert_record`（模块.符号）消歧，
         # 没有它就只能按叶子名兜底匹配，而那正是"悄悄连错、无声漏掉"的来源。
-        self._freeze_skeleton()
+        if freeze:
+            self._freeze_skeleton()
+        return self._normalize_and_compile()
+
+    def _plan_file_imports(self, plan_obj: Any) -> dict[str, list[str]] | None:
+        """二开项目：从 repo **现存源码**机械提取方案内文件间的 import 边（AST，不靠模型）。
+
+        执行 DAG 的依赖来源因此为 contract ∪ symbol ∪ 现存 import 图（建议 §三 的二开口径）。
+        新建项目文件还不存在（返回 None，依赖退化为前两路）；repo 不可用或方案文件在仓库里
+        都还不存在时同样返回 None —— 不猜、不报错。
+        """
+        if self.project_type == "new" or not isinstance(self.repo, Path) or not self.repo.is_dir():
+            return None
+        rels: set[str] = set()
+        if isinstance(plan_obj, dict):
+            for change in (plan_obj.get("changes") or []):
+                if isinstance(change, dict) and change.get("path"):
+                    rels.add(str(change["path"]).replace("\\", "/").strip())
+            for task in (plan_obj.get("tasks") or []):
+                if not isinstance(task, dict):
+                    continue
+                for p in (task.get("target_files") or []):
+                    rel = str(p or "").replace("\\", "/").strip()
+                    if rel:
+                        rels.add(rel)
+        sources: dict[str, str] = {}
+        for rel in sorted(r for r in rels if r):
+            src_file = self.repo / rel
+            try:
+                if src_file.is_file():
+                    sources[rel] = src_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        if not sources:
+            return None
+        return planir.existing_import_edges(sorted(rels), sources)
+
+    def _normalize_and_compile(self) -> list[dict]:
+        """编译链尾部：Plan IR 归一 → Task Compiler 无条件编译（见 :meth:`_finalize_plan_compilation`）。
+
+        单独存在是因为 Design Gate 的「重冻结骨架」分支：``_freeze_skeleton`` 会回填
+        tasks[].symbols 并重算 skeleton_gaps，若之后不重跑本方法，回填只落在上一版
+        compiled tasks 上，IR 与执行图仍是旧的 —— 三份口径重新分裂。
+        """
         # ---- Normalize：raw_plan → compiler_ir（**编译器的唯一稳定输入**）
         # 合并 / 清洗 / 冲突解决 / 推导全部在这里做完，Compiler 之后只读 IR。
-        # 不做这一层，`compile_tasks` 迟早长成"第二个 orchestrator"；而且架构师提示词、
-        # task schema、编译器规则三者会纠缠在一起 —— 指标一动，说不清是谁变的。
+        plan_obj0 = self.state.get("plan")
+        file_imports = self._plan_file_imports(plan_obj0)
         ir = planir.normalize_plan(
-            self.state.get("plan"),
+            plan_obj0,
             skeleton=self.state.get("skeleton") or {},
             previous=self.state.get("compiler_ir"),
+            file_imports=file_imports,
         )
         self.state["compiler_ir"] = ir
         self.state["plan_sources"] = ir.get("plan_sources")
+        if file_imports:
+            n_edges = sum(len(v) for v in file_imports.values())
+            self.log(f"        [Plan IR] 二开现存 import 图贡献 {n_edges} 条文件依赖边（执行 DAG 第三来源）")
         conflicts = ir.get("conflicts") or []
         if conflicts:
             self.state["plan_conflicts"] = conflicts
@@ -1173,25 +1362,232 @@ class Orchestrator:
                 f"        [Plan IR] 相对上一版方案少了 {len(diff['removed_units'])} 张施工图："
                 + "、".join(diff["removed_units"][:4])
             )
-        # ---- Task Compiler：架构师自己做不好的那部分，交给确定性编译器
-        # 让 14B/8K 同时「做架构判断 + 拆任务 + 填字段」必然顾此失彼（真机 011207：
-        # 5 版方案文件划分次次不同，symbols/test_hint/change 100% 为空）。
-        # 它做得到「改哪些文件、动哪些符号」，剩下的机械翻译由这里接管。
-        reasons = taskcompiler.plan_needs_compile(self.state.get("plan"))
+        # ---- Task Compiler：施工图的**唯一执行出口**（always compile）
+        # 旧实现只在 plan_needs_compile 判"架构师原图不合格"时才编译，结果真机出现过
+        # 「架构师改了 main.py 的合并方式，编译器因『无需编译』整轮白算」。现在无论原图
+        # 是否合格都从 Plan IR 重新生成 —— 执行的每一张图都必然经过同一套确定性规则；
+        # 架构师原图存 ``state.plan_draft_tasks`` 仅作设计溯源。
+        plan_obj = self.state.get("plan")
+        reasons = taskcompiler.plan_needs_compile(plan_obj)
+        # 降级为**纯审计信号**：不再决定要不要编译，只记录"架构师原图与编译器口径的偏差"，
+        # 供观察模型拆分质量的趋势（提示词/编译器改动后这个值应趋近于零）。
         self.state["plan_compiled_reasons"] = reasons
         if reasons:
-            compiled = taskcompiler.compile_tasks(self.state.get("plan"), ir=ir)
-            if compiled:
-                self.state["plan"]["tasks"] = compiled
-                self.state["plan"]["tasks_compiled"] = True
-                # 重新算一次：编译后的 tasks 应当**字段齐全**
-                self.state["plan_contract_gaps"] = self._plan_contract_gaps()
+            self.log(
+                "        [Task Compiler·审计] 架构师原图与编译口径有偏差（"
+                + "；".join(reasons[:3])
+                + "）——不影响执行：施工图始终以编译器产物为准"
+            )
+        if isinstance(plan_obj, dict):
+            draft = plan_obj.get("tasks")
+            if draft:
+                self.state["plan_draft_tasks"] = draft
+        result = taskcompiler.compile_plan(plan_obj, ir=ir)
+        errors = list(result.get("errors") or [])
+        compiled = list(result.get("tasks") or [])
+        self.state["plan_compile_errors"] = errors
+        if compiled and isinstance(plan_obj, dict):
+            plan_obj["tasks"] = compiled
+            plan_obj["tasks_compiled"] = True
+            # 重新算一次：编译后的 tasks 应当**字段齐全**
+            self.state["plan_contract_gaps"] = self._plan_contract_gaps()
+            self.log(f"        [Task Compiler] 从 Plan IR 生成 {len(compiled)} 张施工图（唯一执行出口）")
+        for err in errors:
+            self.log(f"        [Task Compiler·错误] {err.get('detail')}")
+        self.state["plan"] = self._ensure_entry_task(plan_obj)
+        return errors
+
+    #: compile error code → Design Gate 阻断 kind。容量与依赖两类都是
+    #: 「编译器机械判定、开发无权修」的方案层硬冲突。
+    _COMPILE_ERROR_KINDS = {
+        "task_capacity_exceeded": "task_capacity_exceeded",
+        "unknown_dependency": "dependency_invalid",
+        "self_dependency": "dependency_invalid",
+        "dependency_cycle": "dependency_invalid",
+    }
+
+    def _design_gate_blockers(self) -> list[dict]:
+        """Design Gate 的**机械判据**：阻断全部不依赖模型主观判断。
+
+          ① ``task_capacity_exceeded`` —— 编译器报告：单文件符号总量装不进图上限
+             （开发无权重拆方案，带下去每张图都必写不完）；
+          ② ``dependency_invalid``      —— 编译器报告：依赖目标不存在 / 自依赖 / 依赖成环
+             （执行 DAG 无法确定施工顺序，或开发会引用一张根本不存在的前置图）；
+          ③ ``contract_unresolved``     —— Plan IR：施工图引用了产物内不存在的符号
+             （stdlib/三方已在 planir 里归入 externals，不会误报）；
+          ④ ``skeleton_mismatch``      —— 方案 changes 声明的符号不在刚冻结的接口基准里
+             （dev 会同时收到两份互相矛盾的要求）。
+        """
+        blockers: list[dict] = []
+        for err in self.state.get("plan_compile_errors") or []:
+            if isinstance(err, dict):
+                kind = self._COMPILE_ERROR_KINDS.get(str(err.get("code") or ""), "compile_error")
+                blockers.append({"kind": kind, **err})
+        ir = self.state.get("compiler_ir")
+        if isinstance(ir, dict):
+            for unit in ir.get("units") or []:
+                if not isinstance(unit, dict):
+                    continue
+                path = str(unit.get("file") or "")
+                for sym in (unit.get("unresolved_uses") or []):
+                    blockers.append(
+                        {
+                            "kind": "contract_unresolved",
+                            "file": path,
+                            "symbol": str(sym),
+                            "detail": f"{path}: 引用了产物内不存在的符号 {sym}（开发无权新增方案外接口）",
+                        }
+                    )
+        for gap in self.state.get("skeleton_gaps") or []:
+            blockers.append({"kind": "skeleton_mismatch", "detail": str(gap)})
+        # ⑤ ``uses_cycle`` —— contracts.uses 在任务**之间**成环。
+        # g4 会把 uses 翻译成文件头**必须**写的顶层 import：uses 成环 ⇒ 顶层互导 ⇒
+        # 运行即 ImportError（真机 20260928-221831：errors↔cli，三轮没修掉）。
+        # 这是方案层缺陷（依赖方向画反 / uses 抄串），开发无权改方案，必须在闸门消掉。
+        hint_ctx = tasktype.import_hint_context(self.state.get("plan"))
+        for tid, mods in (hint_ctx.get("cyclic_modules") or {}).items():
+            blockers.append(
+                {
+                    "kind": "uses_cycle",
+                    "detail": (
+                        f"{tid} 的 contracts.uses 依赖 {'、'.join(mods)}，"
+                        "而对方任务又反向依赖本任务的模块 —— 顶层 import 必然成环。"
+                        "请改依赖方向（底层/被引用方不得反向依赖调用方），"
+                        "或删掉该 uses（通过参数传对象，而不是互导）。"
+                    ),
+                }
+            )
+        # 注意：任务 uses 自己 target_files 里的模块**不阻断** —— 一张施工图合法地可以
+        # 同时覆盖多个文件（cli.py 用 database.py 是两文件间的正常导入）。dev 侧提示层
+        # 会自行避免"文件 import 自己"那一种（见 task_focus_block 的 own_modules 丢弃）。
+        return blockers
+
+    def _design_gate_reask(self, parts: Any, pin: Any, blockers: list[dict]) -> None:
+        """带阻断清单回架构师重做一次方案。**允许**新增文件/重拆任务（与补字段不同）：
+        容量超限的正解就是把符号摊到更多文件。调用失败不崩 —— 保留现方案，阻断交人工。
+        """
+        lines = [f"- （{b.get('kind')}）{b.get('detail')}" for b in blockers[:10]]
+        kinds = {str(b.get("kind") or "") for b in blockers}
+        tail = (
+            "\n请据此调整方案：把对不存在符号的引用改成真实接口，或把缺失符号补进对应"
+            " 文件的 changes/tasks；单文件符号超过容量时，重新拆分文件边界（允许新增文件），"
+            "但不要改动与这些冲突无关的设计。"
+        )
+        if "dependency_invalid" in kinds:
+            # 真机 20260928-160609：阻断是依赖环，而通用指引只讲符号/容量 ——
+            # 模型不知道该动 depends_on，两轮自纠都在修不相干的 main()。
+            tail += (
+                "\n其中依赖类冲突（目标不存在 / 成环）要动的是任务的 **depends_on**："
+                "按上面环清单标注的边来源，删除或改向「方案声明」的依赖（底层/被引用方"
+                "不得反向依赖调用方）；不要靠新增符号或重命名来回避。"
+            )
+        if "uses_cycle" in kinds:
+            # uses 成环不是 depends_on 问题，要动的是 contracts.uses：
+            # 删掉反向引用 / 自引用，或把跨层回调改成参数传入。
+            tail += (
+                "\n其中 uses_cycle 要动的是相关任务的 **contracts.uses**（不是 depends_on）："
+                "删掉导致成环/自引用的条目；调用方若必须通知底层，用参数把回调传进去，"
+                "不要让底层模块反向 import 调用方。"
+            )
+        msg = (
+            "【设计闸门阻断】以下是编译器 / 接口基准在方案定稿时机械判定出的硬冲突，"
+            "进开发前必须消除 —— 开发被约束在你的 changes 范围内，无权改方案，"
+            "带着这些冲突下去必然被判负：\n"
+            + "\n".join(lines)
+            + tail
+        )
+        try:
+            new_plan = self._grounded_call(
+                "architect_plan",
+                [*parts, msg],
+                pin=pin,
+                note="architect_plan·设计闸门返工",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(
+                f"        [设计闸门] 返工调用失败（{type(exc).__name__}：{str(exc)[:80]}）"
+                " → 保留当前方案，阻断项交人工裁决"
+            )
+            return
+        self.state["plan"] = new_plan
+        self.log("        [设计闸门] 架构师已按阻断清单重做方案（允许新增文件 / 重拆任务）")
+
+    def _run_design_gate(self, parts: Any, pin: Any) -> None:
+        """进开发前的闸门本体：阻断 → 有限自纠 → 仍阻断则挂人工强控（不带错进 DEV）。"""
+        self.state.pop("design_gate_blocked", None)
+        self.state.pop("design_gate_attempts", None)
+        blockers = self._design_gate_blockers()
+        attempts = 0
+        # 每次「动手自纠前」见过的阻断类型：最终用于区分「同一类问题两轮没修好」
+        # 与「旧冲突已消除、新方案反而引入了新冲突」（真机 160609：假符号→main()→
+        # 依赖环，三次是三个不同类型，笼统称「仍未消除」会把问题性质说错）。
+        ever_seen: set[str] = set()
+        while blockers and attempts < DESIGN_GATE_RETRIES:
+            cur_kinds = {str(b.get("kind") or "") for b in blockers}
+            ever_seen |= cur_kinds
+            if attempts == 0 and cur_kinds == {"skeleton_mismatch"}:
+                # 第一选择是怀疑**骨架自己**：它也是一次 14B 调用，可能是它枚举错了。
+                # 重冻结成本与方案返工相同但不推翻设计，先做这一步。
                 self.log(
-                    f"        [Task Compiler] 架构师的 tasks 不合格（{'；'.join(reasons[:3])}）"
-                    f" → 已由编译器重新生成 {len(compiled)} 张施工图"
+                    "        [设计闸门] 方案声明与接口基准冲突 → 先重新冻结一次骨架"
+                    "（骨架自身也是模型产物，可能是它错）"
                 )
-        self.state["plan"] = self._ensure_entry_task(self.state["plan"])
-        return self.state["plan"]
+                self.state.pop("skeleton_gaps", None)
+                self._freeze_skeleton()
+                # 重冻结会回填 symbols、重算 gaps：必须重跑 IR 归一 + 编译，
+                # 否则回填只落在上一版 compiled tasks 上，IR / 执行图仍是旧口径。
+                self._normalize_and_compile()
+            else:
+                self.log(
+                    f"        [设计闸门] {len(blockers)} 项阻断 → 带清单回架构师自纠"
+                    f"（第 {attempts + 1}/{DESIGN_GATE_RETRIES} 次）"
+                )
+                self._design_gate_reask(parts, pin, blockers)
+                self.state["plan"] = self._normalize_plan_ids(self.state["plan"])
+                self._finalize_plan_compilation()
+            attempts += 1
+            blockers = self._design_gate_blockers()
+        if blockers:
+            self.state["design_gate_blocked"] = blockers
+            self.state["design_gate_attempts"] = attempts
+            final_kinds = {str(b.get("kind") or "") for b in blockers}
+            fresh_kinds = sorted(final_kinds - ever_seen)
+            stale_kinds = sorted(final_kinds & ever_seen)
+            fresh_note = (
+                f"；其中 {('、'.join(fresh_kinds))} 是最后一版方案**新引入**的"
+                if fresh_kinds else ""
+            )
+            stale_note = (
+                f"（前序自纠仍未消除：{'、'.join(stale_kinds)}）" if stale_kinds else ""
+            )
+            self.log(
+                f"        [设计闸门] {len(blockers)} 项阻断在 {attempts} 次自纠后仍未放行"
+                f"{fresh_note}{stale_note} → 停人工闸门，不带坏方案进开发："
+            )
+            for item in blockers[:6]:
+                # 环类 detail 是多行（含逐边来源），控制台只打首行；全文在 state/handoff 里。
+                first_line = str(item.get("detail") or "").splitlines()[0][:160]
+                self.log(f"          · [{item.get('kind')}] {first_line}")
+
+    def _design_gate_resume_check(self) -> list[dict]:
+        """人工闸门续跑时的**强控复核**：对（可能被人工编辑过的）方案重跑确定性编译链。
+
+        与 pm/intake 闸门同一条纪律 —— 人工什么都不改直接点继续，必须被原地再停一次。
+        不调模型：骨架不重新冻结（骨架类阻断需整体重跑方案阶段，用
+        ``--from architect_plan``），只用 state 里已冻结的基准重算冲突。
+        """
+        plan_obj = self.state.get("plan")
+        if not isinstance(plan_obj, dict):
+            return []
+        self._finalize_plan_compilation(freeze=False)
+        # finalize(freeze=False) 清掉了旧 gaps：用已冻结的基准对（可能被改过的）方案
+        # **机械重算**一次声明差，不重新生成骨架。
+        skeleton = self.state.get("skeleton") or {}
+        if skeleton:
+            gaps = self._declared_vs_skeleton(skeleton)
+            if gaps:
+                self.state["skeleton_gaps"] = gaps
+        return self._design_gate_blockers()
 
     def _freeze_skeleton(self) -> dict:
         """方案定稿后单独喂一次「只列结构、不写实现」的调用，产出**冻结的接口基准**。
@@ -1252,6 +1648,15 @@ class Orchestrator:
                 self.log(f"          - {line[:110]}")
         return digest
 
+    #: Python 入口守卫惯用法（``if __name__ == '__main__':``）—— 它不是类/函数/常量，
+    #: 接口骨架（只枚举这三类）天然不含它；方案把它写进 symbols 时不应判 skeleton_mismatch。
+    #: 真机 run 20260928-180933：该惯用法连续触发两次误判，白烧一次骨架冻结 + 一次方案返工。
+    _MAIN_GUARD_RE = re.compile(r"^if\s+__name__\s*==\s*['\"]__main__['\"]\s*:?$")
+
+    def _is_main_guard_symbol(self, sym: Any) -> bool:
+        text = str(sym or "").strip()
+        return bool(self._MAIN_GUARD_RE.match(text))
+
     def _declared_vs_skeleton(self, digest: dict) -> list[str]:
         """方案 ``changes[].symbols`` 里哪些**不在**刚冻结的接口基准里。
 
@@ -1281,6 +1686,8 @@ class Orchestrator:
             if not known:
                 continue
             for sym in (change.get("symbols") or []):
+                if self._is_main_guard_symbol(sym):
+                    continue  # 入口守卫不是接口符号，骨架不可能枚举它（见 _MAIN_GUARD_RE）
                 name = symbol_resolver.clean_symbol(sym)
                 if not name:
                     continue
@@ -1685,6 +2092,22 @@ class Orchestrator:
         # 所以先原地重问，把「写残」这类低级失误在几十秒内解决。
         _shown: frozenset[str] | None = None  # 上一次拿去重问的问题集，用于判「有没有进展」
         _prev_count: int | None = None  # 上一版的问题**条数**，用于判「有没有净进展」
+        # 仓库里已有的兄弟模块（新建项目为空；同批新建文件在函数内部自动识别）
+        try:
+            _repo_py = list(Path(self.repo).glob("*.py")) if self.repo else []
+        except OSError:
+            _repo_py = []
+        _local_modules = {p.stem for p in _repo_py}
+        # 存量文件的顶层符号归属：机械补全要能补符号级 `from cli import add`，
+        # 而不只是模块级 `import sys`（真机 run 20260928-200631：add/remove 漏 import 五轮）。
+        _local_symbols: dict[str, str] = {}
+        for _p in _repo_py:
+            try:
+                for _sym in patches.top_level_defs(_p.read_text(encoding="utf-8", errors="replace")):
+                    _local_symbols.setdefault(_sym, _p.stem)
+            except OSError:
+                continue
+        _reasked = False  # 本轮有没有真的发起过带问题重问（决定收尾要不要刷新语义审计）
         for attempt in range(1, DEV_CONTENT_REPAIR_TRIES + 1):
             problems = self._dev_selfcheck(merged)
             if not problems:
@@ -1693,7 +2116,9 @@ class Orchestrator:
             # 补一行是确定性操作，没有需要模型判断的地方。真机 run snake-ds-plan 里
             # `main.py` 的 `random` 与 `ui.py` 的 `sys` 连着重问 3 次都没被补上
             # （约 184 秒白烧）—— 能机械修掉就不该消耗重问预算。
-            imp_fix = patches.repair_missing_imports(merged, self.state.get("semantic_audit"))
+            imp_fix = patches.repair_missing_imports(
+                merged, self.state.get("semantic_audit"), _local_modules, _local_symbols
+            )
             if imp_fix["repaired"]:
                 self.log(
                     f"        [import 补全] {imp_fix['repaired']} 处用了却没 import，已机械补上："
@@ -1739,6 +2164,20 @@ class Orchestrator:
             _before = copy.deepcopy(merged)
             merged = self._apply_repair(merged, again)
             patches.normalize_implementation(merged)
+            # 重出常以 full_symbol 整份重发同一文件，_apply_repair 会用新版**整份替换**旧
+            # edit —— 模型的新版照样漏 import，于是循环开头刚机械补进去的 import 被一起
+            # 冲掉（真机 run 20260928-180933：补好的 import db/sys 被整份重吐覆盖，问题
+            # 条数反弹，随即触发「条数没有下降」误停，带病文件流出 dev）。用最新一轮语义
+            # 诊断在替换后的 merged 上**再补一次**，下一轮自检/无进展判据才不会被反弹污染。
+            _re_imp = patches.repair_missing_imports(
+                merged, self.state.get("semantic_audit"), _local_modules, _local_symbols
+            )
+            if _re_imp["repaired"]:
+                self.log(
+                    f"        [import 补全] 重出整份覆盖了 {_re_imp['repaired']} 处 import，"
+                    "已重新机械补上：" + "、".join(_re_imp["detail"][:4])
+                )
+            _reasked = True
             # 「锁基准、定范围、最小改」的机械举证：这一版动到了问题清单没点到的文件吗？
             # 只记告警 —— 先量出真实比例，再决定是否升级成打回（见 _out_of_scope_edits）。
             _oos = self._out_of_scope_edits(_before, merged, problems)
@@ -1760,9 +2199,13 @@ class Orchestrator:
         left = self._invalid_new_files(merged)
         if left:
             self.log(f"        [自检] 重问 {DEV_CONTENT_REPAIR_TRIES} 次后仍不合法 {len(left)} 处（交给评审与人工）")
-        # 兜底：循环里若一直卡在字面检查上（`_invalid_new_files` 有问题时不会走到语义检查），
-        # 评审就少了这条机械证据。这里补跑一次（幂等，代价是几秒物化 + pyright）。
-        if not self.state.get("semantic_audit"):
+        # 语义审计收尾：
+        # ① 一直卡在字面检查时（`_invalid_new_files` 有问题就不会跑到语义检查），评审会少了
+        #    这条机械证据 —— 审计缺失就补跑一次；
+        # ② 只要本轮发起过带问题重问，最后一次 `_apply_repair` 之后 merged 已被替换/补 import，
+        #    state 里的审计可能描述的是替换**之前**那版 —— 按最终 merged 重刷，评审不能拿着
+        #    陈旧诊断判负（幂等，代价是几秒物化 + pyright）。
+        if _reasked or not self.state.get("semantic_audit"):
             self._semantic_problems(merged)
         # 落盘前的红线拦截（机械举证）：补丁即将被物化/交付，先按规则库（pipeline/rules.json）
         # 扫一遍**将要写入的新代码**。放在这里而不是 verify 之后：像 `import keyboard`（自己
@@ -2193,6 +2636,64 @@ class Orchestrator:
         probe, written = bundle
         return verify_mod.api_digest(probe, written)
 
+    def _build_test_view(self, interfaces: dict) -> dict:
+        """构造测试专用视图（P1-1）：behaviors / acceptance / interfaces / symbols / contracts。
+
+        刻意不放代码正文 —— 真机实测整份 implementation 占测试 prompt ≈66%（≈7800 tok），
+        而写用例真正需要的五样信息都在方案 / PM 产物 / 接口摘要里，体积只有零头。
+        """
+        scope = self.state.get("scope") if isinstance(self.state.get("scope"), dict) else {}
+        plan = self.state.get("plan") if isinstance(self.state.get("plan"), dict) else {}
+
+        # ① 行为：PM 的功能需求（id/title/验收）+ 项目级验收标准
+        behaviors: list[Any] = []
+        for fr in (scope.get("functional_requirements") or []):
+            if isinstance(fr, dict):
+                behaviors.append(
+                    {
+                        "id": str(fr.get("id") or ""),
+                        "title": str(fr.get("title") or fr.get("description") or ""),
+                        "acceptance": fr.get("acceptance"),
+                    }
+                )
+        for crit in (scope.get("acceptance_criteria") or []):
+            if str(crit or "").strip():
+                behaviors.append(str(crit))
+
+        # ② 每张施工图的验收口径（测试命令断言的直接来源）
+        acceptance: list[dict] = []
+        # ③ 变更符号（按文件）
+        symbols: list[dict] = []
+        # ④ 跨文件契约
+        contracts: list[dict] = []
+        for change in (plan.get("changes") or []):
+            if not isinstance(change, dict):
+                continue
+            syms = [str(s) for s in (change.get("symbols") or []) if str(s).strip()]
+            if change.get("path") and syms:
+                symbols.append({"path": str(change.get("path")), "symbols": syms})
+        for task in (plan.get("tasks") or []):
+            if not isinstance(task, dict):
+                continue
+            tid = str(task.get("id") or "")
+            if str(task.get("acceptance") or "").strip():
+                acceptance.append({"task": tid, "acceptance": str(task.get("acceptance"))})
+            c = task.get("contracts") if isinstance(task.get("contracts"), dict) else {}
+            exposes = [str(s) for s in (c.get("exposes") or []) if str(s).strip()]
+            uses = [str(s) for s in (c.get("uses") or []) if str(s).strip()]
+            interface = str(task.get("interface") or "").strip()
+            if exposes or uses or interface:
+                contracts.append(
+                    {"task": tid, "exposes": exposes, "uses": uses, "interface": interface}
+                )
+        return {
+            "behaviors": behaviors,
+            "acceptance": acceptance,
+            "interfaces": interfaces if isinstance(interfaces, dict) else {},
+            "symbols": symbols,
+            "contracts": contracts,
+        }
+
     def _test_command_problems(self, report: Any) -> list[str]:
         """测试声明的命令**自身能不能执行**？—— 交给 verify 的静态核对（单一真源）。
 
@@ -2424,19 +2925,32 @@ class Orchestrator:
         own = self._own_module_names(impl)
         out: list[str] = []
         for edit in (impl or {}).get("edits") or []:
-            if not isinstance(edit, dict) or str(edit.get("change_type") or "") != "add":
+            if not isinstance(edit, dict):
                 continue
+            change_type = str(edit.get("change_type") or "")
+            patch_mode = str(edit.get("patch_mode") or "")
             patch = str(edit.get("patch") or "")
             if not patch.strip() or patches.DIFF_RE.search(patch):
                 continue
             path = str(edit.get("path") or "")
-            body = patches._new_file_body(patch)
             label = f"`{path}`（符号 {edit.get('target_symbol') or '-'}）"
-            problem = patches.check_new_file_content(body, path)
-            if problem:
-                out.append(f"{label}：{problem}")
-            for item in patches.unavailable_imports(body, path, own):
-                out.append(f"{label}：{item}")
+            if change_type == "add":
+                body = patches._new_file_body(patch)
+                problem = patches.check_new_file_content(body, path)
+                if problem:
+                    out.append(f"{label}：{problem}")
+                for item in patches.unavailable_imports(body, path, own):
+                    out.append(f"{label}：{item}")
+            elif change_type == "modify" and patch_mode == "full_symbol":
+                # modify/full_symbol 的补丁在套用前没有任何物化环节能验语法：
+                # 它要先靠 anchor/符号定位才能进沙箱，定位失败时 pyright 看到的还是旧文件。
+                # 于是「写残的整符号替换」会一路溜到 verify（真机 run 20260928-200631：
+                # 换行双重转义压成单行，三补丁 SyntaxError → 永不套用 → 每轮恒定阻断）。
+                problem = patches.check_symbol_block_content(
+                    patch, path, str(edit.get("target_symbol") or "")
+                )
+                if problem:
+                    out.append(f"{label}：{problem}")
         return out
 
     @staticmethod
@@ -2541,6 +3055,18 @@ class Orchestrator:
             return v if isinstance(v, list) else []
 
         merged: dict[tuple, dict] = {}
+
+        def _union_covers(a: Any, b: Any) -> list:
+            """同键覆盖时合并两张 covers_tasks 声明（保序去重）。"""
+            seen: set[str] = set()
+            out: list = []
+            for x in list(a or []) + list(b or []):
+                k = str(x)
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append(x)
+            return out
+
         for e in _lst(p1, "edits") + _lst(p2, "edits"):
             # 注意：`and e.get("target_symbol")` 这个条件曾把**没写符号的 edit 整条丢掉** ——
             # 整份新建文件（尤其 main.py 这种入口）常常不写 target_symbol，于是文件凭空消失：
@@ -2552,7 +3078,19 @@ class Orchestrator:
             # 会被判成不同的键（真机踩过：返修替换用粗键，把同符号的多条分片并成了一条）。
             # 语义见那里的注释 —— 同 (path, 符号, 模式, anchor) = 同一处改动的两次尝试，
             # 后写（第二遍）覆盖先写；整份新建且没写符号时按路径后写覆盖，避免重复定义。
-            merged[Orchestrator._edit_key(e)] = e
+            key = Orchestrator._edit_key(e)
+            prev_e = merged.get(key)
+            if prev_e is not None:
+                # 后写覆盖的是**内容**，但两张补丁各自的「我覆盖了哪个任务」声明都得留下：
+                # 跨任务累加时（T-02/T-03 都对 db.py 出 add/full_symbol/Database），
+                # 不合并就等于后一个任务把前一个的 covers 一起抹掉 —— 覆盖审计随即恒定报
+                # 「T-02 未被任何补丁覆盖」，即使补丁内容里 T-02 的方法一个不少
+                # （真机 run 20260928-200631，console：4 张图合并后 3 条）。
+                # 同任务两遍合并时两边 covers 相同，union 是 no-op，不会放大覆盖。
+                union_covers = _union_covers(prev_e.get("covers_tasks"), e.get("covers_tasks"))
+                if union_covers:
+                    e = {**e, "covers_tasks": union_covers}
+            merged[key] = e
         out["edits"] = list(merged.values())
         # 第一遍搭脚手架时常先把「待第二遍补齐」的任务声明成 not_implemented，第二遍补上之后
         # 这些声明就过期了。若不清理，同一批 task id 会同时出现在 covered 与 declared_ids 里，
@@ -2809,6 +3347,9 @@ class Orchestrator:
     def _stage_test(self, requirement: str, fixes: list[str] | None = None) -> Any:
         # 接口摘要：新建项目里它是测试**唯一**能知道"类/函数怎么调"的依据（见 _ensure_api_digest）。
         digest = self._ensure_api_digest()
+        # 测试视图：行为/验收/接口/变更符号/契约，**不含 implementation 全文**（P1-1）。
+        view = self._build_test_view(digest)
+        self.state["test_view"] = view
 
         def _send(repair: list[str] | None, note: str | None) -> None:
             self.state["test_report"] = self._grounded_call(
@@ -2817,11 +3358,13 @@ class Orchestrator:
                     requirement,
                     self.state.get("scope"),
                     self.state.get("plan"),
-                    self.state.get("implementation"),
-                    self._code_text("test"),
-                    fixes,
                     api_digest=digest,
+                    fixes=fixes,
                     repair=repair,
+                    test_view=view,
+                    # 按需拉代码：只有命令自检发现「光凭接口写不出可执行命令」时，
+                    # 重问通道才把相关函数正文补进来（首轮默认无代码正文）。
+                    code_on_demand=self._code_text("test") if repair else "",
                 ),
                 note=note,
             )
@@ -2954,17 +3497,18 @@ class Orchestrator:
         # 真机 run 20260924-235001：8 轮全 rework 且越改越坏（第 8 轮直接 ImportError），
         # 最终 needs_human、什么都没交付 —— 而更早的轮次明明产出过可运行版本。
         if report.get("verdict") == "pass" and not mock:
-            devs = [s for s in runstore.stage_snapshots(self.run_dir) if s.get("stage") == "dev"]
-            if devs:
+            # 建议⑮：验证通过的这一刻把**被验证的那一份字节**固化成一等实体
+            # （runs/<id>/verified_workspace/ + verified_manifest.json）。last_good 只存
+            # 清单引用，兜底交付直接从该目录逐字节复制 —— 验证对象与交付对象因此天然同一份，
+            # 不再依赖「某轮 dev 快照能否凑齐沙箱文件集合」（真机 snake-v2 缺文件的事故根因）。
+            frozen = self._freeze_verified_workspace(work, report)
+            if frozen:
                 self.state["last_good"] = {
-                    "file": devs[-1]["file"],
-                    "seq": devs[-1]["seq"],
-                    "audit": audit,
+                    "verified_manifest_id": frozen["manifest_id"],
+                    "manifest_file": "verified_workspace/verified_manifest.json",
+                    "verified_digest": frozen["digest"],
+                    "attempt": self.attempt,
                     "verify_summary": report.get("summary") or "",
-                    # 那一轮**真正被验证过**的文件集合。交付前必须拿它核对 ——
-                    # 见 _deliver_last_good：交付源是「某一个 dev 快照」，
-                    # 而验证跑的是「各轮累积合并后的实现」，两者可能不是同一份。
-                    "materialized": list(report.get("materialized") or []),
                 }
         commands = report.get("commands") or []
         self._record(
@@ -3277,11 +3821,26 @@ class Orchestrator:
         report = tasktype.bug_report_from_state(
             self.state, list(getattr(self, "fixes", None) or []), plan=self.state.get("plan")
         )
+        ordered = self._ordered_plan_tasks()
+        # **精确路径优先**：缺陷单的每条 item 在 `defect_items` 里已带归属施工图
+        # （补丁声明的 covers_tasks，或按文件反查），`by_task` 是它的分组视图。
+        # 直接用 task 身份定位 ⇒ 同一文件被多张图覆盖时也只重做真正肇事的那张，
+        # 不会把同文件的无辜图一起拖下水。
+        hit_ids = {str(tid) for tid in (report.get("by_task") or {}) if str(tid).strip()}
+        if hit_ids:
+            precise = [
+                task
+                for task in ordered
+                if str(task.get("id") or "") in hit_ids
+            ]
+            if precise:
+                return precise
+        # 降级路径：缺陷项全部没有 task 归属（只有文件级证据）时，才按受影响文件取交集。
         affected = {str(p).replace("\\", "/") for p in (report.get("affected") or {})}
         if not affected:
             return []
         hit: list[dict] = []
-        for task in self._ordered_plan_tasks():
+        for task in ordered:
             files = {str(p).replace("\\", "/") for p in (task.get("target_files") or [])}
             if files & affected:
                 hit.append(task)
@@ -3387,7 +3946,14 @@ class Orchestrator:
         view = {**task, "rework_problems": list(rework_problems or [])}
         if symbols is not None:
             view["symbols"] = list(symbols)
-        focus = prompts.task_focus_block(view, (self.state.get("plan") or {}).get("changes"))
+        # import 清单的**机械校对**：uses 成环（errors↔cli 那种顶层互导）与 verify
+        # 已报缺失的导入契约，都不能再无条件写成"文件头必须"（真机 20260928-221831）。
+        hint_ctx = tasktype.import_hint_context(
+            self.state.get("plan"), self.state.get("verify_report")
+        )
+        focus = prompts.task_focus_block(
+            view, (self.state.get("plan") or {}).get("changes"), hint_ctx
+        )
         if symbols is not None:
             focus += (
                 f"\n【本图已被**机械拆半**】本次只写这些符号：{'、'.join(symbols)} —— "
@@ -3527,9 +4093,31 @@ class Orchestrator:
                     {"task": tid, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
                 )
                 continue
+            # 跨轮「补符号零生效」记录：真机 20260928-221831 里同一批 gap（add_entry 等）
+            # 在第 2/3 轮各补问一次（64s/48s/58s），补丁全部因 anchor 不匹配被裁剪，
+            # prompt 没带任何新信息 —— 同条件重问必然再废一次，直接跳过、留痕升级。
+            no_progress = self.state.setdefault("repair_no_progress", {})
             for retry in range(1, self.TASK_SYMBOL_RETRIES + 1):
                 gaps = self._task_symbol_gaps(task, data)
                 if not gaps:
+                    break
+                prev_np = no_progress.get(tid)
+                if (
+                    isinstance(prev_np, dict)
+                    and int(prev_np.get("round") or 0) < self.attempt
+                    # 本轮缺的符号**全部**在上轮的零生效记录里（补丁被裁或补问后一个没少）
+                    and set(gaps)
+                    and set(gaps) <= set(prev_np.get("gaps") or [])
+                ):
+                    self.log(
+                        f"        [施工图自检] {tid} 同一批符号（{'、'.join(gaps[:3])}）"
+                        "上一轮已补问过且零生效（补丁未落地）→ 不再同 prompt 空转，"
+                        "留给评审/verify 升级处理"
+                    )
+                    self.state.setdefault("repair_skips", []).append(
+                        {"task": tid, "round": self.attempt, "gaps": list(gaps),
+                         "prev_round": int(prev_np.get("round") or 0)}
+                    )
                     break
                 self.log(
                     f"        [施工图自检] {tid} 漏了 {len(gaps)} 个声明过的符号"
@@ -3574,6 +4162,12 @@ class Orchestrator:
                     )
                     break
                 data = self._merge_dev(data, again)
+                # 补完再数一遍：**一个都没少** ⇒ 这次补问零生效（典型：补丁 anchor 对不上
+                # 被裁剪）。记下来，下一轮同批 gap 直接不再补问，避免跨轮空烧。
+                left = self._task_symbol_gaps(task, data)
+                if set(left) >= set(gaps):
+                    no_progress[tid] = {"round": self.attempt, "gaps": list(gaps)}
+                gaps = left
             merged = self._merge_dev(merged, data) if merged else data
             self.log(f"        [按 task 分派] {tid} 完成（{idx}/{len(tasks)}）")
         return merged
@@ -3909,6 +4503,64 @@ class Orchestrator:
                 )
         return out
 
+    def _patch_failures(self) -> list[dict]:
+        """判负补丁的**结构化投影**：Failure Analyzer 责任主体三分类的输入（建议⑨）。
+
+        `_patch_blockers` 产出的是给人/模型读的句子；这里保留两个机械事实：
+          · ``status`` 原始状态码（unchecked / symbol_not_found / anchor_not_found…）；
+          · 目标符号/文件**是否在方案里被点名**（symbol_planned / file_planned）。
+
+        classify 据此区分：开发补丁内容写错（dev_patch）／方案或施工图给的靶子是虚的
+        （compiler_target）／物化链或仓库快照故障（patch_runtime），
+        避免基础设施 bug 被整批甩给 DEV 重写补丁。
+        """
+        audit = self.state.get("patch_audit") or self._audit_patches()
+        plan = self.state.get("plan") if isinstance(self.state.get("plan"), dict) else {}
+        target_files: set[str] = set()
+        planned: set[str] = set()
+        for task in (plan.get("tasks") or []):
+            if not isinstance(task, dict):
+                continue
+            for p in (task.get("target_files") or []):
+                p = str(p or "").replace("\\", "/").strip()
+                if p:
+                    target_files.add(p)
+            planned.update(str(s or "").strip() for s in (task.get("symbols") or []) if str(s).strip())
+        for change in (plan.get("changes") or []):
+            if isinstance(change, dict):
+                planned.update(str(s or "").strip() for s in (change.get("symbols") or []) if str(s).strip())
+
+        def _symbol_planned(symbol: str) -> bool:
+            s = symbol.strip()
+            if not s:
+                return False
+            return any(
+                s == p or s.endswith("." + p) or p.endswith("." + s)
+                for p in planned
+            )
+
+        out: list[dict] = []
+        for row in audit.get("edits") or []:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "")
+            if not status or status == "ok":
+                continue
+            path = str(row.get("path") or "").replace("\\", "/").strip()
+            out.append(
+                {
+                    "status": status,
+                    "path": path,
+                    "symbol": str(row.get("symbol") or ""),
+                    "notes": list(row.get("notes") or []),
+                    # 二开里方案覆盖了某文件、仓库快照却没有它，才是"靶子虚"；
+                    # 新建项目本来就没有任何已存文件，modify 缺失只能算开发 add/modify 选错。
+                    "symbol_planned": _symbol_planned(str(row.get("symbol") or "")),
+                    "file_planned": self.project_type != "new" and path in target_files,
+                }
+            )
+        return out
+
     def _verify_blockers(self) -> list[str]:
         """运行验证失败 = 机械证据表明交付跑不起来，同样属于阻断级。
 
@@ -4227,6 +4879,43 @@ class Orchestrator:
         text = str(entry or "").strip()
         return {"issue": text, "reason": "", "impact": ""} if text else None
 
+    def _mechanical_review_facts(self) -> dict:
+        """评审三层 · **第一层机械事实**（建议⑫）：纯代码汇集，一次取值、处处同源。
+
+        第二层语义 LLM 的 pin 块（补丁审计 / 运行验证 / 测试审计 / 影响面 / 红线 /
+        逐项验收 / 语义审计）与第三层确定性裁决（:func:`diagnose.review_decision`）
+        必须看同一份事实——历史上这些取值散在多处，改一处漏一处是「机制空转」的常见成因。
+        本函数只读 state / 跑既有纯机械核对，不调用模型。
+        """
+        verify_report = self.state.get("verify_report")
+        verify_report = verify_report if isinstance(verify_report, dict) else {}
+        clean, clean_reason = self._mechanical_evidence_clean()
+        return {
+            # 阻断项总表（补丁 / 运行验证 / 测试漏测 / 工程红线 / bugfix 范围 / 契约）
+            "blockers": self._mechanical_blockers(),
+            "patch_audit": self.state.get("patch_audit") or {},
+            "implementation_audit": self.state.get("implementation_audit") or {},
+            "test_audit": self.state.get("test_audit") or {},
+            "verify_verdict": str(verify_report.get("verdict") or ""),
+            "verify_problems": [
+                str(p) for p in (verify_report.get("problems") or []) if str(p).strip()
+            ],
+            "rule_findings": self.state.get("rule_findings") or [],
+            "contract_problems": [
+                str(p) for p in (self.state.get("contract_problems") or []) if str(p).strip()
+            ],
+            # 逐项验收（本轮每条上一轮修复项的机械核对结果）
+            "defect_verdicts": self.state.get("defect_verdicts") or [],
+            # 影响面：谁在调用本轮被改的符号
+            "impact_audit": verify_report.get("impact_audit") or {},
+            "semantic_audit": self.state.get("semantic_audit") or {},
+            # 方案层机械信号
+            "plan_gap_files": self._plan_uncovered_defects(),
+            "missing_entry": self._plan_missing_entry(),
+            "evidence_clean": clean,
+            "evidence_clean_reason": clean_reason,
+        }
+
     def _normalize_review(self, review: dict) -> tuple[list[str], list[str], list[str], bool]:
         """把评审的返工项按作用域分三档；全是 needs_external 时强制放行（防止无意义空转）。
 
@@ -4281,29 +4970,20 @@ class Orchestrator:
         review["residual_risks"] = residual
         review["required_fixes_detail"] = detail
 
-        # 机制兜底：有阻断级问题（补丁 anchor 找不到 / 谎称完整 / 贴回去会留残码，
-        # 或运行验证失败）时不允许 pass —— 机器已经证明贴不回去或跑不起来，模型说 pass 也不算。
-        blockers = self._mechanical_blockers()
-        if blockers and review.get("verdict") == "pass":
-            in_material = list(in_material) + [f"修复：{item}" for item in blockers]
-            review["verdict"] = "rework_dev"
-            review["forced_rework"] = True
-            review["required_fixes"] = in_material
-            review["reasons"] = list(review.get("reasons") or []) + [
-                "机制判定：存在阻断级机械证据（" + "；".join(blockers) + "），不允许判定 pass"
-            ]
-            self.log(f"  [机制] 有阻断级机械证据 → 强制 rework_dev（{len(blockers)} 项）")
+        # ==================================================== 第一层：机械事实（纯代码，不问 LLM）
+        # 建议⑫：所有「机器能证明」的东西在此一处汇集；第二层（唯一一次语义 LLM）只回答
+        # 机械证明不了的问题，第三层（diagnose.review_decision）拿这份事实做确定性裁决。
+        facts = self._mechanical_review_facts()
+        # 留痕：每层裁决实际看到的同一份机械事实（供回放 / 排障；逐轮覆盖即可）。
+        self.state["mechanical_review_facts"] = facts
+        blockers = facts["blockers"]
+        semantic_verdict = str(review.get("verdict") or "")
 
-        # 同类矛盾：列了**方案层**返工项却判 pass ⇒ 不允许放行（等于承认方案有缺陷还继续往下走）。
-        # 放在机械兜底之后：方案层比实现层更根本，两者同时命中时以方案层为准。
-        if architect and review.get("verdict") == "pass":
-            review["verdict"] = "rework_architect"
-            review["forced_rework"] = True
-            review["required_fixes"] = list(architect) + list(in_material)
-            review["reasons"] = list(review.get("reasons") or []) + [
-                f"机制判定：列出 {len(architect)} 条方案层返工项却判 pass（自相矛盾），强制回流方案"
-            ]
-            self.log(f"  [机制] 列了方案层返工项却判 pass → 强制 rework_architect（{len(architect)} 项）")
+        # 机械阻断项入实现层整改清单：旧口径是**仅当语义层判 pass 时**才补入（判 rework_dev 时
+        # 评审自己的 blockers 已另走 blockers_kept 通道），保持该门槛不变；紧接着的入口/漏项
+        # 迁移可能把指向方案层文件的条目一并捞走（顺序不可换）。
+        if blockers and semantic_verdict == "pass":
+            in_material = list(in_material) + [f"修复：{item}" for item in blockers]
 
         # ---------------------------------------------------------- 入口缺口的层级纠正
         # 方案没规划入口文件时，把「要求补入口」的返工项从**实现层提到方案层**。
@@ -4311,8 +4991,9 @@ class Orchestrator:
         # 里列出的文件」）—— 入口文件不在方案里，它**无权创建**。于是评审要求加、开发做不到，
         # 两边都没错，循环却不收敛（真机 run 20260925-045404 卡了整整 3 轮）。
         # 新增一个文件属于**方案变更**，按作用域本该判 architect，模型却常误判成 in_material。
-        # 放在机械兜底**之后**：阻断项这时才被塞进 in_material，一并把入口那条捞出来归位。
-        if self._plan_missing_entry():
+        # 放在阻断项入列**之后**：阻断项这时才被塞进 in_material，一并把入口那条捞出来归位。
+        entry_hit = False
+        if facts["missing_entry"]:
             moved = [x for x in in_material if self._looks_like_entry_fix(x)]
             if moved or self._verify_missing_entry():
                 in_material = [x for x in in_material if x not in moved]
@@ -4321,6 +5002,11 @@ class Orchestrator:
                     "（main.py / __main__.py 等，带 `if __name__ == '__main__':` 且运行时有输出）。"
                     "方案不规划它，开发就无权创建，运行验证会一直判「没有可执行入口」。"
                 ] + moved
+                entry_hit = True
+                self.log(
+                    "  [机制] 方案没规划入口 + 返工项要求补入口 → 提到方案层"
+                    f"（从实现层移出 {len(moved)} 项）"
+                )
 
         # ---------------------------------------------------------- 方案漏项的层级纠正
         # 缺陷指向的**文件**方案里没有 ⇒ 判断依据见 `_plan_uncovered_defects`。
@@ -4329,7 +5015,7 @@ class Orchestrator:
         # 方案漏规划的文件）**没有任务可派** —— `_tasks_for_bugfix` 返回空，
         # 调度落到「两遍模式整批重做」，最小改动整个丢掉；而开发受方案白名单约束，
         # 就算派了它也**无权创建方案里没有的文件**。判 rework_dev 只会白烧一轮。
-        gap_files = self._plan_uncovered_defects()
+        gap_files = facts["plan_gap_files"]
         if gap_files:
             moved = [x for x in in_material if any(f in str(x) for f in gap_files)]
             in_material = [x for x in in_material if x not in moved]
@@ -4338,80 +5024,95 @@ class Orchestrator:
                 "请在 changes / tasks 里补上这些文件（开发受方案白名单约束，无权创建方案里没有的文件）——"
                 "把它硬塞给开发只会白烧一轮。"
             ] + moved
-            if str(review.get("verdict") or "") in ("", "pass", "rework_dev"):
-                review["verdict"] = "rework_architect"
-                review["forced_rework"] = True
-                review["required_fixes"] = list(architect) + list(in_material)
-                review["reasons"] = list(review.get("reasons") or []) + [
-                    "机制判定：缺陷指向方案未规划的文件（方案层漏项）→ 强制回流方案"
-                ]
-                self.log(
-                    f"  [机制] 缺陷指向方案未规划的文件（{'、'.join(gap_files)}）"
-                    "→ 强制 rework_architect（判 dev 它也改不动）"
-                )
-                review["required_fixes"] = in_material
-                review["architect_fixes"] = architect
-                review["reasons"] = list(review.get("reasons") or []) + [
-                    "机制判定：方案未规划可执行入口，而返工项要求补入口 —— 属于方案层变更，回流方案"
-                ]
-                self.log(
-                    "  [机制] 方案没规划入口 + 返工项要求补入口 → 提到方案层"
-                    f"（从实现层移出 {len(moved)} 项）"
-                )
+            self.log(
+                f"  [机制] 缺陷指向方案未规划的文件（{'、'.join(gap_files)}）"
+                "→ 强制 rework_architect（判 dev 它也改不动）"
+            )
 
-        forced = False
-        if not in_material and not architect and review.get("verdict") == "rework_architect" and not blockers:
-            # 自相矛盾：判「方案本身有错」，却把返工项全归为「需外部确认」。方案错误是
-            # **本轮材料内可改**的，不能借外部确认放行（等于带着已知设计缺陷交付）；
-            # 但也不能就这么回流 —— in_material 为空，架构师拿不到任何具体指示。
-            # 标记转人工裁决，由人决定是改方案还是接受现状。
+        # ==================================================== 第三层：确定性裁决（纯函数单一真源）
+        # verdict 只是语义层的**建议**；最终去向由机械事实 + 建议按 diagnose.review_decision
+        # 的固定规则算出。规则不要散在编排器里（历史上散在 5 段 if 中，改动容易只改一半）。
+        decision = diagnose.review_decision(
+            semantic_verdict=semantic_verdict,
+            blocked=bool(blockers),
+            has_in_material=bool(in_material),
+            has_architect_fixes=bool(architect),
+            plan_gap=bool(gap_files),
+            verify_pass=str(facts.get("verify_verdict") or "") == "pass",
+            evidence_clean=bool(facts.get("evidence_clean")),
+        )
+        action = decision["action"]
+        review["verdict"] = decision["verdict"]
+        forced_pass = action in (diagnose.DECISION_PASS_EXTERNAL, diagnose.DECISION_PASS_RESIDUAL)
+        review["forced_pass"] = forced_pass
+        review["forced_rework"] = (
+            decision["forced"] and decision["verdict"] in ("rework_dev", "rework_architect")
+        )
+        if action == diagnose.DECISION_AMBIGUOUS:
+            # 判「方案本身有错」却把返工项全归为 needs_external：分类自相矛盾。
+            # 方案错误是**本轮材料内可改**的，不能借外部确认放行；但 in_material 为空，
+            # 架构师也拿不到具体指示 ⇒ 转人工裁决（保留 rework_architect，由 classify 路由）。
             review["escalated_ambiguous"] = True
-            review["reasons"] = list(review.get("reasons") or []) + [
+
+        # ---- 按裁决动作补 reasons / 日志（文案与旧版内联裁决保持一致）----
+        reasons = list(review.get("reasons") or [])
+        if action == diagnose.DECISION_MECH_DEV:
+            reasons.append(
+                "机制判定：存在阻断级机械证据（" + "；".join(blockers) + "），不允许判定 pass"
+            )
+            self.log(f"  [机制] 有阻断级机械证据 → 强制 rework_dev（{len(blockers)} 项）")
+        elif action == diagnose.DECISION_PLAN_ARCH:
+            if gap_files:
+                reasons.append(
+                    "机制判定：缺陷指向方案未规划的文件（方案层漏项）→ 强制回流方案"
+                )
+            else:
+                reasons.append(
+                    f"机制判定：列出 {len(architect)} 条方案层返工项却判 pass（自相矛盾），强制回流方案"
+                )
+                self.log(
+                    "  [机制] 列了方案层返工项却判 pass → 强制 rework_architect"
+                    f"（{len(architect)} 项）"
+                )
+        elif action == diagnose.DECISION_AMBIGUOUS:
+            reasons.append(
                 "机制判定：判 rework_architect 但返工项全被归为 needs_external（分类自相矛盾），转人工裁决"
-            ]
+            )
             self.log("  [机制] 判 rework_architect 但返工项全需外部确认（分类矛盾）→ 转人工裁决，不放行")
-        elif not in_material and not architect and review.get("verdict") == "rework_dev" and not blockers:
-            forced = True
-            review["verdict"] = "pass"
-            review["forced_pass"] = True
-            review["reasons"] = list(review.get("reasons") or []) + [
+        elif action == diagnose.DECISION_PASS_EXTERNAL:
+            reasons.append(
                 "机制判定：返工项全部属于 needs_external，本轮材料内无可执行修改，自动放行并转入残留风险"
-            ]
+            )
             self.log("  [机制] 返工项全部需外部确认 → 强制 pass，已转入 residual_risks")
-        elif (
-            review.get("verdict") == "rework_dev"
-            and not blockers
-            and not architect
-            and self._mechanical_evidence_clean()[0]
-            and str((self.state.get("verify_report") or {}).get("verdict") or "") == "pass"
-        ):
-            # 机器已经证明「能跑起来、能导入、补丁都套上了」，评审仍判 rework ⇒
-            # 它的返工项是**质量主张**，不是可机械核对的缺陷。真机 20260927-060300 /
-            # 065450：verify 5/5 命令通过、`python main.py` 跑起来了（常驻超时按设计算"能跑"），
-            # 评审却要求「补充 main.py 的 root 参数初始化」—— 与机械证据矛盾，
-            # 且它的措辞是**修复指令**而非"跑不起来"，_refute_stale_blockers 的正则抓不到，
-            # 于是永远 rework、永远进不了人工审核闸门、永远不交付。
-            # 处理方式：不再无休止返工 —— 把这些主张降级为**残留风险**，放行到人工审核闸门
-            # 由人拍板（闸门会预览落盘，人能看到实物再决定）。机械证据本身仍然必须全绿。
-            residual = list(review.get("residual_risks") or [])
+        elif action == diagnose.DECISION_PASS_RESIDUAL:
+            # 机器已证明「能跑、能导入、补丁都套上了」，评审仍判 rework ⇒ 它的返工项是
+            # **质量主张**而非可机械核对的缺陷。降级为残留风险，放行到人工审核闸门由人拍板。
             for item in list(in_material):
                 residual.append(
                     {"issue": str(item)[:200], "reason": "评审提出，但本轮机械证据全绿、运行验证通过",
                      "impact": "已降级为残留风险，交人工审核闸门裁定"}
                 )
-            review["residual_risks"] = residual
-            review["verdict"] = "pass"
-            review["forced_pass"] = True
-            review["reasons"] = list(review.get("reasons") or []) + [
+            reasons.append(
                 "机制判定：机械证据全绿且运行验证通过，评审的实现层返工项降级为残留风险，"
                 "放行到人工审核闸门由人工裁定（共 %d 项）" % len(in_material)
-            ]
+            )
             self.log(
                 f"  [机制] 机械证据全绿 + verify pass → 评审的 {len(in_material)} 项实现层返工项"
                 "降级为残留风险，强制 pass 进人工审核闸门"
             )
-            forced = True
-        return in_material, architect, external, forced
+
+        # 入口纠正本身不翻转 verdict，但必须留痕（旧版这条原因错嵌在漏项分支里，一并归位）。
+        if entry_hit and action not in (diagnose.DECISION_PLAN_ARCH,):
+            reasons.append(
+                "机制判定：方案未规划可执行入口，而返工项要求补入口 —— 属于方案层变更，回流方案"
+            )
+
+        review["required_fixes"] = in_material
+        review["architect_fixes"] = architect
+        review["residual_risks"] = residual
+        review["required_fixes_detail"] = detail
+        review["reasons"] = reasons
+        return in_material, architect, external, forced_pass
 
     # ------------------------------------------------------------------ 状态持久化
     def _snapshot(self) -> dict:
@@ -4587,19 +5288,131 @@ class Orchestrator:
         if isinstance(intake, dict):
             self.state["intake"] = prompts.apply_intake_decisions(intake, self.intake_decisions)
         scope = self.state.get("scope")
-        if isinstance(scope, dict) and self.pm_decisions:
-            self.state["scope"] = prompts.apply_pm_decisions(scope, self.pm_decisions)
+        if isinstance(scope, dict):
+            # 同口径兜底：旧 run 的阶段快照可能是**归一前**写入的（post 钩子收口前），
+            # 上面刚用它覆盖了 state —— 这里再归一次，技术问题/三列重复不能在续跑后复活。
+            scope = prompts.normalize_pm_questions(scope)
+            if self.pm_decisions:
+                scope = prompts.apply_pm_decisions(scope, self.pm_decisions)
+            self.state["scope"] = scope
 
     # ------------------------------------------------------------------ 评审频率
-    def _review_due(self, attempt: int) -> bool:
-        """首轮与末轮必评审；其余按 review_every 间隔。"""
+    def _review_due(self, attempt: int) -> tuple[bool, str]:
+        """节奏判定（建议⑬ 的 cadence 半边）：返回 ``(是否到期, 原因码)``。
+
+        首轮与末轮必评审；其余按 review_every 间隔。**事件强制**（defect_closed 等）
+        不在本函数内，见 :meth:`_force_review_events` —— 总闸门
+        ``cadence_due OR force_review_reason`` 在 `_step_review` 组合。
+        """
         if attempt <= 0:
-            return False
+            return False, ""
         if attempt > self.max_rework:  # 末轮：要拿到真实判定而不是直接 needs_human
-            return True
+            return True, "cadence_last_chance"
         if attempt == 1:  # 首轮：早暴露问题
-            return True
-        return (attempt - self.last_review_attempt) >= self.review_every
+            return True, "cadence_first_round"
+        if (attempt - self.last_review_attempt) >= self.review_every:
+            return True, f"cadence_every_{self.review_every}"
+        return False, ""
+
+    def _plan_file_set(self) -> set[str]:
+        """方案边界文件集合（changes.path ∪ tasks.target_files）。"""
+        plan = self.state.get("plan") or {}
+        out: set[str] = set()
+        for change in (plan.get("changes") or []):
+            if isinstance(change, dict) and str(change.get("path") or "").strip():
+                out.add(str(change.get("path")))
+        for task in (plan.get("tasks") or []):
+            if isinstance(task, dict):
+                out.update(str(p) for p in (task.get("target_files") or []) if str(p).strip())
+        return out
+
+    def _force_review_events(self) -> list[str]:
+        """建议⑬ 的事件半边：节奏窗口外**必须补评**的五类事件（纯机械信号，不问 LLM）。
+
+          · ``defect_closed``：上轮台账还开着的缺陷，本轮逐项验收转绿（典型：BUG 修复轮
+            verify 绿 —— 不能因「今天不是 review 轮」就再空跑一次 dev）；
+          · ``regression_recovered``：上轮已转绿这轮又红（回归出现），或**上轮已标回归**
+            的缺陷本轮转绿（回归修复待确认）—— 两种状态翻转都值得立刻评审；
+          · ``high_risk_task_changed``：被改符号存在**存量上游**调用方
+            （impact_audit.callers 中 in_this_round=False），或本轮命中工程红线；
+          · ``plan_boundary_changed``：方案 changes/target_files 集合与上次评审时不同；
+          · ``human_feedback_resolved``：本轮 dev 消费了人工（打回）反馈。
+
+        台账试算刻意用局部变量：`diagnose.ledger` 是纯函数，正式闭账仍只在评审轮的
+        原位置发生一次，跳过窗口不改动台账（证据连续计数口径不变）。
+        """
+        events: list[str] = []
+        rows = [r for r in (self.state.get("defect_verdicts") or []) if isinstance(r, dict)]
+        prev = self.state.get("defect_ledger") or {}
+        prev_open = {str(k): v for k, v in (prev.get("open") or {}).items() if isinstance(v, dict)}
+        if rows:
+            trial = diagnose.ledger(prev, rows=rows, round_no=self.attempt)
+            green_keys = {
+                diagnose.defect_key(r)
+                for r in rows
+                if str(r.get("status") or "") == "green"
+            }
+            if green_keys & set(prev_open):
+                events.append("defect_closed")
+            regressed_open = {k for k, v in prev_open.items() if v.get("regressed")}
+            if trial.get("regressions") or (green_keys & regressed_open):
+                events.append("regression_recovered")
+
+        impact = (self.state.get("verify_report") or {}).get("impact_audit") or {}
+        external_callers = [
+            c for c in (impact.get("callers") or [])
+            if isinstance(c, dict) and not c.get("in_this_round")
+        ]
+        if external_callers or self._rule_blockers():
+            events.append("high_risk_task_changed")
+
+        last_files = self.state.get("last_review_plan_files")
+        if last_files is not None and set(last_files) != self._plan_file_set():
+            events.append("plan_boundary_changed")
+
+        if self.state.get("human_feedback_consumed_round") == self.attempt:
+            events.append("human_feedback_resolved")
+        return events
+
+    def _record_transition(
+        self,
+        *,
+        to: str,
+        reason: str,
+        defect_ids: list[str],
+        evidence: list[str],
+        due_reason: str = "",
+    ) -> dict:
+        """建议⑭：每次离开评审（回 dev / 回 architect / 进 human / done）落一条因果记录。
+
+        字段（与优化建议 §十四 的结构对齐）：``from / to / reason / defect_ids / attempt /
+        evidence / plan_version / task_version``，另带 verdict 与评审触发原因便于回放。
+        存进 ``state["transitions"]``（随 state.json 持久化），回答「为什么从这里跳回去」
+        不再需要翻日志。
+        """
+        ir = self.state.get("compiler_ir")
+        rec = {
+            "seq": len(self.state.get("transitions") or []) + 1,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "attempt": self.attempt,
+            "from": "review",
+            "to": to,
+            "reason": str(reason or ""),
+            "defect_ids": [str(k) for k in defect_ids][:20],
+            "evidence": [str(e) for e in evidence if str(e).strip()][:20],
+            "plan_version": planir.plan_digest(self.state.get("plan") or {}),
+            "task_version": planir.tasks_digest(
+                ir if isinstance(ir, dict) and ir.get("units") else (self.state.get("plan") or {})
+            ),
+            "review_due_reason": due_reason,
+        }
+        self.state.setdefault("transitions", []).append(rec)
+        self.log(
+            f"  [transition] review -> {to}（{rec['reason']}；"
+            f"缺陷 {len(rec['defect_ids'])} 条；plan={rec['plan_version']} "
+            f"task={rec['task_version']}）"
+        )
+        return rec
 
     def _mark_next_round(self, kind: str) -> None:
         """标记**下一次 dev 轮**的任务类型（由路由决策点写入、`_begin_round` 消费）。
@@ -4624,7 +5437,7 @@ class Orchestrator:
             # 那条路上的类型来自 `_step_review` 的标记（方案返工），不会被方案轮吃掉。
             self.state["round_kind"] = self._take_pending_kind() or tasktype.FEATURE
         route = "架构师方案 -> 开发 -> 测试" if entry == "architect_plan" else "开发 -> 测试"
-        tail = " -> 评审" if self._review_due(self.attempt) else "（本轮跳过评审）"
+        tail = " -> 评审" if self._review_due(self.attempt)[0] else "（本轮跳过评审）"
         if entry == "dev":
             tail += f"（本轮口径：{tasktype.round_kind_label(self.state.get('round_kind'))}）"
         self.log(f"== 迭代 {self.attempt}: {route}{tail}")
@@ -4675,7 +5488,43 @@ class Orchestrator:
 
     def _run_architect_plan(self) -> str:
         self._stage_plan(self.requirement, self.fixes)
+        if self.state.get("design_gate_blocked"):
+            # 真机 160609：闸门拦截前就 _begin_round —— attempt 自增、「迭代 1」日志已打，
+            # 但开发一轮都没跑。轮次必须在**闸门放行真正进入 dev 时**才算开始：
+            # 原地续跑放行走 _execute 顶部复核处补开；--from 重放走重放后的本函数。
+            return "dev"
         return self._begin_round("dev")
+
+    _PRUNED_DETAIL_RE = re.compile(r"^(.+?)::([^（:]+)（")
+
+    def _record_pruned_no_progress(self, detail: list[str]) -> None:
+        """把"被裁剪的补丁"登记成「补符号零生效」证据（供下一轮跳过同 prompt 补问）。
+
+        真机 20260928-221831：补问产出的补丁整份被 prune（anchor 对不上），但补问自检
+        只数补丁文本里有没有符号名 ⇒ 误以为补齐了；下一轮又对同一批符号补问一次，纯烧。
+        补丁被裁 = 符号实际没进沙箱，这才是零生效的硬证据。按 path→施工图、
+        符号名∈该图声明符号 两重收敛后登记，避免误伤同名辅助符号。
+        """
+        tasks = [t for t in ((self.state.get("plan") or {}).get("tasks") or [])
+                 if isinstance(t, dict)]
+        rec = self.state.setdefault("repair_no_progress", {})
+        for raw in detail:
+            m = self._PRUNED_DETAIL_RE.match(str(raw))
+            if not m:
+                continue
+            path, symbol = m.group(1).replace("\\", "/"), m.group(2).strip()
+            if not symbol or symbol == "?":
+                continue
+            for t in tasks:
+                tid = str(t.get("id") or "")
+                files = {str(p).replace("\\", "/") for p in (t.get("target_files") or [])}
+                syms = {str(s) for s in (t.get("symbols") or [])}
+                if not tid or path not in files or symbol not in syms:
+                    continue
+                row = rec.setdefault(tid, {"round": self.attempt, "gaps": []})
+                row["round"] = self.attempt
+                if symbol not in row["gaps"]:
+                    row["gaps"].append(symbol)
 
     def _run_dev(self) -> str:
         self._stage_dev(self.requirement, self.fixes)
@@ -4696,6 +5545,7 @@ class Orchestrator:
             self.state.setdefault("pruned_patches", []).extend(pruned["detail"])
             # 审计与 edits 是**按位置对齐**的（`apply_all` 用 zip），裁剪后必须重算
             self.state.pop("patch_audit", None)
+            self._record_pruned_no_progress(pruned["detail"])
             self.log(
                 f"        [补丁裁剪] {pruned['dropped']} 条**定位失败**的补丁（anchor/符号与原文对不上）"
                 "已从实现里移除："
@@ -4778,13 +5628,37 @@ class Orchestrator:
         return self._budget_exceeded() or self._stagnating()
 
     def _step_review(self) -> str:
-        if not self._review_due(self.attempt):
+        # 建议⑬：review_due = cadence_due OR force_review_reason（五类事件，见
+        # _force_review_events）。节奏窗口外命中事件同样必须补评 —— 典型：BUG 修复轮
+        # 台账缺陷刚转绿，不能因「今天不是 review 轮」再空跑一次 dev。
+        cadence_due, cadence_reason = self._review_due(self.attempt)
+        force_reasons: list[str] = []
+        if not cadence_due:
+            force_reasons = self._force_review_events()
+        if not cadence_due and not force_reasons:
+            # 能走到跳评分支，上一次评审的结论必然是 rework_dev（转绿会触发 defect_closed
+            # 强制评审；回方案走的是 architect_plan 游标）——也就是说这一轮 dev 干的是
+            # 「照缺陷单修复」，口径必须标 BUGFIX。
+            # 真机 run 20260928-200631：漏标后 _begin_round 默认回退成 FEATURE，
+            # 口径随节奏交替翻转（bugfix→首次开发→bugfix→首次开发），FEATURE 轮
+            # 无视「禁止 add 整份」约束，把上一轮修好的 import/入口守卫又整份覆盖回去，
+            # 五轮不收敛。
+            self._mark_next_round(tasktype.BUGFIX)
             self.log(
                 f"  第 {self.attempt} 轮跳过评审（review_every={self.review_every}；首轮与末轮必评审）"
+                f"——延续缺陷修复口径（{tasktype.round_kind_label(tasktype.BUGFIX)}）"
             )
             return self._begin_round("dev")
+        if cadence_due:
+            due_reason = cadence_reason
+        else:
+            due_reason = "force:" + ",".join(force_reasons)
+            self.log(f"  [评审调度] 节奏窗口外强制评审（{due_reason}）")
+        self.state["review_due_reason"] = due_reason
         review = self._stage_review(self.requirement, self.fixes) or {}
         self.last_review_attempt = self.attempt
+        # 记录本轮回看时的方案边界：下轮 _force_review_events 据此判 plan_boundary_changed。
+        self.state["last_review_plan_files"] = sorted(self._plan_file_set())
         in_material, architect_fixes, external, forced = self._normalize_review(review)
         if self.run_dir is not None:
             # 归一化后的评审要回写 NN 文件：_call 内部记录的是原始（未归一化）评审，
@@ -4800,6 +5674,8 @@ class Orchestrator:
             {
                 "attempt": self.attempt,
                 "verdict": verdict,
+                # 建议⑬：本轮为什么开评（节奏码 / force:事件列表）
+                "review_due_reason": due_reason,
                 "forced_pass": forced,
                 "forced_rework": bool(review.get("forced_rework")),
                 "patch_blockers": patch_blockers,
@@ -4825,6 +5701,43 @@ class Orchestrator:
                 else ""
             )
         )
+        # ---- 缺陷台账：跨轮守恒（仍开 / 本轮转绿 / 不再出现 / 回归）
+        # 直接用评审阶段已算好的逐项验收结果（`_stage_review` 写进 state），不重算。
+        # 它回答的是返工最缺的那句"到底还剩几条、上次那几条去哪了"。
+        # **必须在 done / human_review 提前返回之前记账**：最终确认（pass）轮同样要闭账，
+        # 否则上一轮刚转绿的条目在 pass 轮没有任何记录，跨轮守恒永远差最后一页。
+        # **先闭账、后归因**：Recovery Policy 要读台账里每条开缺陷的「证据连续计数」。
+        led = diagnose.ledger(
+            self.state.get("defect_ledger"),
+            rows=self.state.get("defect_verdicts") or [],
+            round_no=self.attempt,
+        )
+        self.state["defect_ledger"] = led
+        self.log(diagnose.ledger_line(led))
+
+        # 建议⑭：Transition Record 的证据/缺陷部分在路由前备妥（四个出口共用同一份）。
+        transition_defect_ids = sorted(str(k) for k in (led.get("open") or {}).keys())
+        transition_evidence: list[str] = [f"patch:{b}" for b in patch_blockers]
+        transition_evidence += [f"mechanical:{b}" for b in mechanical_blockers]
+        for cmd in ((self.state.get("verify_report") or {}).get("commands") or []):
+            if isinstance(cmd, dict) and str(cmd.get("status") or "") not in ("ok", "skipped", ""):
+                transition_evidence.append(
+                    f"verify:{str(cmd.get('command') or '')[:60]}:{cmd.get('status')}"
+                )
+
+        # 交付指纹：本批补丁「内容 + 落点」的摘要。Recovery Policy 的
+        # 「补丁无实质变化」判据靠它 —— 同一缺陷同证据连失两轮、指纹还一模一样，
+        # 说明 DEV 这一轮什么也没改动，再打回一次只是再烧一轮。
+        impl_digest = self._delivery_digest(
+            self.state.get("implementation") or {}, self.state.get("patch_audit") or {}
+        )
+        prev_digest = next(
+            (str(r.get("impl_digest")) for r in reversed(self.rounds[:-1]) if r.get("impl_digest")),
+            "",
+        )
+        impl_unchanged = bool(prev_digest) and prev_digest == impl_digest
+        self.rounds[-1]["impl_digest"] = impl_digest
+
         # ---- 归因与去向：**一次确定性分类**（替换原先散开的七层 if 链）
         # 判据散在四个函数里时改动容易只改一半 —— 那正是本项目"机制空转"的常见成因。
         # 现在「为什么没修好」与「下一跳去哪」由一处产出，并逐轮落进
@@ -4840,6 +5753,7 @@ class Orchestrator:
             max_rework=self.max_rework,
             guard_stop=stop or "",
             patch_blockers=patch_blockers,
+            patch_failures=self._patch_failures(),
             mechanical_blockers=mechanical_blockers,
             # 跨文件契约虚依赖：归因指向方案层，但**路由暂不动它**（改行为要有基线，
             # 见 diagnose.classify 的 owner_mismatch 说明）。
@@ -4848,37 +5762,56 @@ class Orchestrator:
             uncovered_files=self._plan_uncovered_defects(),
             external_fixes=external,
             prior_types=[str(r.get("failure") or "") for r in self.rounds[:-1]],
+            # Recovery Policy（Escalation by evidence）
+            open_defects=led.get("open") or {},
+            impl_unchanged=impl_unchanged,
         )
         self.rounds[-1]["failure"] = record["type"]
+        self.rounds[-1]["owner_class"] = record.get("owner_class") or ""
+        self.rounds[-1]["recovery"] = record.get("recovery") or {}
         self.state["failure"] = record
-        self.state.setdefault("failure_history", []).append(
-            {
-                key: record.get(key)
-                for key in ("round", "type", "owner", "recover_stage", "needs_human", "stop", "repeat")
-            }
+        history_rec = {
+            key: record.get(key)
+            for key in (
+                "round", "type", "owner", "owner_class", "recover_stage",
+                "needs_human", "stop", "repeat",
+            )
+        }
+        history_rec["recovery_action"] = (record.get("recovery") or {}).get(
+            "action", "retry_owner"
         )
+        self.state.setdefault("failure_history", []).append(history_rec)
         for line in diagnose.render(record):
             self.log(line)
         if record["needs_human"]:
             self.needs_human = True
         if stop:
             self.state["guard_stop"] = stop
+
         target = record["recover_stage"]
+        # 路由原因：归因分类的类型（pass / 各类失败 / needs_human 等），即 Transition 的 reason。
+        transition_reason = str(record.get("type") or verdict or "")
         if target == "done":
+            self._record_transition(
+                to="done", reason=transition_reason,
+                defect_ids=transition_defect_ids, evidence=transition_evidence,
+                due_reason=due_reason,
+            )
             return "done"
         if target == "human_review":
-            return "human_review" if HUMAN_REVIEW_GATE else "done"
-
-        # ---- 缺陷台账：跨轮守恒（仍开 / 本轮转绿 / 不再出现 / 回归）
-        # 直接用评审阶段已算好的逐项验收结果（`_stage_review` 写进 state），不重算。
-        # 它回答的是返工最缺的那句"到底还剩几条、上次那几条去哪了"。
-        led = diagnose.ledger(
-            self.state.get("defect_ledger"),
-            rows=self.state.get("defect_verdicts") or [],
-            round_no=self.attempt,
-        )
-        self.state["defect_ledger"] = led
-        self.log(diagnose.ledger_line(led))
+            if HUMAN_REVIEW_GATE:
+                self._record_transition(
+                    to="human_review", reason=transition_reason,
+                    defect_ids=transition_defect_ids, evidence=transition_evidence,
+                    due_reason=due_reason,
+                )
+                return "human_review"
+            self._record_transition(
+                to="done", reason=transition_reason,
+                defect_ids=transition_defect_ids, evidence=transition_evidence,
+                due_reason=due_reason,
+            )
+            return "done"
 
         # 方案层返工项也进 fixes：回退到方案时架构师要能逐条看到「我漏了什么」，
         # 只做路由不带上内容的话，架构师拿不到任何具体指示。
@@ -4910,9 +5843,19 @@ class Orchestrator:
             # 下一轮 dev 是**方案返工后施工**，不是"最小改动修缺陷"：方案可能新增了文件与符号，
             # 口径必须跟着换 —— 否则评审要求加文件、开发无权创建，两边都没错却不收敛（真机 L2）。
             self._mark_next_round(tasktype.PLAN_REWORK)
+            self._record_transition(
+                to="architect_plan", reason=transition_reason,
+                defect_ids=transition_defect_ids, evidence=transition_evidence,
+                due_reason=due_reason,
+            )
             return self._begin_round("architect_plan")
         # 其余回流都是在**既有方案范围内**修东西：按缺陷修复口径（最小改动 + 逐条回应）。
         self._mark_next_round(tasktype.BUGFIX)
+        self._record_transition(
+            to="dev", reason=transition_reason,
+            defect_ids=transition_defect_ids, evidence=transition_evidence,
+            due_reason=due_reason,
+        )
         return self._begin_round("dev")
 
     def _extend_budget_for_human(self, reason: str) -> None:
@@ -5061,6 +6004,23 @@ class Orchestrator:
                     spec.title if spec else "PM 未决项闸门",
                     "以下内容**还不是陈述**，不得带进下游 —— " + " ｜ ".join(bits),
                 )
+        if stage == "architect_plan" and self.state.get("design_gate_blocked"):
+            # Design Gate 强控：首次到达（阻断已在方案阶段算好）与续跑（人工可能改过方案）
+            # 都走这里。续跑时重跑**确定性**编译链重新判定 —— 不修改就点继续会被原地再停。
+            blockers = self._design_gate_resume_check()
+            if blockers:
+                self.state["design_gate_blocked"] = blockers
+                self._persist()
+                detail = (
+                    f"以下 {len(blockers)} 项设计阻断未消除，**不得带进开发** —— "
+                    + "；".join(str(b.get("detail")) for b in blockers[:4])
+                    + f"。处理方式：① 直接续跑 {self.run_id} 重放方案阶段（--from architect_plan "
+                    "--feedback \"...\"）；② 在页面/产物里改好方案后续跑（会重新做机械编译校验）。"
+                )
+                return Interrupt(stage, "conditional", "设计闸门（Design Gate）", detail)
+            self.state.pop("design_gate_blocked", None)
+            self.state.pop("design_gate_attempts", None)
+            self.log("  [强控] 设计阻断项已消除 —— 放行进入开发")
         return None
 
     def _pm_unresolved(self) -> dict[str, list[str]]:
@@ -5111,6 +6071,14 @@ class Orchestrator:
                 self.log(f"  [强控] {gate_stage} 的待裁决项仍未解决 —— 不放行，继续停在这里")
                 self._interrupt(it)
                 return
+            if gate_stage == "architect_plan" and self.cursor == "dev":
+                # 方案阶段在闸门拦截时**没有**开轮（见 _run_architect_plan）；
+                # 人工改好方案、复核放行的此刻补开 —— attempt/迭代日志与真实轮次对齐。
+                # 旧版本暂停在这道闸门前已把 attempt 自增成 1（dev 其实一轮没跑）：
+                # 按不变量归一 —— 还没有任何实现产物，下一轮就是第 1 轮。
+                if not isinstance(self.state.get("implementation"), dict):
+                    self.attempt = 0
+                self._begin_round("dev")
         try:
             while self.cursor != "done":
                 stage = self.cursor
@@ -5287,7 +6255,14 @@ class Orchestrator:
         self.status = "running"
         # 记下"上次停在哪个闸门"再清 paused_after：条件闸门是强控，续跑时必须重新判定
         # （见 `_execute` 开头）。用快照里的值而不是内存值 —— 内存值在这里就被清掉了。
-        self._resume_gate_stage = str(snap.get("paused_after") or "").strip() or None
+        # 但**显式 --from / 检查点回放不算「原地续跑」**：用户已经决定重放某阶段，
+        # 顶部若再拿旧产物复核（如设计闸门用旧方案重算阻断）会在重放开始前就再停一次，
+        # 让暂停文案推荐的 `--from architect_plan --feedback` 永远走不到（真机 160609）。
+        # 闸门会在重放阶段结束后走正常流程重新判定，不丢强控。
+        replaying = bool(from_stage or from_checkpoint is not None)
+        self._resume_gate_stage = (
+            None if replaying else str(snap.get("paused_after") or "").strip() or None
+        )
         self.paused_after = None
         self._t0 = time.time()
         self._persist()
@@ -5316,6 +6291,10 @@ class Orchestrator:
             self.state["implementation_symbols_prev"] = sorted(self._symbol_set(stale))
         for stage in tail:
             self.state.pop(runstore.STAGE_STATE_KEY[stage], None)
+        # 设计闸门的结论绑定在「即将重放/跳过的方案」上：重放后 _run_design_gate 会重判
+        # （开头即 pop）；人工强制从下游重放则属于显式越过闸门，旧标记继续留着是脏状态。
+        self.state.pop("design_gate_blocked", None)
+        self.state.pop("design_gate_attempts", None)
         if from_stage in ("pm", "architect_assess", "architect_plan"):
             self.attempt = 0
             self.last_review_attempt = 0
@@ -5410,27 +6389,91 @@ class Orchestrator:
             return result
         return self._write_target("deliver")
 
-    def _last_good_impl(self) -> tuple[dict | None, dict]:
-        """取「最后一个验证通过的版本」（那时的 dev 产物 + 通过时的补丁审计）。"""
+    # ---- 建议⑮：Verified Workspace —— 被验证字节的一等实体 ----
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _freeze_verified_workspace(self, work: str, report: dict) -> dict | None:
+        """verify pass 时把沙箱里**真正被验证过**的文件固化为 ``verified_workspace/``。
+
+        只复制 ``materialized`` 列出的项目产物（不是整份沙箱：基座文件本就在用户仓库里），
+        逐文件 sha256 进清单，整体再算一个 12 位摘要。之后兜底交付是「照清单复制字节」——
+        与验证跑的对象逐字节相同，「验证对象 ≠ 交付对象」（snake-v2 缺文件事故）在结构上消失。
+        """
+        if not work or self.run_dir is None:
+            return None
+        src_root = Path(work)
+        rels: list[str] = []
+        for p in report.get("materialized") or []:
+            rel = str(p or "").replace("\\", "/").strip()
+            if rel and rel not in rels:
+                rels.append(rel)
+        if not rels:
+            return None
+        vdir = self.run_dir / "verified_workspace"
+        # 重新通过验证时整体重建：verified_workspace 永远只代表「最近一次通过」。
+        if vdir.exists():
+            shutil.rmtree(vdir, ignore_errors=True)
+        files_meta: list[dict] = []
+        for rel in rels:
+            src = src_root / rel
+            if not src.is_file():
+                continue
+            dst = vdir / rel
+            try:
+                if vdir.resolve() not in dst.resolve(strict=False).parents:
+                    continue
+            except OSError:
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            files_meta.append(
+                {"path": rel, "sha256": self._sha256_file(dst), "size": dst.stat().st_size}
+            )
+        if not files_meta:
+            return None
+        digest = hashlib.sha1(
+            json.dumps(files_meta, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:12]
+        manifest = {
+            "manifest_id": f"vm-{self.attempt}-{digest[:8]}",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "attempt": self.attempt,
+            "verify_summary": report.get("summary") or "",
+            "digest": digest,
+            "files": files_meta,
+        }
+        runstore.write_json(vdir / "verified_manifest.json", manifest)
+        self.state["verified_digest"] = digest
+        self.log(f"        [verified] 已固化 {len(files_meta)} 个被验证文件（digest={digest}）")
+        return manifest
+
+    def _verified_manifest(self) -> dict | None:
+        """读 last_good 指向的固化清单；新结构不存在（如 mock 或旧 run）时返回 None。"""
         lg = self.state.get("last_good") or {}
-        name = str(lg.get("file") or "")
+        name = str(lg.get("manifest_file") or "")
         if not name or self.run_dir is None:
-            return None, {}
+            return None
+        mp = self.run_dir / Path(name).name if Path(name).name == name else self.run_dir / name
         try:
-            payload = json.loads((self.run_dir / Path(name).name).read_text(encoding="utf-8"))
+            data = json.loads(mp.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None, {}
-        impl = payload.get("artifact")
-        if not isinstance(impl, dict) or not impl.get("edits"):
-            return None, {}
-        audit = lg.get("audit")
-        return impl, (audit if isinstance(audit, dict) else {})
+            return None
+        return data if isinstance(data, dict) and data.get("files") else None
 
     def _deliver_last_good(self) -> dict:
-        """未通过时的**兜底交付**：把最后一个验证通过的版本物化到目标目录。
+        """未通过时的**兜底交付**：把 verified_workspace 里被验证过的字节复制到目标目录。
 
         交付物明确标注「未经放行」。有它总比什么都没有强 —— 用户拿到的是唯一一个
         被机械证据证明过能跑的版本，而不是最后一轮（可能已改坏）的残次品。
+
+        建议⑮后交付源不再是「某一个 dev 快照」，而是 verify pass 当时固化的工作区：
+        复制前逐文件比对 sha256，清单里的文件缺失或被改动就**整体拒绝、一个字都不写**。
         """
         result = self._blank_delivery()
         result["mode"] = "last_good"
@@ -5440,52 +6483,81 @@ class Orchestrator:
         if not self.repo:
             result["reason"] = "未指定目标目录（repo 为空）"
             return result
-        impl, audit = self._last_good_impl()
-        if impl is None:
-            result["reason"] = "没有「验证通过」的历史版本可兜底"
+        manifest = self._verified_manifest()
+        if manifest is None or self.run_dir is None:
+            result["reason"] = "没有「验证通过」的固化工作区可兜底"
             return result
-        # ---- 交付前核对：这一份能不能凑出「验证通过时」的文件集合 ----
-        #
-        # 交付源是**某一个 dev 快照**，而 verify 跑的是**各轮累积合并后的实现** ——
-        # 两者并不自动等价。真机 run snake-v2（2026-09-26）就栽在这里：
-        #   第 3 轮 verify 判 pass（沙箱里 5 个文件，main.py 真能开窗口），
-        #   但兜底交付取的 20-dev.json 只有 4 条 edits —— **少了 game_logic.py**，
-        #   而 main.py 第一行就是 `from game_logic import GameLogic`。
-        #   结果目标目录拿到一份「号称验证通过、实际缺核心文件」的东西，人只有真跑才发现。
-        # 这正是「几轮都通过、交付却跑不了」的机械成因：**验证的对象与交付的对象不是同一份**。
-        # 宁可不交付，也不能把「看着交付成功、实际跑不起来」的产物放进用户仓库。
-        lg = self.state.get("last_good") or {}
-        verified = {str(p).replace("\\", "/") for p in (lg.get("materialized") or []) if str(p).strip()}
-        planned = {
-            str(e.get("path") or "").replace("\\", "/")
-            for e in impl.get("edits") or []
-            if str(e.get("path") or "").strip()
-        }
-        missing = sorted(verified - planned)
-        if verified and missing:
-            result["partial"] = True
-            result["missing_vs_sandbox"] = missing
-            result["reason"] = (
-                f"兜底版本 {lg.get('file')} 凑不齐「验证通过时」的文件集合（缺 {missing}）："
-                "验证跑的是各轮累积合并后的实现，而这份快照只含它自己那一轮的补丁 —— "
-                "两者不等价，直接写出去就是一份跑不起来的交付物。**已放弃交付**；"
-                f"被验证过的那一份在 runs/{self.run_id}/verify/work。"
-            )
+        vdir = self.run_dir / "verified_workspace"
+        entries = [f for f in (manifest.get("files") or []) if isinstance(f, dict) and f.get("path")]
+        if not entries:
+            result["reason"] = "固化清单为空（verified_manifest.json 无文件记录）"
             return result
-        saved = (self.state.get("implementation"), self.state.get("patch_audit"))
-        self.state["implementation"] = impl
-        self.state["patch_audit"] = audit or patches.analyze_all(self.repo, impl)
+
+        repo = Path(self.repo).expanduser()
         try:
-            out = self._write_target("last_good")
-        finally:
-            self.state["implementation"], self.state["patch_audit"] = saved
-        if out.get("delivered"):
-            lg = self.state.get("last_good") or {}
-            out["reason"] = (
-                f"该版本取自「最后一次通过运行验证」的快照 {lg.get('file')}"
-                "（**未经人工放行**；本轮最终判定未通过）"
+            root = Path(ROOT).resolve()
+            resolved = repo.resolve(strict=False)
+        except OSError as exc:
+            result["error"] = f"目标路径无法解析：{exc}"
+            return result
+        # 防自伤：与 _write_target 同一道红线。
+        if resolved == root or root in resolved.parents:
+            result["error"] = f"拒绝交付：目标目录位于流水线目录内（{resolved}）"
+            return result
+
+        # ---- 先整体校验、后逐字节复制：任何一个文件缺失/越界/哈希不符都一个字不写 ----
+        plans: list[tuple[str, Path, Path]] = []
+        bad: list[str] = []
+        for item in entries:
+            rel = str(item["path"]).replace("\\", "/").strip()
+            src = vdir / rel
+            try:
+                dest = (resolved / rel).resolve(strict=False)
+            except OSError:
+                bad.append(f"{rel}（路径无法解析）")
+                continue
+            if resolved != dest and resolved not in dest.parents:
+                bad.append(f"{rel}（越出目标目录）")
+                continue
+            if not src.is_file():
+                bad.append(f"{rel}（固化工作区中缺失）")
+                continue
+            actual = self._sha256_file(src)
+            if str(item.get("sha256") or "") and actual != str(item["sha256"]):
+                bad.append(f"{rel}（sha256 与清单不符，固化区被改动）")
+                continue
+            plans.append((rel, src, dest))
+        if bad:
+            result["reason"] = (
+                "放弃兜底交付：固化工作区与清单不一致（" + "；".join(bad[:4])
+                + f"，共 {len(bad)} 项）：验证对象已不完整或被改动，写出去无法保证是被验证过的那份。"
             )
-        return out
+            return result
+
+        written: list[dict] = []
+        for rel, src, dest in plans:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            backup = dest.with_suffix(dest.suffix + ".orig")
+            if dest.is_file() and not backup.exists():
+                shutil.copy2(dest, backup)
+            shutil.copy2(src, dest)
+            entry = {"path": rel, "written": str(dest)}
+            if dest.is_file() and backup.exists():
+                entry["backup"] = str(backup)
+            written.append(entry)
+        if not written:
+            result["wrote_nothing"] = True
+            result["reason"] = "固化清单无可交付文件，目标目录未改动"
+            return result
+        result["delivered"] = True
+        result["files"] = written
+        result["verified_digest"] = manifest.get("digest") or ""
+        result["reason"] = (
+            f"该版本逐字节复制自「最后一次通过运行验证」的固化工作区"
+            f"（{manifest.get('manifest_id')}，{len(written)} 个文件；"
+            "**未经人工放行**；本轮最终判定未通过）"
+        )
+        return result
 
     def _deliver_preview(self) -> dict:
         """人工审核闸门处的**预览物化**：先把交付物写进目标目录，让人工有东西可看再决定。

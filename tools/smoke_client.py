@@ -24,6 +24,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from dataclasses import replace
+
 from pipeline.config import STAGE_MODELS  # noqa: E402
 from pipeline.ollama_client import OllamaClient, OllamaError, _looks_degenerate  # noqa: E402
 
@@ -122,18 +124,20 @@ def main() -> int:
     )
     check(_looks_degenerate(code_like) is False, "正常的类方法集合（30 个各不相同）⇒ 不误判")
 
-    print("== ③ 普通截断：抬高上限（上限 3 次），但抬不出上下文余量 ==")
+    print("== ③ 普通截断（非 dev 角色）：抬高上限（上限 3 次），但抬不出上下文余量 ==")
+    # dev 角色另有「先压短、不加码」口径（见 ⑨）；这里用架构师角色钉住长输出角色的加码语义。
+    arch_spec = replace(spec, role="架构师", tag="smoke-arch", num_ctx=16384, num_predict=6144)
     client, sent = _client([_truncated(normal)])
     try:
-        client.chat_json(spec, "sys", "user", {"type": "object"}, attempts=3)
+        client.chat_json(arch_spec, "sys", "user", {"type": "object"}, attempts=3)
         check(False, "三次都截断应当报错", "没有抛错")
     except OllamaError as exc:
         check("已抬高上限" in str(exc), "报错里说明「抬高已到顶」（不再默默再抬）", str(exc)[:90])
     limits = _limits(sent)
-    check(limits[:2] == [spec.num_predict, spec.num_predict * 2] and len(limits) == 3,
-          "上限序列 = 原值 → ×2 → ×2（抬高上限 3 次；此前只准抬 1 次会过早放弃）", str(limits))
+    check(limits[:2] == [6144, 6144 * 2] and len(limits) == 3,
+          "上限序列 = 原值 → ×2 → 余量上界（抬高上限；非 dev 角色行为不变）", str(limits))
     check(all(limits[i] < limits[i + 1] for i in range(len(limits) - 1))
-          and max(limits) <= spec.num_ctx,
+          and max(limits) <= arch_spec.num_ctx,
           "抬高只增不减，且**抬不出 num_ctx**（余量才是硬上界）", str(limits))
     check(len(sent) == 3, "每次都用新上限重试（不做同上限白试）", str(len(sent)))
 
@@ -198,6 +202,85 @@ def main() -> int:
     client.chat_json(spec, "sys", "user", {"type": "object", "properties": {"ok": {"type": "boolean"}}},
                      on_attempt=seen_ok.append)
     check(not seen_ok, "成功不触发 on_attempt（否则同一次调用会记两遍，账就重了）", str(len(seen_ok)))
+
+    print("== ⑧ HTTP 500「token repeat limit」：降载重试一次 + 失败必留痕 ==")
+    # 真机 run 20260928-180933 的 dev 轮：服务端主动中止（prediction aborted, token
+    # repeat limit reached），原链路既不重试也不留痕（traces / llm-calls 都是成功后才落），
+    # 异常直接冒泡暂停整轮，事后连请求规模都复盘不了。
+    repeat_500 = OllamaError("POST /api/chat -> HTTP 500: prediction aborted, token repeat limit reached")
+    other_500 = OllamaError("POST /api/chat -> HTTP 500: internal inference error")
+
+    def _scripted(script: list) -> tuple[OllamaClient, list[dict]]:
+        c = OllamaClient.__new__(OllamaClient)
+        c.host = "http://127.0.0.1:1"
+        c.timeout = 5
+        sent2: list[dict] = []
+
+        def fake(path, payload, method="POST", timeout=None):  # noqa: ARG001
+            sent2.append(payload or {})
+            item = script[min(len(sent2) - 1, len(script) - 1)]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        c._request = fake  # type: ignore[method-assign]
+        return c, sent2
+
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    seen_r: list[dict] = []
+    client, sent = _scripted([repeat_500, ok])
+    data, _meta = client.chat_json(spec, "sys", "user", schema,
+                                   on_attempt=seen_r.append, log=lambda m: None)
+    check(data == {"ok": True}, "500 中止后降载重试成功", str(data))
+    check(len(sent) == 2, "只多发一次（降载名额 1 个）", str(len(sent)))
+    opts0, opts1 = (sent[0].get("options") or {}), (sent[1].get("options") or {})
+    check(opts0.get("repeat_penalty") is None, "首次请求不画蛇添足（默认采样）", str(opts0))
+    check(float(opts1.get("repeat_penalty") or 0) == 1.15
+          and abs(float(opts1.get("temperature")) - min(spec.temperature + 0.15, 1.0)) < 1e-9,
+          "重试改采样：repeat_penalty=1.15、temperature +0.15（打散重复循环）", str(opts1))
+    check(len(seen_r) == 1 and seen_r[0].get("done_reason") == "http_500_repeat_abort"
+          and "token repeat limit" in str(seen_r[0].get("http_error") or "")
+          and seen_r[0].get("prompt_est_tokens"),
+          "失败的那次 HTTP 尝试即时上账（错误原文 + 请求规模都在，不再零留痕）",
+          str({k: seen_r[0].get(k) for k in ("done_reason", "http_error", "prompt_est_tokens")}) if seen_r else "无记录")
+
+    seen_o: list[dict] = []
+    client, sent = _scripted([other_500])
+    try:
+        client.chat_json(spec, "sys", "user", schema, on_attempt=seen_o.append)
+        check(False, "非 repeat 的 500 应当抛出", "没有抛错")
+    except OllamaError as exc:
+        check("internal inference error" in str(exc), "其他 500 原样上抛（不猜着重试）", str(exc)[:80])
+    check(len(sent) == 1, "非 repeat 失败不重试（只有改条件才有意义）", str(len(sent)))
+    check(bool(seen_o) and seen_o[0].get("done_reason") == "http_error",
+          "非 repeat 的 HTTP 失败同样留痕", str(seen_o and seen_o[0].get("done_reason")))
+
+    seen_t: list[dict] = []
+    client, sent = _scripted([repeat_500, repeat_500])
+    try:
+        client.chat_json(spec, "sys", "user", schema, on_attempt=seen_t.append)
+        check(False, "降载后仍 500 应当抛出", "没有抛错")
+    except OllamaError as exc:
+        check("token repeat limit" in str(exc), "降载后仍中止 ⇒ 上抛交由上层暂停", str(exc)[:80])
+    check(len(sent) == 2, "降载**只给一次**（不无限烧算力）", str(len(sent)))
+    check(len(seen_t) == 2 and all(r.get("done_reason") == "http_500_repeat_abort" for r in seen_t),
+          "两次中止各留一条痕", str([r.get("done_reason") for r in seen_t]))
+
+    print("== ⑨ dev 角色截断：先压短，恢复不超过基础上限，再截断就放弃（不加码 12288） ==")
+    # 真机 run 20260928-200631：分图后单任务补丁正常只有几百~一两千 token，撞满 6144
+    # 就是整份重写/发散。旧口径一路加码 12288，满额 319s 仍是断 JSON，五轮白烧。
+    client, sent = _client([_truncated(normal)])
+    try:
+        client.chat_json(spec, "sys", "user", {"type": "object"}, attempts=3)
+        check(False, "dev 三次都截断应当报错", "没有抛错")
+    except OllamaError as exc:
+        check("基础上限" in str(exc) and "停止加码" in str(exc),
+              "dev 报错说明「基础上限内仍截断、已停止加码」", str(exc)[:110])
+    limits = _limits(sent)
+    check(limits == [spec.num_predict, spec.num_predict // 2, spec.num_predict],
+          "序列 = 6144 → 压到 3072 → 最多回到 6144（绝不升到 12288）", str(limits))
+    check("单个任务" in _last_user(sent, 1) and "3072" in _last_user(sent, 1),
+          "压短那次明确反馈「单任务写过多、不要整份重写」", _last_user(sent, 1)[-180:])
 
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0

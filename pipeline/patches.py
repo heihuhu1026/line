@@ -22,6 +22,7 @@ import ast
 import importlib.util
 import re
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -254,6 +255,32 @@ def check_new_file_content(content: str, path: str) -> str | None:
             return f"第 {exc.lineno or '?'} 行：{exc.msg}"
         except ValueError as exc:  # 例如源码里含空字节
             return f"无法编译：{exc}"
+    return None
+
+
+def check_symbol_block_content(content: str, path: str, symbol: str = "") -> str | None:
+    """对 **full_symbol 补丁**（完整顶层符号块）做语法级校验，没问题返回 None。
+
+    与 :func:`check_new_file_content` 的差别：补丁可能被模型整体缩进一层，
+    先 ``textwrap.dedent`` 再 compile；不核对「patch 是否定义了声明的符号」——
+    那条由 ``analyze_edit`` 的既有校验负责，这里只管「是不是合法 Python 残片」。
+
+    真机 run 20260928-200631：repair 轮模型把所有换行**双重转义**（JSON 里的 ``\\n``
+    变成字面反斜杠+n），三份补丁全压成单行；而 dev 自检此前只看 change_type=add，
+    modify/full_symbol 一路漏到 verify 的 py_compile 才炸。补丁永远套用不上，
+    还沉淀成每轮恒定 3 条 patch_blockers，淹没真正的问题。
+    """
+    suffix = Path(str(path or "")).suffix.lower()
+    if suffix != ".py" or not str(content or "").strip() or DIFF_RE.search(content):
+        return None
+    body = textwrap.dedent(content)
+    try:
+        compile(body, str(path or "<symbol block>"), "exec")
+    except SyntaxError as exc:
+        who = f"符号 `{symbol}` 的 " if symbol else ""
+        return f"{who}full_symbol 补丁有语法错误（未物化即可判定无法套用）：第 {exc.lineno or '?'} 行：{exc.msg}"
+    except ValueError as exc:  # 例如源码里含空字节
+        return f"无法编译：{exc}"
     return None
 
 
@@ -842,12 +869,17 @@ def symbol_excerpt(source: str, symbol: str, *, context: int = 0) -> dict | None
     return {"start": lo + 1, "end": hi + 1, "text": "\n".join(lines[lo : hi + 1])}
 
 
-def _importable_module(name: str) -> bool:
-    """这个名字是不是**能被 import 的模块**（标准库 / builtin / 本环境已安装）。"""
+def _importable_module(name: str, local_modules: set[str] | None = None) -> bool:
+    """这个名字是不是**能被 import 的模块**（标准库 / builtin / 本环境已安装 / 同批新建）。"""
     if not name or name.startswith("_") or not name.isidentifier():
         return False
     stdlib = set(getattr(sys, "stdlib_module_names", frozenset())) | set(sys.builtin_module_names)
     if name in stdlib:
+        return True
+    # 同批（或仓库里）即将作为兄弟文件存在的本地模块：本函数运行时这些文件还没落盘，
+    # find_spec 必然失败 —— 真机 run 20260928-180933：cli.py 用 `db.xxx`，db.py 与它
+    # 同批新建，find_spec('db') 为 None，于是「机械补 import」漏掉它，带病文件流出 dev。
+    if local_modules and name in local_modules:
         return True
     try:
         return importlib.util.find_spec(name) is not None
@@ -855,13 +887,82 @@ def _importable_module(name: str) -> bool:
         return False
 
 
-def _insert_import(body: str, name: str) -> str:
-    """在文件正文里插入 ``import <name>`` —— 跳过 shebang / 开头注释 / 模块 docstring。
+# pyright 的未定义变量诊断有中英两种形态（不同版本/语言环境不一致，真机都出现过）：
+#   中文：未定义 "db" / 未定义"db" / 未定义: db
+#   英文（实测）："db" is not defined
+_UNDEF_NAME_RES = (
+    re.compile(r"未定义\s*[:：]?\s*[“\"']?([\w.]+)"),
+    re.compile(r"[“\"']([\w.]+)[“\"']\s+is\s+not\s+defined"),
+)
+
+
+def _undefined_name(message: str) -> str | None:
+    """从 pyright 的 reportUndefinedVariable 消息里抽出未定义名字（中英双语兼容）。"""
+    text = str(message or "")
+    for rx in _UNDEF_NAME_RES:
+        m = rx.search(text)
+        if m:
+            return m.group(1).split(".")[0]
+    return None
+
+
+def top_level_defs(source: str) -> list[str]:
+    """源码里**模块级** def/class 的名字（解析失败返回空，不抛）。"""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    return [
+        str(node.name)
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+
+
+def _imports_name(body: str, module: str, name: str) -> bool:
+    """``body`` 里是否已经有 ``from <module> import ... <name> ...``（优先 AST，解析失败退化正则）。"""
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        rx = re.compile(
+            rf"^\s*from\s+{re.escape(module)}\s+import\s+[^\n]*\b{re.escape(name)}\b", re.M
+        )
+        return bool(rx.search(body))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module:
+            if any(alias.name == name for alias in node.names):
+                return True
+    return False
+
+
+def _insert_import(body: str, name: str, module: str | None = None) -> str:
+    """在文件正文里插入 ``import <name>``（module 给定时插 ``from <module> import <name>``）
+    —— 跳过 shebang / 开头注释 / 模块 docstring；已存在同模块的 from-import 则把名字并进去。
 
     插在 docstring **之后**而不是文件最前面：否则模块 docstring 会退化成一条
     无用的字符串语句（`main.py` 这类入口文件通常有）。
     """
     lines = body.splitlines()
+    if module is not None:
+        # 已有 `from module import a, b`：把新名字并进同一行（含括号形态也摊平，语法等价）。
+        pat = re.compile(
+            rf"^(\s*from\s+{re.escape(module)}\s+import\s*)([^\n#]*?)(\s*(?:#.*)?)$", re.M
+        )
+        m = pat.search(body)
+        if m:
+            existing = m.group(2).replace("(", "").replace(")", "")
+            names = [x.strip() for x in existing.split(",") if x.strip()]
+            if name not in names:
+                names.append(name)
+                newline = f"{m.group(1)}{', '.join(names)}{m.group(3)}"
+                lines = body.splitlines()
+                line_no = body[: m.start()].count("\n")
+                lines[line_no] = newline
+                return "\n".join(lines) + "\n"
+            return body
+        new_line = f"from {module} import {name}"
+    else:
+        new_line = f"import {name}"
     pos = 0
     while pos < len(lines) and (
         not lines[pos].strip() or lines[pos].lstrip().startswith("#")
@@ -878,27 +979,42 @@ def _insert_import(body: str, name: str) -> str:
                 pos += 1
             if pos < len(lines):
                 pos += 1
-    lines.insert(pos, f"import {name}")
+    lines.insert(pos, new_line)
     return "\n".join(lines) + "\n"
 
 
-def repair_missing_imports(impl: dict | None, semantic_audit: dict | None = None) -> dict[str, Any]:
-    """机械补上「用了但没 import」的模块（原地修改 impl）。
+def repair_missing_imports(
+    impl: dict | None,
+    semantic_audit: dict | None = None,
+    local_modules: set[str] | None = None,
+    local_symbols: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """机械补上「用了但没 import」的名字（原地修改 impl）。
+
+    支持两种形态：
+      · 模块级 ``import sys`` —— 未定义名本身是可导入模块；
+      · 符号级 ``from cli import add`` —— 未定义名是**兄弟模块顶层定义的符号**。
+        符号→模块的归属来自：调用方传入的仓库存量 ``local_symbols``，以及本批 impl
+        里 add 全文 / modify+full_symbol 补丁的 AST 解析。
+
+    ``local_modules``：仓库里已存在 / 本批 impl 即将新建的兄弟模块名。这些模块在
+    ``find_spec`` 看来尚不可导入，但补 ``import <name>`` 仍然成立（见
+    :func:`_importable_module` 的真机说明）。
 
     真机教训（run snake-ds-plan 第 1 轮，2026-09-26）：pyright 连报三轮
     ``main.py:17 未定义 "random"`` / ``ui.py:28 未定义 "sys"``，流水线按
     「带问题重问 dev」处理了 3 次（约 184 秒），**一次都没修掉** —— 模型每次
     重写整份文件，惟独没加上那行 import。
 
-    性质与「anchor 抄缩写」完全一样（见 :func:`repair_anchors`）：pyright 已经
-    **精确指出**是哪个文件、哪个名字，而补一行 import 是确定性操作，没有任何
-    需要模型判断的地方。让模型重试是纯浪费，而且重问传的还是上一版正文，越问越偏。
+    符号级缺口（run 20260928-200631 第 5 轮）：main.py 用了 cli.py 定义的
+    add/remove，verify 静态检查明说「cli.py 定义了它，几乎肯定漏 import」，
+    但旧版只认「未定义名=模块名」，于是机械补全只连补 ``import sys``，
+    add/remove 五轮 NameError。
 
     安全闸门（全过才动，任何一条不满足就原样返回）：
       1. 只认 pyright 的 ``reportUndefinedVariable`` —— 用的是**它的判定**，不是猜的；
-      2. 那个名字必须**确实是可导入的模块**（标准库 / builtin / 已安装），
-         这样补的 import 一定成立，不会把不存在的包引进来（``Cell`` 这类
-         项目内部符号不在此列，交给跨模块检查去管）；
+      2. 那个名字要么**确实是可导入的模块**，要么是兄弟模块（仓库/本批）顶层定义的
+         符号，且 owner 不是当前文件自己 —— 补的 import 一定成立；
       3. 只处理 ``change_type == "add"`` 且 patch 是**整份正文**（非 diff）——
          只有拿到全文才能安全地在头部插入；
       4. 该文件里**还没有**这个 import（幂等，重复调用不会重复插）。
@@ -906,27 +1022,70 @@ def repair_missing_imports(impl: dict | None, semantic_audit: dict | None = None
     report: dict[str, Any] = {"repaired": 0, "detail": []}
     if not impl or not semantic_audit:
         return report
-    wanted: dict[str, set[str]] = {}
+    # 本批 impl 里以 add 形式新建的 .py 文件，它们的模块名一定可导入（兄弟文件）。
+    batch_modules = {
+        Path(str(e.get("path") or "")).stem
+        for e in (impl.get("edits") or [])
+        if isinstance(e, dict)
+        and str(e.get("change_type") or "") == "add"
+        and str(e.get("path") or "").endswith(".py")
+    }
+    importable_as = (local_modules or set()) | batch_modules
+    # 符号 → owner 模块。仓库存量优先；同批补丁（add 全文 / modify+full_symbol 整块）
+    # 用 setdefault 补位 —— 同一符号在存量里已有定义时不被同批声明抢走归属。
+    symbol_owner: dict[str, str] = dict(local_symbols or {})
+
+    def _index(source: str, stem: str) -> None:
+        for sym in top_level_defs(source):
+            symbol_owner.setdefault(sym, stem)
+
+    for e in (impl.get("edits") or []):
+        if not isinstance(e, dict) or not str(e.get("path") or "").endswith(".py"):
+            continue
+        stem = Path(str(e.get("path") or "")).stem
+        patch_text = str(e.get("patch") or "")
+        if not patch_text.strip() or DIFF_RE.search(patch_text):
+            continue
+        if str(e.get("change_type") or "") == "add":
+            _index(_new_file_body(patch_text), stem)
+        elif (
+            str(e.get("change_type") or "") == "modify"
+            and str(e.get("patch_mode") or "") == "full_symbol"
+        ):
+            _index(textwrap.dedent(patch_text), stem)
+
+    # path -> 模块名集合（插 import x）；path -> {owner 模块: 符号集合}（插 from x import y）
+    wanted_modules: dict[str, set[str]] = {}
+    wanted_symbols: dict[str, dict[str, set[str]]] = {}
     for diag in semantic_audit.get("diagnostics") or []:
         if not isinstance(diag, dict):
             continue
         if str(diag.get("rule") or "") != "reportUndefinedVariable":
             continue
-        match = re.search(r"未定义[“\"']?([\w.]+)[”\"']?", str(diag.get("message") or ""))
-        if not match:
+        name = _undefined_name(str(diag.get("message") or ""))
+        if not name:
             continue
-        name = match.group(1).split(".")[0]
         path = str(diag.get("file") or "").replace("\\", "/").strip()
         if not name or not path or Path(path).suffix.lower() != ".py":
             continue
-        if not _importable_module(name):
+        if _importable_module(name, importable_as):
+            wanted_modules.setdefault(path, set()).add(name)
             continue
-        wanted.setdefault(path, set()).add(name)
-    if not wanted:
+        owner = symbol_owner.get(name)
+        # owner 必须真是个兄弟模块（防止按同批补丁里解析出的残缺归属瞎 import），
+        # 且不能是文件自己（本文件内的定义缺失不是 import 能解决的）。
+        if owner and owner != Path(path).stem and owner in importable_as:
+            wanted_symbols.setdefault(path, {}).setdefault(owner, set()).add(name)
+    if not wanted_modules and not wanted_symbols:
         return report
 
     def _key(p: str) -> str:
         return str(p or "").replace("\\", "/").strip()
+
+    def _same_file(k: str, path: str) -> bool:
+        # pyright 的 file 字段有时是沙箱绝对路径（/work/main.py）、有时是相对路径，
+        # 同一文件会落成两个键 —— 必须把匹配上的键**全部**聚合，不能 next 取第一个。
+        return k == path or k.endswith("/" + path) or path.endswith("/" + k)
 
     for edit in impl.get("edits") or []:
         if not isinstance(edit, dict):
@@ -934,25 +1093,37 @@ def repair_missing_imports(impl: dict | None, semantic_audit: dict | None = None
         path = _key(edit.get("path"))
         if not path or str(edit.get("change_type") or "") != "add":
             continue
-        names = next(
-            (v for k, v in wanted.items()
-             if k == path or k.endswith("/" + path) or path.endswith("/" + k)),
-            None,
-        )
-        if not names:
+        mod_names: set[str] = set()
+        sym_map: dict[str, set[str]] = {}
+        for k, v in wanted_modules.items():
+            if _same_file(k, path):
+                mod_names |= v
+        for k, v in wanted_symbols.items():
+            if _same_file(k, path):
+                for owner, names in v.items():
+                    sym_map.setdefault(owner, set()).update(names)
+        if not mod_names and not sym_map:
             continue
         patch_text = str(edit.get("patch") or "")
         if not patch_text.strip() or DIFF_RE.search(patch_text):
             continue  # diff 形态拿不到全文，不碰
         body = _new_file_body(patch_text)
-        for name in sorted(names):
+        repaired_before = report["repaired"]
+        for name in sorted(mod_names or set()):
             if re.search(rf"^\s*(import\s+{re.escape(name)}\b|from\s+{re.escape(name)}\b)",
                          body, re.M):
                 continue  # 已经有这个 import
             body = _insert_import(body, name)
             report["repaired"] += 1
             report["detail"].append(f"{path}: import {name}")
-        if report["detail"]:
+        for owner in sorted(sym_map or {}):
+            for name in sorted(sym_map[owner]):
+                if _imports_name(body, owner, name):
+                    continue  # 已经从该模块 import 过这个符号
+                body = _insert_import(body, name, owner)
+                report["repaired"] += 1
+                report["detail"].append(f"{path}: from {owner} import {name}")
+        if report["repaired"] > repaired_before:
             edit["patch"] = body
     return report
 

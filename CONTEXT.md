@@ -801,6 +801,15 @@ dev 给的是 **5 条小补丁（161~409 字符）**，全部 `insert_after` 挂
   - 这样各阶段的人工调整（改产物）与裁决结果（intake/pm 的 `final_decision` + `confirmed_facts`）都会体现在 PRD 这份完整输出文件里。
 - **测试**：mock +3（已裁决作确定结论下发、未裁决仍带默认假设、两区呈现）；console +10（按 question 合并、去掉默认前缀、confirmed_facts、final_decision 落盘、PRD 保存/读回/空值拒绝/标记存在/重新生成清标记）。**mock 195 / console 81 全绿**。
 
+### 16.10.2 未决问题准入：折叠重复 + 技术类剔除（真机 20260928-172150）
+
+反馈：裁决页同一批问题出现 3 遍，且混着「数据库表结构」「浮点数精度处理」等业务方回答不了的技术问题。根因：提示词曾**强制** unknowns / clarifying_questions 与 open_questions「一一对应」，三列又被闸门分别计数、分别裁决。
+
+- **两层防御**：提示词（二开/新建两版 PM 段）改为「只准业务方拍板的问题；技术实现类禁问；两列只填未覆盖点、允许空数组」；确定性归一兜底在 `prompts.py:668 normalize_pm_questions`（open_questions 行内去重、技术词表 `PM_TECHNICAL_HINTS` 剔除、两列对 open_questions 折叠）。
+- **三个接入点同口径**：`_stage_pm` 落库前（主入口，带日志留痕）、`pm_unresolved_items` 判据读取时（兜旧 run 与 gateway 作业层）、console.html `renderPmQuestions` 内 JS 版（旧 run 页面也干净，页面顶部显示折叠/忽略条数）。
+- **判重算法**：归一（小写/剥疑问前缀/去标点）后 全等→子串→字符级 LCS 占比 ≥0.75（`_pm_q_similar`，阈值刻意高：「金额格式校验/金额上限校验」LCS 0.67 是两个业务问题，不能折叠；词序交错改写宁可漏判）。**Python 词表/阈值与 JS 各一份，改时两处同步**。
+- 真机 172150 实测：18 条 → 7（业务 4 问 + 3 条字面不相似改写残余）；断言在 smoke_prompts 第 6 段。
+
 ### 16.11 续跑闸门的「原始输入」展示（锁定但可读）
 
 反馈：续跑区的人工闸门在运行中/已结束时被锁定（disabled）是对的，但**看不出当初勾了什么**。
@@ -1370,28 +1379,36 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 - 续跑/打回：`POST /api/runs/20260924-185507/resume`（body 可选 `from`/`feedback`/`max_rework`/`pause_after`），
   或直接命令行 `cd D:\AI\line && python -m pipeline.cli --resume 20260924-185507`。
 - 关键位置（**2026-09-27 已核对；行号会漂移，优先按符号名找**）：
-  评审提示词 `prompts.py:2407 parts_review`；fix 列表拼装 `orchestrator.py:4901 self.fixes = fixes`；
+  评审提示词 `prompts.py:2814 parts_review`；fix 列表拼装 `orchestrator.py:5839 self.fixes = fixes`；
   运行态相位 `console.html:842 runPhase`、续跑按钮 `console.html:1262 btn-resume`；
-  入口探测 `verify.py:502 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
-  跨文件契约比对 `verify.py:1020 contract_check`；跨轮合并 `orchestrator.py:1805 _merge_impl_across_rounds`；
-  缺陷单 `tasktype.py:204 bug_report_from_state`；施工图字段强制 `orchestrator.py:1435 _plan_contract_gaps`；
-  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:3347 _task_drawing_is_thin`；
-  确定性拆任务 `taskcompiler.py:49 compile_tasks` / `taskcompiler.py:200 plan_needs_compile`；
-  **编译层**：Plan IR 归一 `planir.py:186 normalize_plan`、最长匹配 `planir.py:108 drop_parent_symbols`、
-  相对名剥离 `planir.py:138 _relative_name`、编译器指纹 `planir.py:449 fingerprint`；
+  入口探测 `verify.py:520 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
+  跨文件契约比对 `verify.py:1101 contract_check`；跨轮合并 `orchestrator.py:2224 _merge_impl_across_rounds`；
+  缺陷单 `tasktype.py:367 bug_report_from_state`；施工图字段强制 `orchestrator.py:1846 _plan_contract_gaps`；
+  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:3910 _task_drawing_is_thin`；
+  确定性拆任务 `taskcompiler.py:49 compile_plan`（容量错误通道；施工图包装 `taskcompiler.py:71 compile_tasks`；
+  执行 DAG 装配/环校验 `taskcompiler.py:220 _assemble_dependency_dag`）/ 编译审计 `taskcompiler.py:440 plan_needs_compile`；
+  **编译层**：Plan IR 归一 `planir.py:274 normalize_plan`、二开现存 import 边 `planir.py:152 existing_import_edges`、
+  最长匹配 `planir.py:108 drop_parent_symbols`、
+  相对名剥离 `planir.py:226 _relative_name`、编译器指纹 `planir.py:558 fingerprint`；
   符号解析 `symbols.py:239 resolve`、调用写法归一 `symbols.py:199 clean_symbol`、
   文件限定切分 `symbols.py:224 _split_file_hint`、索引 `symbols.py:112 build_index`、
-  摘要解析 `symbols.py:63 digest_symbols`；单张施工图 `prompts.py:1736 task_focus_block`；
-  定位失败补丁裁剪 `patches.py:1092 prune_unappliable`；符号逐字原文 `patches.py:816 symbol_excerpt`；
-  **修复项与归因** `tasktype.py:383 defect_items`（方案漏项判据 `tasktype.py:349 plan_gap_files`、
-  逐项验收 `tasktype.py:537 defect_verdicts`、分组视图 `tasktype.py:622 by_task_attribution`、
-  渲染 `tasktype.py:696 format_bug_report`、路径收敛 `tasktype.py:319 _match_known`、
-  缺陷单入口 `tasktype.py:204 bug_report_from_state`）；
-  当前代码取源 `orchestrator.py:1984 _current_candidates`（按文件 `orchestrator.py:2025 _current_sources`）；
-  方案漏项回流 `orchestrator.py:3953 _plan_uncovered_defects`；
+  摘要解析 `symbols.py:63 digest_symbols`；单张施工图 `prompts.py:1942 task_focus_block`；
+  定位失败补丁裁剪 `patches.py:1263 prune_unappliable`；符号逐字原文 `patches.py:843 symbol_excerpt`；
+  **修复项与归因** `tasktype.py:648 defect_items`（方案漏项判据 `tasktype.py:614 plan_gap_files`、
+  逐项验收 `tasktype.py:856 defect_verdicts`、分组视图 `tasktype.py:966 by_task_attribution`、
+  渲染 `tasktype.py:1040 format_bug_report`、路径收敛 `tasktype.py:584 _match_known`、
+  缺陷单入口 `tasktype.py:367 bug_report_from_state`）；
+  **机械失败归因** `diagnose.py:264 classify`（补丁责任主体三分类 `diagnose.py:130 patch_owner_class`：
+  dev_patch / compiler_target / patch_runtime；内建 Recovery Policy：同缺陷+同证据连失 2 轮且
+  交付指纹无变化 → escalate_plan / escalate_human；阈值 `diagnose.py RECOVERY_STREAK_AFTER=2`）、
+  缺陷身份 v2 `diagnose.py:548 defect_key`（类型+check_id+文件+符号，line/what 仅证据）、
+  跨轮台账 `diagnose.py:582 ledger`（含 evidence_streak）；
+  当前代码取源 `orchestrator.py:2431 _current_candidates`（按文件 `orchestrator.py:2472 _current_sources`）；
+  方案漏项回流 `orchestrator.py:4607 _plan_uncovered_defects`；
+  判负补丁结构化投影 `orchestrator.py:4506 _patch_failures`（classify 三分类的输入）；
   **输出截断处理**：抬高上限一次数 `ollama_client.py:40 _MAX_ESCALATIONS`、
-  逐张调用组装 `orchestrator.py:3394 _dev_task_call`、
-  截断自动拆半 `orchestrator.py:3437 _dev_split_retry`。
+  逐张调用组装 `orchestrator.py:3964 _dev_task_call`、
+  截断自动拆半 `orchestrator.py:4007 _dev_split_retry`。
   复检脚本：`python tools/check_refs.py`（抽 CONTEXT.md 里所有 `文件:行号` 并比对当前代码；
   含"该行附近是否还有文档声称的符号名"这一层，能抓出"行号还在但内容已换"的漂移）。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。

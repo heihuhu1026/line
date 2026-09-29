@@ -130,6 +130,18 @@ def main() -> int:
     check("其他任务的文件一个都不要碰" in block, "明确禁止越界到别的任务")
     check(P.task_focus_block(None) == "" and P.task_focus_block({}) == "",
           "无施工图时不注入空块")
+    # uses 必须翻译成明确的 import 语句；入口文件强制守卫（真机 run 20260928-200631：
+    # 分图模式下 main.py 五轮不写 import / 不带 __main__ 守卫）
+    t_entry = {
+        "id": "T-01", "title": "接线入口", "target_files": ["main.py"],
+        "symbols": ["main"], "contracts": {"uses": ["cli.add", "cli.remove"]},
+    }
+    blk = P.task_focus_block(t_entry)
+    check("from cli import add, remove" in blk, "uses 翻成文件头必须写的 import 语句", blk[:200])
+    check("可执行入口文件" in blk and "__main__" in blk, "main.py 被强制要求入口守卫")
+    t_lib = {"id": "T-02", "title": "存储", "target_files": ["db.py"],
+             "contracts": {"uses": []}}
+    check("__main__" not in P.task_focus_block(t_lib), "非入口文件不要求守卫")
 
     print("== ⑦ 任务拓扑排序与返工只重做受影响任务 ==")
     o = Orchestrator.__new__(Orchestrator)
@@ -245,6 +257,25 @@ def main() -> int:
         r = V.contract_check(w, ["bad.py"], {"tasks": [
             {"id": "T-01", "target_files": ["bad.py"], "contracts": {"exposes": ["x"]}}]})
         check(isinstance(r["problems"], list), "文件语法坏掉时比对不崩")
+
+        # ⑦ exposes 带空括号 / interface 写成「实例方法调用形态」不许假报
+        # （真机 run 20260928-200631：exposes=["insert()"] 五轮恒定报"找不到定义"，
+        # "Database().insert(a, b)" 被截成 Database/2 参数，db.py 一直正确却每轮 8 条假缺陷）
+        wfile("db2.py", "class Database:\n"
+                        "    def insert(self, amount, note):\n"
+                        "        return 1\n")
+        plan_paren = {"tasks": [
+            {"id": "T-01", "target_files": ["db2.py"],
+             "contracts": {"exposes": ["Database", "insert()"]},
+             "interface": "Database().insert(amount: float, note: str) -> None"},
+        ]}
+        r = V.contract_check(w, ["db2.py"], plan_paren)
+        check(r["problems"] == [],
+              "exposes 剥空括号、构造调用形态取最后方法名（self 由比对侧扣除）", str(r["problems"]))
+        check(V._interface_of("Database().insert(amount: float, note: str) -> None")
+              == ("insert", ["amount: float", "note: str"]),
+              "接口解析：实例方法调用形态")
+        check(V._interface_of("main() -> int") == ("main", []), "接口解析：无参方法")
 
     print("== ⑩ dev 的输入：方案是唯一权威（不再喂需求原文与 PM 物料） ==")
     from pipeline import prompts as P
@@ -525,9 +556,18 @@ def main() -> int:
             per_file.setdefault(f, []).append(t["id"])
     check(all(len(v) == 1 for f, v in per_file.items() if f == "main.py"),
           "main.py 只由一张图负责")
-    # 线性依赖：后一张依赖前一张（保证跨文件接口先建后引用）
-    check(t1[0]["depends_on"] == [] and t1[1]["depends_on"] == [t1[0]["id"]],
-          "线性 depends_on", str([t["depends_on"] for t in t1]))
+    # **不再人为串成线**：没有真实依赖的跨文件施工图 depends_on 必须为空
+    # （旧实现无条件把每张图挂到前一张上，抵消了 DAG 的并行/裁剪价值）。
+    by_file = {t["target_files"][0]: t for t in t1}
+    check(by_file["ledger/db.py"]["depends_on"] == []
+          and parser_tasks[0]["depends_on"] == []
+          and by_file["main.py"]["depends_on"] == [],
+          "无声明/契约依赖 ⇒ depends_on 为空（不人为串联）",
+          str([(t["target_files"], t["depends_on"]) for t in t1]))
+    # 同文件多图保留顺序边：后者在前者的成果上继续（同一产物文件，顺序即依赖）
+    parser_ids = [t["id"] for t in parser_tasks]
+    check(parser_tasks[1]["depends_on"] == [parser_ids[0]],
+          "同文件两张图：第二张依赖第一张", str([t["depends_on"] for t in parser_tasks]))
 
     # 编译后应通过字段强制校验
     o4 = Orchestrator.__new__(Orchestrator)
@@ -570,8 +610,135 @@ def main() -> int:
             per_file[f] = per_file.get(f, 0) + 1
     check(all(v <= MAX_TASKS_PER_FILE for v in per_file.values()),
           f"编译结果：单文件图数 ≤ {MAX_TASKS_PER_FILE}", str(per_file))
-    check(len(compiled) <= MAX_TASKS_PER_FILE, "5 个符号 ⇒ 不超过 2 张图（切分大小被放宽）",
+    check(len(compiled) <= MAX_TASKS_PER_FILE, "5 个符号 ⇒ 4/1 两张，不超单文件上限",
           str(len(compiled)))
+
+    # 容量硬约束（旧 _split_groups 的真实 bug：9/10 个符号被切成 5 个一张）
+    over = {"changes": [{"path": "a.py",
+                         "symbols": ["f", "g", "h", "i", "j", "k", "l", "m", "n"]}]}
+    res = TC.compile_plan(over)
+    check(all(len(t["symbols"]) <= TC.MAX_SYMBOLS_PER_TASK for t in res["tasks"]),
+          "9 个符号 ⇒ **绝不**产出 5 个符号一张的图（单图硬上限）",
+          str([len(t["symbols"]) for t in res["tasks"]]))
+    cap_errors = [e for e in res["errors"] if e.get("code") == "task_capacity_exceeded"]
+    check(len(cap_errors) == 1 and cap_errors[0]["file"] == "a.py"
+          and cap_errors[0]["tasks_needed"] == 3,
+          "9 个符号需 3 张图 > 单文件上限 2 ⇒ 显式 task_capacity_exceeded（不靠放宽消化）",
+          str(res["errors"]))
+    res10 = TC.compile_plan(
+        {"changes": [{"path": "b.py", "symbols": [f"s{i}" for i in range(10)]}]}
+    )
+    check(all(len(t["symbols"]) <= 4 for t in res10["tasks"])
+          and any(e.get("code") == "task_capacity_exceeded" for e in res10["errors"]),
+          "10 个符号同样硬切 4/4/2 + 容量错误",
+          str([len(t["symbols"]) for t in res10["tasks"]]))
+
+    print("== ⑲ 执行 DAG：真实依赖边（contract/import）+ 三项机械校验 ==")
+    from pipeline import planir as IR
+    # 契约 uses 跨文件 ⇒ 文件级边；声明顺序相反时 Kahn 仍把被依赖方排前面
+    dag_plan = {"changes": [
+        {"path": "cli.py", "symbols": ["run"]},
+        {"path": "db.py", "symbols": ["insert"]},
+    ], "tasks": [
+        {"id": "T-01", "target_files": ["cli.py"], "symbols": ["run"],
+         "contracts": {"uses": ["db.insert"], "exposes": []}},
+        {"id": "T-02", "target_files": ["db.py"], "symbols": ["insert"],
+         "contracts": {"uses": [], "exposes": []}},
+    ]}
+    dag_ir = IR.normalize_plan(dag_plan)
+    dag_res = TC.compile_plan(dag_plan, ir=dag_ir)
+    dag_order = [(t["target_files"][0], t["depends_on"]) for t in dag_res["tasks"]]
+    check(dag_res["tasks"][0]["target_files"] == ["db.py"]
+          and dag_res["tasks"][1]["depends_on"] == [dag_res["tasks"][0]["id"]],
+          "contracts.uses 建文件级边 + Kahn 拓扑序（db 先于 cli）", str(dag_order))
+    check(dag_res["errors"] == [], "合法 DAG 无编译错误", str(dag_res["errors"]))
+    # 二开现存 import 图：不写契约也能从 AST 机械推出边（含传递序 main→cli→db）
+    import_edges = IR.existing_import_edges(
+        ["db.py", "cli.py", "main.py"],
+        {"db.py": "import os\n", "cli.py": "import db\n", "main.py": "from cli import run\n"},
+    )
+    check(import_edges == {"cli.py": ["db.py"], "main.py": ["cli.py"]},
+          "AST 提取现存 import 边（stdlib/方案外不建边）", str(import_edges))
+    imp_plan = {"changes": [
+        {"path": "main.py", "symbols": ["main"]},
+        {"path": "cli.py", "symbols": ["run"]},
+        {"path": "db.py", "symbols": ["insert"]},
+    ]}
+    imp_ir = IR.normalize_plan(imp_plan, file_imports=import_edges)
+    imp_res = TC.compile_plan(imp_plan, ir=imp_ir)
+    check([t["target_files"][0] for t in imp_res["tasks"]] == ["db.py", "cli.py", "main.py"],
+          "import 边驱动的传递拓扑序", str([(t["id"], t["target_files"]) for t in imp_res["tasks"]]))
+    # 未知依赖目标 ⇒ unknown_dependency（旧实现静默丢弃）
+    unk_ir = {"units": [
+        {"file": "a.py", "symbols": ["a"], "depends_on": ["T-99"],
+         "source_task_ids": ["T-01"], "stable_id": "a.py::a"},
+    ]}
+    unk = TC.compile_plan(None, ir=unk_ir)
+    unk_err = [e for e in unk["errors"] if e["code"] == "unknown_dependency"]
+    check(len(unk_err) == 1 and unk_err[0]["dep"] == "T-99"
+          and "a.py" in unk_err[0]["declared_by"],
+          "依赖不存在的任务 id ⇒ unknown_dependency 且点名声明方", str(unk["errors"]))
+    # 自依赖（draft 显式声明自己）⇒ self_dependency
+    self_ir = {"units": [
+        {"file": "a.py", "symbols": ["a"], "depends_on": ["T-01"], "self_depends": ["T-01"],
+         "source_task_ids": ["T-01"], "stable_id": "a.py::a"},
+    ]}
+    self_res = TC.compile_plan(None, ir=self_ir)
+    check([e["code"] for e in self_res["errors"]] == ["self_dependency"]
+          and all("T-01" not in t["depends_on"] for t in self_res["tasks"]),
+          "自依赖 ⇒ self_dependency，且不造出幻影边", str(self_res["errors"]))
+    # 合并副产物（T-02/T-03 同文件、T-03 声明依赖 T-02）**不是**自依赖错误，静默滤掉
+    merge_plan = {"changes": [{"path": "a.py", "symbols": ["x", "y", "z", "q", "r"]}],
+                  "tasks": [
+        {"id": "T-02", "target_files": ["a.py"], "symbols": ["x", "y"]},
+        {"id": "T-03", "target_files": ["a.py"], "symbols": ["z", "q", "r"],
+         "depends_on": ["T-02"]},
+    ]}
+    merge_ir = IR.normalize_plan(merge_plan)
+    merge_res = TC.compile_plan(merge_plan, ir=merge_ir)
+    check(not [e for e in merge_res["errors"] if e["code"] == "self_dependency"],
+          "同文件合并导致的机械自引用 ⇒ 不报 self_dependency", str(merge_res["errors"]))
+    # 环 ⇒ dependency_cycle，且给出一条具体环（不只给节点集合）
+    cyc_ir = {"units": [
+        {"file": "a.py", "symbols": ["a"], "depends_on": ["T-02"],
+         "source_task_ids": ["T-01"], "stable_id": "a.py::a"},
+        {"file": "b.py", "symbols": ["b"], "depends_on": ["T-03"],
+         "source_task_ids": ["T-02"], "stable_id": "b.py::b"},
+        {"file": "c.py", "symbols": ["c"], "depends_on": ["T-01"],
+         "source_task_ids": ["T-03"], "stable_id": "c.py::c"},
+    ]}
+    cyc = TC.compile_plan(None, ir=cyc_ir)
+    cyc_err = [e for e in cyc["errors"] if e["code"] == "dependency_cycle"]
+    check(len(cyc_err) == 1 and len(cyc_err[0].get("cycle") or []) >= 3
+          and cyc_err[0]["cycle"][0] == cyc_err[0]["cycle"][-1],
+          "三环 ⇒ dependency_cycle 且 cycle 为首尾闭合的具体路径", str(cyc_err))
+    check(len(cyc["tasks"]) == 3, "环上施工图仍照常切出（阻断由 Design Gate 决定，不偷丢图）")
+    # 真机 20260928-160609：只报环路径模型无法打断 —— 每条边要带来源、可操作指引与原图编号对照
+    ce = cyc_err[0]
+    _edges = ce.get("cycle_edges") or []
+    check(len(_edges) >= 2 and all(e.get("sources") for e in _edges),
+          "环错误逐边标注来源（cycle_edges 非空且每条边有 sources）", str(_edges))
+    check(any("方案声明" in s for e in _edges for s in e["sources"]),
+          "draft 边标注为「方案声明（…depends_on…）」", str(_edges))
+    check("depends_on" in ce["detail"] and "打断" in ce["detail"],
+          "环 detail 给出可操作的打断指引", ce["detail"][:200])
+    check(all(tid in ce.get("source_tasks", {}) for tid in ce["tasks"]),
+          "环上编译编号能对回模型原图任务 id（source_tasks）", str(ce.get("source_tasks")))
+    # 真机 160609 第三轮原形态：两文件互相声明依赖（+ uses 推出的文件级边，来源应都列出）
+    mut_ir = {"units": [
+        {"file": "commands.py", "symbols": ["CLI.add"], "depends_on": ["T-03"],
+         "depends_on_files": ["database.py"], "source_task_ids": ["T-02"],
+         "stable_id": "commands.py::CLI.add"},
+        {"file": "database.py", "symbols": ["Database.insert"], "depends_on": ["T-02"],
+         "source_task_ids": ["T-03"], "stable_id": "database.py::Database.insert"},
+    ]}
+    mut = TC.compile_plan(None, ir=mut_ir)
+    me = [e for e in mut["errors"] if e["code"] == "dependency_cycle"]
+    check(len(me) == 1 and "T-02" in str(me[0].get("cycle_edges"))
+          and any("跨文件引用推出" in s for e in me[0]["cycle_edges"] for s in e["sources"])
+          and any("方案声明" in s for e in me[0]["cycle_edges"] for s in e["sources"]),
+          "互依环：draft 边与 uses 文件级边分别标注（真机 160609 形态）",
+          json.dumps(me[0].get("cycle_edges"), ensure_ascii=False))
 
     print("== ⑳ 定位失败的补丁不进累积实现（真机 20260927-221511 的恒定判负） ==")
     # 真机链：dev 重问把 anchor 写成 `self.db.add_entry(amount, note)`，而实际代码是

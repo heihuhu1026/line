@@ -63,6 +63,11 @@ def round_kind_label(kind: Any) -> str:
 _FILE_PREFIX = re.compile(r"^\s*\[\s*文件\s*([^\]]+?)\s*\]")
 #: traceback 里的位置行：`File "…/cli.py", line 17`
 _TB_SITE = re.compile(r'File\s+"([^"]+)"\s*,\s*line\s+(\d+)')
+#: traceback 末尾的异常类（`ImportError: …` / `subprocess.CalledProcessError: …`），
+#: 取最后一条 —— 缺陷身份用它区分"导入错"与"断言错"（行号/措辞都只是证据）。
+_TB_EXC = re.compile(
+    r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))\s*:", re.M
+)
 #: `from X import …`（先挖掉，避免把被导入的符号当成模块名）
 _FROM_IMPORT = re.compile(r"\bfrom\s+([A-Za-z_][\w.]*)\s+import\b")
 #: 裸 `import a, b as c`：**逗号列表**也要逐个取（verify 的导入自检正是这种形式）
@@ -74,6 +79,146 @@ _RUN_PY = re.compile(r"\bpython[0-9.]*\s+([^\s\"']+\.py)")
 
 def _norm(path: Any) -> str:
     return str(path or "").replace("\\", "/").strip()
+
+
+#: 评审常把多个文件塞进一条返工项的 path（"cli.py,db.py,main.py"）。消费侧必须拆开 —
+#: 否则缺陷单 affected 里出现一个不存在的假路径，bugfix 的「只重做受影响施工图」分派
+#: 整体失效（真机 run 20260928-180933：三张施工图一张都没匹配上，退化成整批重写，
+#: 随后大上下文重写诱发 token-repeat 500）。
+_PATH_SPLIT_RE = re.compile(r"\s*[,，;；、]\s*")
+
+
+def _split_paths(text: Any) -> list[str]:
+    """把「[文件 a.py,b.py]」前缀捕获到的路径串拆成单个规范化路径（保序去重）。"""
+    out: list[str] = []
+    for part in _PATH_SPLIT_RE.split(str(text or "")):
+        p = _norm(part)
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+#: 评审返工项**散文**里的文件路径 token（`database.py` / `src/db.py`）。
+#: 要求带扩展名：裸模块名（`database`）歧义太大，不敢拿来归因。
+_PROSE_FILE_TOKEN = re.compile(
+    r"(?<![\w.\\/\-])(?:[A-Za-z0-9_\-]+/)*[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}(?![\w\\/\-])"
+)
+
+
+def _known_paths(plan: Any = None, src: dict[str, str] | None = None,
+                 verify: dict[str, Any] | None = None) -> list[str]:
+    """归因时**敢认**的文件全集：现有真实文件 + 方案 target_files + 沙箱物化清单。
+
+    只在这个集合里认路径 —— 散文里随便一个 `x.py` 不在其中就不猜（不猜是本模块纪律）。
+    """
+    out: list[str] = []
+
+    def _add(p: Any) -> None:
+        n = _norm(p)
+        if n and n not in out:
+            out.append(n)
+
+    for k in (src or {}):
+        _add(k)
+    for task in (_as_dict(plan).get("tasks") or []):
+        if isinstance(task, dict):
+            for p in (task.get("target_files") or []):
+                _add(p)
+    for p in ((verify or {}).get("materialized") or []):
+        _add(p)
+    return out
+
+
+def _prose_paths(text: Any, known: list[str]) -> list[str]:
+    """从评审返工项的**散文**里捞出已知文件（真机 20260928-221831：
+    「实现 database.py 中的 insert/select/delete 方法」没写 `[文件 X]` 前缀，
+    根因文件 database.py 因此整轮没进 affected、T-02 三轮没被派活）。
+
+    认法：完整相对路径直接认；只写 basename 时要求它在已知集合里**无歧义**
+    （两个不同目录都有同名文件就放弃，不猜）。
+    """
+    paths = sorted({_norm(p) for p in (known or []) if _norm(p)})
+    if not paths:
+        return []
+    known_set = set(paths)
+    by_base: dict[str, list[str]] = {}
+    for p in paths:
+        by_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    out: list[str] = []
+    for raw in _PROSE_FILE_TOKEN.findall(str(text or "")):
+        token = _norm(raw)
+        cand = token if token in known_set else ""
+        if not cand:
+            rows = by_base.get(token.rsplit("/", 1)[-1], [])
+            if len(rows) == 1:
+                cand = rows[0]
+        if cand and cand not in out:
+            out.append(cand)
+    return out
+
+
+#: 老版本 verify 只留了人读文本（``cli.py 里 `from database import delete`，但 database.py
+#: 并没有定义 delete``）。结构化明细缺失时用它兜底解析，别让旧 run 的证据归零。
+_CONTRACT_MISSING_RE = re.compile(
+    r"([\w./\\-]+\.py)\s*里\s*`from\s+([\w.]+)\s+import\s+(\w+)`\s*[，,]\s*但\s*"
+    r"([\w./\\-]+\.py)\s*并没有定义\s+(\w+)"
+)
+
+
+def _missing_symbol_details(verify: dict[str, Any]) -> list[dict]:
+    """``from X import Y 但 X 没定义 Y`` 的**结构化**证据（定义方文件为根因）。
+
+    优先读 verify 的 ``interface_audit.missing_symbol_details``；
+    老产物没有这个字段时从人读文本正则兜底。
+    """
+    audit = _as_dict((verify or {}).get("interface_audit"))
+    rows = [d for d in (audit.get("missing_symbol_details") or []) if isinstance(d, dict)]
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for d in rows:
+        importer, definer = _norm(d.get("importer")), _norm(d.get("definer"))
+        module, name = str(d.get("module") or "").strip(), str(d.get("name") or "").strip()
+        if not (importer and definer and module and name):
+            continue
+        key = (importer, definer, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "importer": importer, "module": module, "definer": definer, "name": name,
+                "line": int(d.get("line") or 0),
+            }
+        )
+    if out:
+        return out
+    for raw in audit.get("missing_symbols") or []:
+        m = _CONTRACT_MISSING_RE.search(str(raw or ""))
+        if not m:
+            continue
+        importer, module, name1, definer, name2 = m.groups()
+        key = (_norm(importer), _norm(definer), name2)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "importer": _norm(importer), "module": module.split(".")[0],
+                "definer": _norm(definer), "name": name2, "line": 0,
+            }
+        )
+    return out
+
+
+def _is_syntax_only_command(command: Any) -> bool:
+    """**只证明语法**的命令（py_compile/compileall）：通过不代表任何功能/导入缺陷转绿。
+
+    真机 20260928-221831：``py_compile cli.py database.py ...`` 退出码 0 被对账成
+    「cli.py 导入已修复」转绿 —— 语法检查对 ImportError 一条都证明不了。
+    """
+    text = str(command or "")
+    return ("py_compile" in text) or ("compileall" in text)
+
 
 
 def _short(text: Any, limit: int = 160) -> str:
@@ -97,6 +242,24 @@ def _cmd_text(text: Any, limit: int = 240) -> str:
         return out
     head = limit // 2
     return out[:head] + "\n…（中略）…\n" + out[-(limit - head):]
+
+
+#: ``python -c "整段脚本"`` 的内联脚本体（含跨行）。缺陷单里逐字贴整段脚本是
+#: bugfix prompt 逐轮膨胀的主要来源（真机 20260928-221831：单条近 400 字符，
+#: 复现/机械/日志三处重复出现）；展示时把脚本体压成占位，argv 保留。
+_INLINE_SCRIPT = re.compile(r'(-c\s+)"[\s\S]*?"')
+
+
+def _display_command(command: Any, limit: int = 120) -> str:
+    """缺陷单**展示用**命令：内联 ``-c`` 脚本压成占位（完整命令仍在 state / verify 里）。"""
+    text = str(command or "")
+    compact = _INLINE_SCRIPT.sub(r'\1"<内联自检脚本，完整输出见 verify>"', text)
+    if compact != text:
+        # 压掉脚本后多行也没意义了，直接压平
+        compact = " ".join(compact.split())
+    if len(compact) > limit:
+        compact = compact[: limit - 1] + "…"
+    return compact
 
 
 #: harness **自己造的**机械自检命令（导入检查 / 语法检查）。
@@ -221,7 +384,11 @@ def bug_report_from_state(
     problems = [_short(p, 200) for p in (verify.get("problems") or []) if str(p).strip()]
     missing = [_short(s, 80) for s in (test.get("missing_symbols") or []) if str(s).strip()]
 
-    # 受影响文件：① 返工项里的「[文件 X]」前缀（最可靠）；② 失败命令反推
+    # 受影响文件：
+    #   ① 静态契约证据：「from X import Y 但 X 没定义 Y」⇒ **定义方文件**（根因）必入内；
+    #   ② 返工项的「[文件 X]」前缀（最可靠）；
+    #   ③ 返工项**散文**里点名的已知文件（无前缀也认，见 _prose_paths 的真机依据）；
+    #   ④ 失败命令反推。
     affected: dict[str, set[str]] = {}
 
     def touch(path: str, symbol: str = "") -> None:
@@ -232,10 +399,18 @@ def bug_report_from_state(
         if symbol:
             affected[p].add(str(symbol))
 
+    known = _known_paths(plan, sources or None, verify)
+    contract_missing = _missing_symbol_details(verify)
+    for d in contract_missing:
+        # 根因在**定义方**：它漏定义/把符号错封进类里；导入方只是照契约引用，一并记下。
+        touch(d["definer"], d["name"])
+        touch(d["importer"], d["name"])
     for item in fixes or []:
-        m = _FILE_PREFIX.match(str(item or ""))
-        if m:
-            touch(m.group(1))
+        text = str(item or "")
+        m = _FILE_PREFIX.match(text)
+        paths = _split_paths(m.group(1)) if m else _prose_paths(text, known)
+        for p in paths:
+            touch(p)
     for cmd in failed:
         for p in _paths_from_command(str(cmd.get("command") or "")):
             touch(p)
@@ -314,6 +489,96 @@ def _tasks_to_files(plan: Any, tid: str) -> list[str]:
             if norm and norm not in out:
                 out.append(norm)
     return out
+
+
+def _module_stem(path: Any) -> str:
+    """``src/db.py`` → ``db``（取 basename 去扩展名；目录信息对 uses 匹配没用）。"""
+    base = _norm(path).rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if base.endswith(".py") else ""
+
+
+def import_hint_context(plan: Any, verify: dict[str, Any] | None = None) -> dict:
+    """给 dev「文件头必须写这些 import」清单做**合理性校对**用的上下文。
+
+    两个真机 20260928-221831 暴露的问题：
+      ① T-04（errors.py）的 contracts.uses 抄了 ``cli.add_entry/...``，而 T-03（cli.py）
+         反过来 uses errors —— g4 据此**强制**文件头互导，写出环形导入，运行即炸；
+      ② verify 已报 ``database.py 没定义 delete``，清单仍强制 cli.py 文件头写这行 import，
+         两条指令在同一份 prompt 里打架，模型只能靠加别名迷信式修复。
+
+    返回：
+      · ``cyclic_modules``：``{task_id: [该 task uses 且会成环的模块名]}`` ——
+        这些 import 不能写成"文件头必须"；
+      · ``missing_pairs``：``[(module, name), ...]`` —— verify 已报当前缺失的导入契约。
+    """
+    tasks = [t for t in (_as_dict(plan).get("tasks") or []) if isinstance(t, dict)]
+    owners: dict[str, list[str]] = {}
+    own_mods: dict[str, set[str]] = {}
+    uses_mods: dict[str, list[str]] = {}
+    for t in tasks:
+        tid = str(t.get("id") or "").strip()
+        if not tid:
+            continue
+        mods = {m for m in (_module_stem(p) for p in (t.get("target_files") or [])) if m}
+        own_mods[tid] = mods
+        for m in mods:
+            owners.setdefault(m, [])
+            if tid not in owners[m]:
+                owners[m].append(tid)
+        contracts = t.get("contracts") if isinstance(t.get("contracts"), dict) else {}
+        used: list[str] = []
+        for raw in contracts.get("uses") or []:
+            top = str(raw or "").split(".", 1)[0].strip()
+            if top and top.isidentifier() and top not in used:
+                used.append(top)
+        uses_mods[tid] = used
+
+    # 任务级依赖图：tid -> 它 uses 的模块所属任务（排除自依赖；自依赖在渲染侧直接删）
+    deps: dict[str, set[str]] = {tid: set() for tid in own_mods}
+    for tid, used in uses_mods.items():
+        for m in used:
+            if m in own_mods.get(tid, set()):
+                continue
+            for owner in owners.get(m, []):
+                if owner != tid:
+                    deps[tid].add(owner)
+    # 反图 BFS：能到达 t 的任务集合 = t 的祖先；t uses 的模块若被任一祖先拥有，
+    # 这条依赖就处在一个环上（任意长度的环都能抓到，不只 2-环）。
+    reverse: dict[str, set[str]] = {tid: set() for tid in own_mods}
+    for tid, ds in deps.items():
+        for s in ds:
+            reverse[s].add(tid)
+    cyclic: dict[str, list[str]] = {}
+    for tid in own_mods:
+        seen: set[str] = set()
+        stack = list(reverse.get(tid, ()))
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(reverse.get(cur, ()) - seen)
+        seen.discard(tid)
+        cyc = [m for m in uses_mods.get(tid, []) if set(owners.get(m, [])) & seen]
+        if cyc:
+            cyclic[tid] = cyc
+
+    self_use: dict[str, list[str]] = {}
+    for tid, used in uses_mods.items():
+        bad = [m for m in used if m in own_mods.get(tid, set())]
+        if bad:
+            self_use[tid] = bad
+
+    missing_pairs = [
+        (str(d.get("module")), str(d.get("name")))
+        for d in _missing_symbol_details(_as_dict(verify))
+        if d.get("module") and d.get("name")
+    ]
+    return {
+        "cyclic_modules": cyclic,
+        "self_uses": self_use,
+        "missing_pairs": missing_pairs,
+    }
 
 
 def _match_known(raw: str, known: list[str]) -> str:
@@ -398,8 +663,9 @@ def defect_items(
     来源（全部机械）：
       ① 补丁审计的非 ok 行（自带 path / symbol / status / notes / tasks）；
       ② verify 失败命令的 traceback（`File "…", line N` → 文件:行 → 取那几行原文）；
-      ③ 评审返工项的「[文件 X]」前缀；
-      ④ `implementation_audit.missing`（整张施工图一条补丁都没有）。
+      ③ 评审返工项的「[文件 X]」前缀（无前缀时从散文点名的已知文件兜底）；
+      ④ `implementation_audit.missing`（整张施工图一条补丁都没有）；
+      ⑤ verify 静态契约：「from X import Y 但 X 没定义 Y」⇒ 缺陷挂在**定义方**文件。
     """
     from . import patches as patches_mod  # 局部导入，避免环
 
@@ -409,6 +675,7 @@ def defect_items(
     impl_audit = _as_dict(state.get("implementation_audit"))
     verify = _as_dict(state.get("verify_report"))
     known = sorted(src)
+    known_all = _known_paths(plan, src, verify)
     items: list[dict] = []
     seen: set[tuple] = set()
 
@@ -462,6 +729,9 @@ def defect_items(
                 "what": f"{detail}：{symbol or row.get('path')}" + (f"（{note}）" if note else ""),
                 "check": f"这条补丁要能被套用（不再出现「{detail}」）",
                 "source": "patch_audit",
+                # 缺陷身份 v2：补丁状态码是类型（anchor_not_found / symbol_not_found…），
+                # 措辞与行号只是证据
+                "kind": f"patch:{status}",
                 "_tasks": row.get("tasks") or [],
             }
         )
@@ -471,6 +741,10 @@ def defect_items(
             continue
         output = str(cmd.get("output") or cmd.get("error") or "")
         command = _short(cmd.get("command"), 120)
+        # 异常类取 traceback 最后一条，剥掉模块前缀（subprocess.CalledProcessError →
+        # CalledProcessError）；抓不到就 unknown —— 命令+文件仍是身份，类型只是细分。
+        excs = _TB_EXC.findall(output)
+        exc = excs[-1].rsplit(".", 1)[-1] if excs else ""
         for raw, line in _TB_SITE.findall(output):
             path = _match_known(raw, known)
             if not path:
@@ -484,6 +758,8 @@ def defect_items(
                     # 存**完整**命令：逐项核对靠它精确匹配（展示用的是短版）
                     "command": str(cmd.get("command") or ""),
                     "source": "traceback",
+                    "kind": f"traceback:{exc or 'unknown'}",
+                    "exc": exc,
                 }
             )
         if not _TB_SITE.search(output):
@@ -495,25 +771,36 @@ def defect_items(
                         "check": f"命令 `{command}` 退出码 0",
                         "command": str(cmd.get("command") or ""),
                         "source": "verify",
+                        "kind": "verify",
                     }
                 )
-    # ③ 评审返工项
+    # ③ 评审返工项（path 可能是逗号串：一条返工项点多个文件 → 每个文件一条缺陷项）。
+    # 没写「[文件 X]」前缀时，用**散文点名的已知文件**兜底（真机 20260928-221831：
+    # 「实现 database.py 中的 insert/select/delete 方法」无前缀，根因文件整个丢失）。
     for item in fixes or []:
-        m = _FILE_PREFIX.match(str(item or ""))
-        if not m:
+        text = str(item or "")
+        m = _FILE_PREFIX.match(text)
+        if m:
+            paths = _split_paths(m.group(1))
+            # 去掉「[文件 X]」前缀：位置已经由 path 决定，前缀只会重复一遍
+            bare = _short(_FILE_PREFIX.sub("", text).strip(), 140)
+        else:
+            paths = _prose_paths(text, known_all)
+            bare = _short(text.strip(), 140)
+        if not paths:
             continue
-        # 去掉「[文件 X]」前缀：位置已经由 path 决定，前缀只会重复一遍
-        bare = _short(_FILE_PREFIX.sub("", str(item or "")).strip(), 140)
-        # 有些返工项本身就以"评审要求"开头 —— 别叠成"评审要求：评审要求…"
+        # 有些返工项本身就以"评审"开头 —— 别叠成"评审要求：评审要求…"
         head = "" if bare.startswith(("评审", "机制")) else "评审要求："
-        add(
-            {
-                "path": m.group(1),
-                "what": f"{head}{bare}",
-                "check": "评审点到的这个问题必须消失",
-                "source": "review",
-            }
-        )
+        for path in paths:
+            add(
+                {
+                    "path": path,
+                    "what": f"{head}{bare}",
+                    "check": "评审点到的这个问题必须消失",
+                    "source": "review",
+                    "kind": "review",
+                }
+            )
     # ④ 整张施工图没做
     for tid in impl_audit.get("missing") or []:
         for path in _tasks_to_files(plan, str(tid)):
@@ -523,9 +810,41 @@ def defect_items(
                     "what": "本轮**没有任何补丁**覆盖这张图（等于这张图没做）",
                     "check": "这张图覆盖的符号都要被定义出来",
                     "source": "coverage",
+                    "kind": "coverage",
                     "_tasks": [str(tid)],
                 }
             )
+    # ⑤ 静态契约：「from X import Y，但 X 没定义 Y」。
+    # 缺陷必须挂在**定义方**文件（X.py）而不是导入方 —— 真机 20260928-221831 里
+    # 评审挂到了 cli.py（导入方），真正漏定义的 database.py 三轮没被派活，形成死局。
+    # 有导入自检命令时把它带上：它转绿才是这条契约真正的验收依据。
+    import_check_cmd = ""
+    for cmd in verify.get("commands") or []:
+        if not isinstance(cmd, dict):
+            continue
+        cmd_text = str(cmd.get("command") or "")
+        if "IMPORT_CHECK" in cmd_text and "import_module" in cmd_text:
+            import_check_cmd = cmd_text
+            break
+    for d in _missing_symbol_details(verify):
+        add(
+            {
+                "path": d["definer"],
+                "symbol": d["name"],
+                # 故意不给 line：行号属于导入方文件，拿去定义方文件里取逐字原文会对错行；
+                # 符号级 excerpt 才能把"被错封成类方法"的现状摘出来。
+                "what": (
+                    f"跨文件接口缺失：{d['importer']} 按契约写了 "
+                    f"`from {d['module']} import {d['name']}`，但本文件模块级没有定义 "
+                    f"`{d['name']}`（常见错法：把它封进了类/函数里，调用方导不到）。"
+                    "在模块级补出这个符号，**不要**让导入方改名或加别名。"
+                ),
+                "check": f"`from {d['module']} import {d['name']}` 能成功导入",
+                "command": import_check_cmd,
+                "source": "contract",
+                "kind": "contract:missing_symbol",
+            }
+        )
     return items
 
 
@@ -560,10 +879,35 @@ def defect_verdicts(
         command = str(item.get("command") or "")
         key = _cmd_key(command)
         matched = [by_cmd[key]] if key and key in by_cmd else []
+        if not matched and str(item.get("kind") or "") == "contract:missing_symbol":
+            # 契约项专用兜底：导入自检的 argv 是**模块名**（`... cli database errors main`），
+            # 不含 "database.py"，按路径匹配一条都碰不到；按模块名整词匹配。
+            module = ""
+            for d in _missing_symbol_details(verify):
+                if d["definer"] == _norm(item.get("path")) and d["name"] == str(item.get("symbol") or ""):
+                    module = d["module"]
+                    break
+            if module:
+                token = re.compile(rf"(?<![\w.]){re.escape(module)}(?![\w.])")
+                matched = [
+                    c
+                    for c in cmds
+                    if "import_module" in str(c.get("command") or "")
+                    and token.search(str(c.get("command") or ""))
+                ]
         if not matched:
-            # 兜底：哪条命令**碰得到**这个文件（命令由测试阶段重新生成时，字符串对不上）
+            # 兜底：哪条命令**碰得到**这个文件（命令由测试阶段重新生成时，字符串对不上）。
+            # 但要剔除**只证明语法**的 py_compile/compileall：它对每个文件都"碰得到"，
+            # 通过却证明不了任何导入/运行类缺陷（真机 20260928-221831：py_compile ok
+            # 被对账成「cli.py 导入已修复」假转绿，真·导入自检与运行命令当时全 fail）。
             path = str(item.get("path") or "")
-            matched = [c for c in cmds if path and path in str(c.get("command") or "")]
+            matched = [
+                c
+                for c in cmds
+                if path
+                and path in str(c.get("command") or "")
+                and not _is_syntax_only_command(c.get("command"))
+            ]
         if not matched:
             status, detail = "unverifiable", "没有任何命令能核对这一项（未测量，不假装通过）"
         else:
@@ -709,18 +1053,22 @@ def format_bug_report(report: dict) -> str:
     if r.get("repro_steps"):
         lines.append("- 复现（真实执行失败的命令）：")
         for cmd in r["repro_steps"][:5]:
-            lines.append(f"    · {cmd}")
+            lines.append(f"    · {_display_command(cmd)}")
     if r.get("mechanical_checks"):
         # 机械自检单独列，并**明说它不是要你修的东西** —— 否则模型会去"修命令"。
         lines.append("- 机械自检失败（**harness 自己跑的命令，别改它本身**，看它报的错）：")
         for cmd in r["mechanical_checks"][:3]:
-            lines.append(f"    · {cmd}")
+            lines.append(f"    · {_display_command(cmd)}")
     if r.get("expected") and r.get("actual"):
         lines.append(f"- 期望/实际：{r['expected']} / {r['actual']}")
     if r.get("logs"):
-        lines.append("- 日志与判负理由：")
-        for log in r["logs"][:5]:
-            lines.append(f"    · {log}")
+        # 「失败：`<整条命令>`」这类条目与上面的复现/机械清单重复（且常把整段
+        # -c 脚本再贴一遍），跳过；只留接口不一致 / 空跑 / 判负理由这些**增量信息**。
+        logs = [x for x in r["logs"] if not str(x).startswith("失败：")][:5]
+        if logs:
+            lines.append("- 日志与判负理由：")
+            for log in logs:
+                lines.append(f"    · {log}")
     items = [x for x in (r.get("items") or []) if isinstance(x, dict)]
     if items:
         # **修复项**：这一段是返工描述的主体。每条都给"在哪儿、什么问题、**那处现在逐字

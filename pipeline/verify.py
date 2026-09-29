@@ -471,10 +471,28 @@ def plan_commands(
         for c in (test_report or {}).get("automated_commands") or []
         if isinstance(c, dict) and str(c.get("command") or "").strip()
     ]
-    for command in declared:
+    # **带参真跑入口**的 planned 命令要排最前（稳定排序，同档内保持模型原序）。
+    # 真机 run 20260928-200631：test 给了 8~9 条命令，机械自检 + 裸 probe 占掉 3 槽后，
+    # 前两个 planned 槽被 `python -c "import db; db.Database()...."` 这类窄命令占满，
+    # 真正验证 CLI 行为的 `python main.py add/list/remove` 一轮都没轮上 —— 假绿/行为盲飞。
+    entry_names = {Path(str(n)).name for n in entry_targets(work, written)}
+
+    def _runs_named_entry(command: str) -> bool:
+        rel = _python_script_arg(command)
+        if rel and Path(str(rel).replace("\\", "/")).name in entry_names:
+            return True
+        # `-m pkg` 等形态的兜底；明确排除 `python -c "import main"` 这类只导入不执行的。
+        return " -c " not in command and any(name in command for name in entry_names)
+
+    declared_specs = [
+        {"command": command, "source": "planned", "display": "测试阶段声明的命令"}
+        for command in declared
+    ]
+    declared_specs.sort(key=lambda s: 0 if _runs_named_entry(str(s["command"])) else 1)
+    for spec in declared_specs:
         if len(specs) >= max_commands:
             break
-        specs.append({"command": command, "source": "planned", "display": "测试阶段声明的命令"})
+        specs.append(spec)
     # 去重：开发声明的入口命令与测试阶段声明的命令常常是同一条，别跑两遍白等一轮
     seen: set[str] = set()
     deduped: list[dict] = []
@@ -535,6 +553,40 @@ _STATIC_SUFFIX = ".py"
 #: 「一看就知道能当入口」的文件名（没有 __main__ 时退而求其次认这些）。
 #: 公开给编排器复用：判定「方案有没有规划入口」以及演示面板挑入口都要它。
 ENTRY_NAMES = ("main.py", "__main__.py", "run.py", "app.py", "cli.py")
+
+
+#: 无参执行 CLI 入口时，程序**有意**打印用法并以非零码退出的典型输出。
+#: 真机 run 20260928-180933：`python main.py` 无参 → 打印 `Usage: …` + rc=1，
+#: 这是 argparse 式 CLI 的标准设计，却被入口探针当成「产物失败」判负。
+_USAGE_EXIT_RE = re.compile(
+    r"usage\s*:|用法|unrecognized arguments?|required positional argument|"
+    r"arguments? are required|no command|子命令|缺少参数|参数(?:错误|不足|个数|不对)",
+    re.I,
+)
+_TRACEBACK_MARK_RE = re.compile(r"traceback \(most recent call last\)", re.I)
+#: 裸入口调用：`python main.py`（脚本名后没有任何参数）
+_BARE_SCRIPT_RE = re.compile(r'^\s*"?[^"\n]*python[\w.]*"?\s+(\S+\.py)\s*$', re.I)
+
+
+def is_usage_exit(cmd: dict) -> bool:
+    """入口探针的非零退出是不是「无参打印用法」的**有意设计**（而非崩溃）。
+
+    四个条件全满足才算（宁漏不错：漏判只是多一次返工，误判会把真崩溃洗成通过）：
+      ① harness 自己生成的入口探针（``source == "probe"``），非测试阶段声明的命令；
+      ② 裸入口调用（脚本名后没有参数）；
+      ③ 输出含用法提示特征；
+      ④ 输出里**没有** Python traceback（崩溃栈在就一定是实现失败）。
+    """
+    if str(cmd.get("source") or "") != "probe":
+        return False
+    if str(cmd.get("status") or "") != "fail":
+        return False
+    if not _BARE_SCRIPT_RE.match(str(cmd.get("command") or "")):
+        return False
+    out = f"{cmd.get('stderr_tail') or ''}\n{cmd.get('stdout_tail') or ''}"
+    if _TRACEBACK_MARK_RE.search(out):
+        return False
+    return bool(_USAGE_EXIT_RE.search(out))
 
 
 def _entry_probe(work: Path) -> dict[str, Any] | None:
@@ -686,6 +738,25 @@ def runs_entry(work: Path, written: list[str], command: str) -> bool:
     if rel and rel in entry_targets(work, written):
         return True
     return any(name in text for name in entry_targets(work, written))
+
+
+def runs_guarded_entry(work: Path, written: list[str], command: str) -> bool:
+    """这条命令是不是在跑**真正带入口守卫**（`if __name__ == "__main__"`）的交付文件。
+
+    与 :func:`runs_entry` 的区别：后者把「文件名叫 main.py」也算入口，但同名文件
+    可能只是个函数库 —— `python main.py` 定义完函数静默 rc=0、输出为空，
+    这不是「跑起来了」的证据（真机 run 20260928-200631：最终 main.py 无 import、
+    无守卫，verify 却 5/5 全绿）。非空 stdout 那条证据由调用方另行接受，不在这里。
+    """
+    guarded = {str(n).replace("\\", "/") for n in entry_files(work, written)}
+    if not guarded:
+        return False
+    text = str(command or "")
+    rel = _python_script_arg(text)
+    if rel and str(rel).replace("\\", "/") in guarded:
+        return True
+    # 兜底：命令行没按脚本参数形态写（引号、-m 等），用守卫文件的名字做子串匹配。
+    return any(str(n).replace("\\", "/") in text for n in guarded)
 
 
 def _sig_args(args: ast.arguments, *, drop_self: bool) -> str:
@@ -928,12 +999,22 @@ def _interface_of(text: str) -> tuple[str, list[str]]:
     """从方案里写的 `add(amount: float, note: str) -> None` 取出 (名字, 形参数)。
 
     按括号深度切分，避免默认值 `f(x, y=(1, 2))` 里的逗号被当成参数分隔符。
+
+    还要兼容「实例方法的调用形态」``Database().insert(amount, note) -> None``：
+    真正的接口是最后一个 ``insert``，不能在第一个 ``(`` 处截断把名字取成 ``Database``
+    （真机 run 20260928-200631：编译器把 T-02 的 interface 写成这个形态，
+    五轮恒定误报「Database 签名不符：声明 2 个参数，实际 0 个」）。
     """
     s = str(text or "").strip()
+    if "->" in s:
+        s = s.split("->", 1)[0].strip()
     if "(" not in s:
         return s, []
-    name = s[: s.index("(")].strip()
-    inner = s[s.index("(") + 1: s.rindex(")")] if ")" in s else s[s.index("(") + 1:]
+    # 接口名一定是「最后一个 名字(」里的名字；前面允许任意接收者前缀（Database(). / x.）。
+    m = re.match(r"^(?:.*[^A-Za-z0-9_])?([A-Za-z_]\w*)\s*\((.*)\)\s*$", s, re.S)
+    if not m:
+        return s, []
+    name, inner = m.group(1), m.group(2)
     depth, cur, parts = 0, "", []
     for ch in inner:
         if ch in "([{":
@@ -1063,15 +1144,29 @@ def contract_check(work: str | Path, written: list[str], plan: Any) -> dict:
         return str(p or "").replace("\\", "/")
 
     def _find(symbol: str, preferred: list[str]) -> tuple[str | None, list[str] | None]:
-        """优先在声明的文件里找；找不到再全局找（宽松，但不静默放过）。"""
-        leaf = symbol.rsplit(".", 1)[-1]
+        """优先在声明的文件里找；找不到再全局找（宽松，但不静默放过）。
+
+        声明侧是模型/编译器写的文本，两种噪声必须先剥：
+          · 结尾空括号 ``insert()``（编译器把 exposes 写成「调用形态」）；
+          · ``Database.insert`` 这类类前缀（AST 表同时收 ``Database.insert``
+            与裸 ``insert``，裸键在全局兜底里必须能命中）。
+        真机 run 20260928-200631：``exposes=["insert()"]`` 逐字比对键 ``insert``
+        五轮全败 —— db.py 一直实现正确，却每轮收到 6 条「找不到定义」的假缺陷。
+        """
+        raw = str(symbol or "").strip()
+        bare = re.sub(r"\s*\(\s*\)\s*$", "", raw).strip()
+        leaf = bare.rsplit(".", 1)[-1]
+        keys: list[str] = []
+        for k in (raw, bare, leaf):
+            if k and k not in keys:
+                keys.append(k)
         for cand in preferred:
             table = actual.get(_norm(cand)) or {}
-            for key in (symbol, symbol.rsplit(".", 1)[-1], leaf):
+            for key in keys:
                 if key in table:
                     return _norm(cand), table[key]
         for path, table in actual.items():
-            for key in (symbol, leaf):
+            for key in (bare, leaf):
                 if key in table:
                     return path, table[key]
         return None, None
@@ -1335,12 +1430,14 @@ def runnability_problems(work: Path, written: list[str], commands: list[dict]) -
         # **超时也算跑起来了**：长时间运行的程序（游戏主循环、服务）本来就不会自己退出。
         # 真机 run 20260925-110258：贪吃蛇的 `python main.py` 跑满 180s 被强杀 —— 那正是
         # 「它真的在运行」的最好证据；把它当成失败会让**任何常驻程序**永远过不了 verify。
-        if status == "timeout" and runs_entry(work, written, str(cmd.get("command") or "")):
+        if status == "timeout" and runs_guarded_entry(work, written, str(cmd.get("command") or "")):
             evidence = True
             break
         if status != "ok":
             continue
-        if runs_entry(work, written, str(cmd.get("command") or "")):
+        # 必须跑的是**带守卫的真入口**：光文件名叫 main.py 不够（可能只是函数库，
+        # 定义完静默 rc=0）。真机 run 20260928-200631 即此形态的假绿。
+        if runs_guarded_entry(work, written, str(cmd.get("command") or "")):
             evidence = True
             break
         if (str(cmd.get("stdout_tail") or "")).strip():
@@ -1355,12 +1452,17 @@ def runnability_problems(work: Path, written: list[str], commands: list[dict]) -
             + " / ".join(ENTRY_NAMES)
             + "。直接执行这类文件退出码也是 0（定义完就退出），证明不了产物能运行。"
         ]
-    if not evidence:
+    if not entries and named:
         return [
-            "没有任何命令真正执行了交付物：已执行的命令只覆盖语法/导入检查，"
-            "或执行了不带入口的文件（空跑）。产物是否可运行未被验证。"
+            "存在约定入口名文件 "
+            + " / ".join(named)
+            + "，但文件里没有 `if __name__ == '__main__':` 守卫：直接执行只是"
+            "「定义完函数就退出」（rc=0、无输出），本轮没有任何命令真正跑起过产物。"
         ]
-    return []
+    return [
+        "没有任何命令真正执行了交付物：已执行的命令只覆盖语法/导入检查，"
+        "或执行了不带入口的文件（空跑）。产物是否可运行未被验证。"
+    ]
 
 
 def audit_impact(work: Path, written: list[str], impl: dict | None = None) -> dict[str, Any]:
@@ -1519,6 +1621,8 @@ def audit_interfaces(work: Path, written: list[str]) -> dict[str, Any]:
     defs: dict[str, set[str]] = {}
     bound: dict[str, set[str]] = {}
     trees: dict[str, ast.Module] = {}
+    #: 模块名 → 沙箱相对路径（结构化缺陷归因要精确指到**定义方文件**）
+    rel_of: dict[str, str] = {}
     unparsable: list[str] = []
     for rel in written:
         if not str(rel).endswith(_STATIC_SUFFIX):
@@ -1536,6 +1640,7 @@ def audit_interfaces(work: Path, written: list[str]) -> dict[str, Any]:
             unparsable.append(f"{rel}（第 {exc.lineno} 行：{exc.msg}）")
             continue
         trees[module] = tree
+        rel_of[module] = str(rel).replace("\\", "/")
         names: set[str] = set()
         defined: set[str] = set()
         for node in tree.body:
@@ -1555,6 +1660,7 @@ def audit_interfaces(work: Path, written: list[str]) -> dict[str, Any]:
         bound[module] = _bound_names(tree)
 
     missing: list[str] = []
+    missing_details: list[dict] = []
     for module, tree in trees.items():
         for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom) or node.level:
@@ -1570,11 +1676,41 @@ def audit_interfaces(work: Path, written: list[str]) -> dict[str, Any]:
                     f"{module}.py 里 `from {target} import {alias.name}`，"
                     f"但 {base}.py 并没有定义 {alias.name}"
                 )
+                # **结构化**明细：归因不能只靠正则解析上面那句人读文本
+                # （真机 run 20260928-221831：评审把根因误归到导入方 cli.py，
+                # 真正的肇事方 database.py 三轮没被派活）。
+                missing_details.append(
+                    {
+                        # 写这行 import 的文件（受害方；它本身没写错）
+                        "importer": rel_of.get(module, f"{module}.py"),
+                        # 被导入的模块名 / **应该定义该符号的文件**（根因方）
+                        "module": base,
+                        "definer": rel_of.get(base, f"{base}.py"),
+                        "name": alias.name,
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
     return {
         "files": sorted(modules),
         "definitions": {key: sorted(value) for key, value in sorted(modules.items())},
         "unparsable": unparsable,
         "missing_symbols": sorted(set(missing)),
+        # 去重：同一 (importer, definer, name) 在多处 import 只算一条（line 取首条）
+        "missing_symbol_details": [
+            {
+                "importer": imp,
+                "module": mod,
+                "definer": defn,
+                "name": name,
+                "line": line,
+            }
+            for (imp, mod, defn, name), line in sorted(
+                {
+                    (d["importer"], d["module"], d["definer"], d["name"]): d["line"]
+                    for d in missing_details
+                }.items()
+            )
+        ],
         "undefined_names": _undefined_cross_module(defs, trees, bound),
     }
 
@@ -2071,9 +2207,25 @@ def verify(
     else:
         mis_ids: set[int] = set()
 
+    # 裸入口探针的「无参打印用法 + 非零退出」是 CLI 的标准设计（argparse 如此），不是崩溃：
+    # 没有 traceback、输出是用法提示 —— 不计入交付物失败。但它同样没证明行为正确，
+    # runnability 仍会诚实判「没有可运行证据」，测试阶段必须补带参数的真跑命令。
+    usage_exits = [c for c in executed if is_usage_exit(c)]
+    usage_ids = {id(c) for c in usage_exits}
+    if usage_exits:
+        report["notes"].append(
+            "以下入口探测**不带参数**执行，程序打印用法提示后以非零码退出（CLI 标准行为，"
+            "无 traceback）—— 不视为交付物失败；但无参执行证明不了行为正确，"
+            "测试阶段应补带参数的真跑命令："
+            + "；".join(f"`{c['command']}`" for c in usage_exits)
+        )
+
     failed = [
         c for c in executed
-        if c["status"] not in ("ok", "unavailable") and c not in long_running and id(c) not in mis_ids
+        if c["status"] not in ("ok", "unavailable")
+        and c not in long_running
+        and id(c) not in mis_ids
+        and id(c) not in usage_ids
     ]
 
     # ------------------------------------------------------------------ 归因：谁的错？
@@ -2088,6 +2240,11 @@ def verify(
     ]
     if not impl_fail and runnability:
         test_defects += [f"没有取得可运行证据（测试命令质量问题）：{p}" for p in runnability]
+    if not impl_fail and usage_exits:
+        test_defects += [
+            f"入口无参执行仅打印用法（退出码非零但无 traceback），需补带参数的真跑命令：`{c['command']}`"
+            for c in usage_exits
+        ]
     report["impl_fail"] = impl_fail
     report["test_defects"] = test_defects
     if test_defects and not impl_fail:

@@ -348,9 +348,23 @@ def resolve(symbol: str, *, files: Any = None, index: dict | None = None) -> dic
         best: dict[str, str] = {}
         for path in [*scope, *(p for p in known_files if p not in scope)]:
             stem = path[:-3] if path.endswith(".py") else path
-            for cand in (path, stem):
-                if cand and sym.startswith(cand + "."):
-                    rest = sym[len(cand) + 1:]
+            # 两种前缀（完整路径 / 模块名 stem）× 两种限定符：
+            #   点号 —— `db.py.add_record` / `db.add_record`
+            #   中文「的」—— 真机 20260928-160609 架构师写成 `db.py的add_record()`
+            # 都按「文件限定 + 成员」汇聚到 _by_file，复用同一套不唯一/虚成员判定。
+            for cand, sep in ((path, "."), (stem, "."), (path, "的"), (stem, "的")):
+                # stem + "." 不得吃**文件扩展名**那个点：`db.py的add_record` 里 `db.`
+                # 后面是 `py`（整个文件名还在符号里），那不是成员点号 ——
+                # 旧逻辑据此错切成成员 `py的add_record`，报出模型无法理解的假冲突。
+                if (
+                    sep == "."
+                    and cand == stem
+                    and path.endswith(".py")
+                    and sym.startswith(path)
+                ):
+                    continue
+                if cand and sym.startswith(cand + sep):
+                    rest = sym[len(cand) + len(sep):]
                     if path not in best or len(rest) < len(best[path]):
                         best[path] = rest
         if len(best) == 1:
