@@ -1,0 +1,19 @@
+{
+  "id": "fixture-010-testcompiler-runtime",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_testcompiler_runtime；§四 TestCompiler 主链接入"],
+  "description": "TestCompiler 从 required PO 机械编译运行时场景：syntax PO 得到 py_compile 可执行场景；没有可机械生成命令的 behavior PO 落 coverage_gap（场景缺口必须可见，不得静默跳过）。",
+  "scenario": "testcompiler_runtime",
+  "input": {
+    "obligations": [
+      {"id": "po:syn", "kind": "syntax", "required": true, "claim": "语法成立"},
+      {"id": "po:beh", "kind": "behavior", "required": true, "claim": "交互行为正确"}
+    ],
+    "files": ["src/store.py"]
+  },
+  "expect": {
+    "executable_target": "po:syn",
+    "executable_command_contains": "py_compile",
+    "coverage_gap_contains": "po:beh"
+  }
+}

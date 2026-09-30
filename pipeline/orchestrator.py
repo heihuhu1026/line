@@ -44,6 +44,7 @@ from . import (
     symbols as symbol_resolver,
 )
 from . import taskcompiler, tasktype
+from . import testcompiler
 from . import semantics
 from . import ontology
 from . import ontology_validate
@@ -409,6 +410,8 @@ class Orchestrator:
             "pm": ["intake"],
             "architect_assess": ["pm"],
             "architect_plan": ["architect_assess", "review"],
+            # 方案§三十：确定性 Task Plan 是 Architect Plan 的下游编译产物。
+            "task_plan": ["architect_plan"],
             "test": ["dev"],
             "verify": ["dev"],
             "review": ["verify"],
@@ -468,10 +471,11 @@ class Orchestrator:
             for aid in caused_by_extra:
                 if aid and aid not in caused_by:
                     caused_by.append(str(aid))
-        # Ontology 真值（规格§三）：verify 是机械产物 PROVEN；human_review 携带人工事实
-        # ASSERTED；其余阶段（含 intake/pm/plan/skeleton/dev/test/review LLM）一律 DERIVED。
+        # Ontology 真值（方案§十六/§十七）：**Artifact 不等于证明** —— verify 报告本身
+        # 只是机械流程的派生产物（DERIVED），PROVEN/FAILED 只能由其 Evidence（绑定
+        # workspace revision 的执行痕迹）携带；human_review 携带人工事实 ⇒ ASSERTED；
+        # 其余阶段（含 intake/pm/plan/skeleton/dev/test/review LLM）一律 DERIVED。
         artifact_truth = {
-            "verify": ontology.TRUTH_PROVEN,
             "human_review": ontology.TRUTH_ASSERTED,
         }.get(base_stage, ontology.TRUTH_DERIVED)
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -509,6 +513,20 @@ class Orchestrator:
             "response_text": raw_text,
             "response_thinking": raw_thinking,
         }
+        # 方案§三十/§三十一：只追加的 artifact envelope 台账（不重复算 hash），
+        # 供 Ontology 投影 Artifact derived_from / supersedes 链；旧 run 缺该字段缺省安全。
+        self.state.setdefault("artifact_log", []).append({
+            "artifact_id": artifact_id,
+            "stage": base_stage,
+            "produced_by": produced_by.get("stage") or base_stage,
+            "revision": artifact_revision,
+            "supersedes": payload["supersedes"],
+            "input_hash": input_hash,
+            "output_hash": output_hash,
+            "caused_by": caused_by,
+            "truth": artifact_truth,
+            "created_at": created_at,
+        })
         runstore.write_json(
             self.run_dir / f"{self._seq:02d}-{self._safe_stage_stem(stage)}.json", payload
         )
@@ -566,6 +584,82 @@ class Orchestrator:
             "request_preview": "",
         }
         runstore.write_json(self.run_dir / f"{self._seq:02d}-dev.json", payload)
+
+    def _record_task_plan(
+        self, ir: dict[str, Any], compiled: list[dict[str, Any]], errors: list[dict[str, Any]]
+    ) -> None:
+        """方案§三十/§三十一：确定性 Task Plan 也落一等 Artifact envelope。
+
+        TaskCompiler 不经 LLM，``_call`` 的 ``_record`` 不会覆盖该阶段，这里补**同口径**
+        台账（artifact_log + 阶段快照），投影时即有 ``Task Plan derived_from Architect
+        Plan`` 与同阶段再版的 ``supersedes``。纪律：
+
+        * 纯确定性重算且输出 hash 与上一版相同 ⇒ 视为同一版，**不**新增（同一输入不造版本）；
+        * 不写 ``llm-calls.jsonl``（没有模型调用，不能污染模型调用台账）；
+        * 真值 DERIVED —— 编译器只机械转译架构方案，不产生 ASSERTED/PROVEN 事实（§三十三）。
+        """
+        if self.run_dir is None:
+            return
+        stage = "task_plan"
+        try:
+            input_hash = "h:" + ontology.stable_hash(
+                ontology.canonical_json(ir), length=12)
+            output_hash = "h:" + ontology.stable_hash(
+                ontology.canonical_json({"tasks": compiled, "errors": errors}), length=12)
+        except (TypeError, ValueError):
+            # 产物理论上都可 JSON 化；不可算 hash 时留空但不阻断台账。
+            input_hash = output_hash = ""
+        artifact_log = self.state.setdefault("artifact_log", [])
+        prev_same = next(
+            (e for e in reversed(artifact_log)
+             if isinstance(e, dict) and str(e.get("stage") or "") == stage),
+            None,
+        )
+        if prev_same is not None and str(prev_same.get("output_hash") or "") == output_hash:
+            return  # 输出与上一版逐字相同：确定性重算，不制造新版本
+        self._seq += 1
+        chain = self.state.setdefault("artifact_chain", {})
+        prev_artifact = str(chain.get(stage) or "")
+        revisions = self.state.setdefault("artifact_revisions", {})
+        revision = int(revisions.get(stage) or 0) + 1
+        revisions[stage] = revision
+        artifact_id, produced_by, caused_by = self._provenance(stage)
+        supersedes = [prev_artifact] if prev_artifact and prev_artifact != artifact_id else []
+        created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        artifact_log.append({
+            "artifact_id": artifact_id,
+            "stage": stage,
+            "produced_by": produced_by.get("stage") or stage,
+            "revision": revision,
+            "supersedes": supersedes,
+            "input_hash": input_hash,
+            "output_hash": output_hash,
+            "caused_by": caused_by,
+            "truth": ontology.TRUTH_DERIVED,
+            "created_at": created_at,
+        })
+        runstore.write_json(
+            self.run_dir / f"{self._seq:02d}-task_plan.json",
+            {
+                "stage": stage,
+                "artifact_id": artifact_id,
+                "produced_by": produced_by,
+                "caused_by": caused_by,
+                "artifact_revision": revision,
+                "supersedes": supersedes,
+                "input_hash": input_hash,
+                "output_hash": output_hash,
+                "created_at": created_at,
+                "truth": ontology.TRUTH_DERIVED,
+                "meta": {
+                    "kind": "deterministic", "stage": stage,
+                    "note": "taskcompiler.compile_plan（不经 LLM 的确定性编译）",
+                    "task_count": len(compiled), "error_count": len(errors),
+                },
+                "artifact": {"tasks": compiled, "errors": errors},
+                "request_preview": "",
+            },
+        )
 
     def _record_trace(
         self,
@@ -1501,6 +1595,8 @@ class Orchestrator:
         plan_ont = ir.get("ontology")
         if isinstance(plan_ont, dict):
             self._persist_ontology(ontology.OntologyGraph.from_dict(plan_ont), "architect_plan")
+        # 方案§三十：确定性 Task Plan 落 Artifact envelope（derived_from architect_plan）。
+        self._record_task_plan(ir, compiled, errors)
         return errors
 
     #: compile error code → Design Gate 阻断 kind。容量与依赖两类都是
@@ -2049,6 +2145,7 @@ class Orchestrator:
         # 先作废旧的在制工作区引用：本轮缺陷单 / 首图 current_code 必须以上一轮
         # verify 沙箱为准；新的 dev-wip 在 _dev_by_tasks 开头重建（G4）。
         self._wip_dir = None
+        self._wip_head_revision = ""
         prev = self.state.get("implementation") or {}
         # 「这一轮让哪些符号消失了」——必须在下面覆盖 `implementation_symbols_prev` **之前**
         # 算出来：它是"上上轮有、上一轮没了"的差集，也就是返工退化的实证。
@@ -2830,6 +2927,7 @@ class Orchestrator:
         """
         self._wip_dir: Path | None = None
         self._wip_base: Path | None = None
+        self._wip_head_revision = ""  # 本轮在制工作区链头（方案§二十三/§二十四）
         if self.run_dir is None:
             return
         base = self.run_dir / "dev-wip-base"
@@ -3058,8 +3156,11 @@ class Orchestrator:
         # 规格§四十一：每个 task transaction 记录语义边界 —— 从哪个 workspace revision
         # 起、物化到哪个 revision、是哪个语义任务的哪个补丁、带了哪些机械快检证据。
         # 链式内容寻址：base = 轮次基线 + 本任务之前已累积补丁；result = 本次物化后工作区。
+        def _base_manifest_now() -> str:
+            return self._manifest_digest(getattr(self, "_wip_base", None))
+
         def _base_rev() -> str:
-            base_manifest = self._manifest_digest(getattr(self, "_wip_base", None))
+            base_manifest = _base_manifest_now()
             try:
                 prior = ontology.stable_hash(
                     ontology.canonical_json((merged or {}).get("edits") or []), length=10)
@@ -3077,6 +3178,38 @@ class Orchestrator:
             compile_checks = [
                 f"py_compile:{rel}:ok" for rel in touched
             ] if not compile_errs else [f"py_compile:{rel}:FAILED" for rel in touched]
+            # 方案§二十二：只给**真正物化成功**的文件登记补丁清单（path/符号/模式），
+            # 供 Ontology 投影 Patch/Symbol；元数据按路径回连本任务的 edits。
+            written_set = {
+                str(p).replace("\\", "/") for p in (cur_mat.get("written") or []) if str(p)
+            }
+            meta_by_path: dict[str, list[dict]] = {}
+            if isinstance(cur_data, dict) and isinstance(cur_data.get("edits"), list):
+                for e in cur_data["edits"]:
+                    if isinstance(e, dict):
+                        ep = str(e.get("path") or "").replace("\\", "/")
+                        if ep in written_set:
+                            meta_by_path.setdefault(ep, []).append(e)
+
+            def _join(rows: list[dict], key: str) -> str:
+                return ";".join(sorted({str(r.get(key) or "") for r in rows if str(r.get(key) or "")}))
+
+            patches_manifest: list[dict] = []
+            for path in sorted(written_set):
+                rows = meta_by_path.get(path, [])
+                symbols = sorted({
+                    str(r.get("target_symbol") or "") for r in rows
+                    if str(r.get("target_symbol") or "")
+                })
+                targets = symbols or [""]
+                for sym in targets:
+                    patches_manifest.append({
+                        "path": path, "symbol": sym,
+                        "change_type": _join(rows, "change_type"),
+                        "patch_mode": _join(rows, "patch_mode"),
+                    })
+            result_rev = self._manifest_digest(getattr(self, "_wip_dir", None))
+            parent_rev = getattr(self, "_wip_head_revision", "") if result_rev else ""
             self.state.setdefault("task_transactions", []).append({
                 "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "round": self.attempt,
@@ -3084,13 +3217,19 @@ class Orchestrator:
                 "task_semantic_id": str(task.get("semantic_task_id") or ""),
                 "patch_id": patch_id,
                 "base_workspace_revision": _base_rev(),
-                "result_workspace_revision": self._manifest_digest(getattr(self, "_wip_dir", None)),
+                "base_manifest": _base_manifest_now(),
+                "parent_workspace_revision": parent_rev,
+                "result_workspace_revision": result_rev,
+                "patches": patches_manifest,
                 "verification_evidence_ids": compile_checks + (
                     ["materialization"] if cur_mat.get("written") else []),
                 "status": "escalated" if probs else "committed",
                 "reasked": reasked,
                 "problems": [str(p) for p in probs][:10],
             })
+            # 推进本轮在制工作区链头（方案§二十三：真实父子链）。
+            if result_rev:
+                self._wip_head_revision = result_rev
 
         if not problems:
             _ledger(cand, mat, [], False)
@@ -3170,6 +3309,24 @@ class Orchestrator:
         probe, written = bundle
         return verify_mod.api_digest(probe, written)
 
+    def _proof_obligations(self) -> list[ontology.ProofObligation]:
+        """当前语义底图上的 PO 清单 —— TestCompiler 的**唯一覆盖清单**（方案§七）。
+
+        优先取 Plan IR 投影出的 ontology 图（与 Proof Gate 同一张底图）；
+        极端情况下 IR 缺失时从 scope 现场重建（重建结果不回写，纯只读用途）。
+        """
+        ir = self.state.get("compiler_ir")
+        base = ir.get("ontology") if isinstance(ir, dict) else None
+        if isinstance(base, dict):
+            return list(ontology.OntologyGraph.from_dict(base).obligations.values())
+        graph = ontology.OntologyGraph()
+        scope = self.state.get("scope")
+        ontology.build_requirement_projection(
+            graph, scope if isinstance(scope, dict) else {},
+            original_requirement=self.requirement or "",
+        )
+        return list(graph.obligations.values())
+
     def _build_test_view(self, interfaces: dict) -> dict:
         """构造测试专用视图（P1-1）：behaviors / acceptance / interfaces / symbols / contracts。
 
@@ -3220,12 +3377,23 @@ class Orchestrator:
                 contracts.append(
                     {"task": tid, "exposes": exposes, "uses": uses, "interface": interface}
                 )
+        # ⑤ 证明义务清单：automated_commands.target_po 的**唯一合法取值表**（方案§七/§十）。
+        #    只给 id/kind/name，模型原样抄写 id 即可，不允许自造 PO 身份。
+        proof_obligations: list[dict] = []
+        try:
+            proof_obligations = [
+                {"id": po.id, "kind": po.kind, "name": po.name, "required": po.required}
+                for po in self._proof_obligations()
+            ]
+        except Exception as exc:  # 视图构建永不阻断测试阶段（纯增强信息）
+            self.log(f"        [测试视图] 证明义务清单构建失败，忽略：{type(exc).__name__}")
         return {
             "behaviors": behaviors,
             "acceptance": acceptance,
             "interfaces": interfaces if isinstance(interfaces, dict) else {},
             "symbols": symbols,
             "contracts": contracts,
+            "proof_obligations": proof_obligations,
         }
 
     def _test_command_problems(self, report: Any) -> list[str]:
@@ -3963,6 +4131,69 @@ class Orchestrator:
                 )
         return out
 
+    def _compile_test_scenarios(self) -> dict:
+        """Test LLM 产物 → TestCompiler 唯一编译路径（方案§四/§五/§十，纯确定性）。
+
+        * automated_commands 只是 DERIVED 候选，经 TestCompiler 安全筛 + PO 显式归档后
+          才成为可执行 TestScenario；
+        * 产物落 ``state['test_scenarios']``，覆盖三分类落 ``state['test_scenario_audit']``；
+        * 从 **executable** 场景生成 verify 执行绑定（命令→PO/断言/期望退出码）落
+          ``state['verify_command_bindings']``：weak 场景（仅 rc=0 无业务断言）**不绑定**，
+          防止 rc=0 冒充行为证明；
+        * 模型一条 target_po 都没写时绑定映射为空，verify / Proof Gate 自动走旧兼容路径。
+        """
+        report = self.state.get("test_report")
+        report = report if isinstance(report, dict) else {}
+        plan = self.state.get("plan") if isinstance(self.state.get("plan"), dict) else {}
+        files = sorted({
+            str(f)
+            for task in (plan.get("tasks") or []) if isinstance(task, dict)
+            for f in (task.get("target_files") or []) if str(f)
+        })
+        try:
+            obligations = self._proof_obligations()
+        except Exception:
+            obligations = []
+        compiled = testcompiler.compile_scenarios(
+            obligations=obligations,
+            files=files,
+            planned_commands=list(report.get("automated_commands") or []),
+        )
+        self.state["test_scenarios"] = compiled
+        audit = testcompiler.audit_po_test_coverage(compiled)
+        self.state["test_scenario_audit"] = audit
+        bindings: dict[str, dict[str, Any]] = {}
+        for sc in compiled.get("scenarios") or []:
+            if not isinstance(sc, dict) or sc.get("status") != testcompiler.STATUS_EXECUTABLE:
+                continue
+            po_id = str(sc.get("target_po") or "")
+            if not po_id:
+                continue
+            for act in (sc.get("actions") or []):
+                if not isinstance(act, dict) or not act.get("safe"):
+                    continue
+                cmd = str(act.get("command") or "").strip()
+                if not cmd:
+                    continue
+                slot = bindings.setdefault(cmd, {
+                    "target_po_ids": [],
+                    "assertions": [str(x) for x in (act.get("assertions") or [])],
+                    "expect_exit": int(act.get("expect_exit") or 0),
+                })
+                if po_id not in slot["target_po_ids"]:
+                    slot["target_po_ids"].append(po_id)
+                for assertion in (act.get("assertions") or []):
+                    if assertion not in slot["assertions"]:
+                        slot["assertions"].append(str(assertion))
+        self.state["verify_command_bindings"] = bindings
+        if not isinstance(self.client, MockClient):
+            self.log(
+                f"        [TestCompiler] 场景 {len(compiled.get('scenarios') or [])}："
+                f"覆盖 PO {len(audit['covered'])} / weak {len(audit['weak'])} / "
+                f"缺口 {len(audit['missing'])} / 绑定命令 {len(bindings)}"
+            )
+        return compiled
+
     def _stage_test(self, requirement: str, fixes: list[str] | None = None) -> Any:
         # 接口摘要：新建项目里它是测试**唯一**能知道"类/函数怎么调"的依据（见 _ensure_api_digest）。
         digest = self._ensure_api_digest()
@@ -4011,6 +4242,8 @@ class Orchestrator:
                 f"（第 {attempt}/{self._TEST_REPAIR_TRIES} 次）"
             )
             _send(problems, f"test 重出·命令不可执行（第 {attempt} 次）")
+        # TestCompiler 主链接入：测试命令（DERIVED 候选）→ 编译场景 → verify 绑定（方案§四/§五）
+        self._compile_test_scenarios()
         return self.state["test_report"]
 
     def _stage_verify(self, requirement: str = "") -> Any:
@@ -4044,6 +4277,9 @@ class Orchestrator:
             deny_patterns=VERIFY_DENY_PATTERNS,
             mock=mock,
             project_type=self.project_type,
+            # TestCompiler 编译出的「命令→PO/断言」绑定：执行结果证据原样继承（方案§十）
+            command_meta=self.state.get("verify_command_bindings") if isinstance(
+                self.state.get("verify_command_bindings"), dict) else None,
         )
         # new 项目无仓库时，verify 内部建了 verify/base 空基线并按新增文件重新审计；
         # 回写 patch_audit，让下游契约核对/评审看到的审计与物化用的同一份。
@@ -5626,12 +5862,39 @@ class Orchestrator:
             for po_id in (task.get("proof_obligations") or []):
                 if po_id in graph.obligations:
                     graph.relate(tid, "carries_obligation", str(po_id), truth=ontology.TRUTH_DERIVED)
+        # 方案§三十/§三十一：Artifact 溯源链接入语义图（envelope 已在 _record 算好，
+        # 这里只投影不重算 hash）：intake→pm→plan→dev→verify 的 derived_from 与版本 supersedes。
+        art_count = ontology.project_artifact_chain(
+            graph, self.state.get("artifact_log") or []
+        )
+        if art_count["artifacts"]:
+            self.log(
+                f"  [Ontology] Artifact 链：对象 {art_count['artifacts']} / "
+                f"derived_from 边 {art_count['derived_from']} / supersedes 边 {art_count['supersedes']}"
+            )
+        # 方案§三十二/§三十三：Intake/PM 同级事实矛盾 → Claim 投影，由 contradictions
+        # 校验器复用 reconcile_claims 硬阻断（PM 闸门之外的 Release 兜底闭环）。
+        n_conflict_claims = ontology.project_conflict_claims(graph, self._scope_conflict_groups())
+        if n_conflict_claims:
+            self.log(f"  [Ontology] 需求矛盾 Claim 投影：{n_conflict_claims} 条（同级对立将阻断放行）")
+        # 方案§十九~§二十四：Task→Patch→Symbol→WorkspaceRevision 真实父子链投影。
+        # 必须在 verify 评估之前：verify revision 要挂到在制链头之下（证据只认链头）。
+        chain = ontology.project_workspace_chain(
+            graph, self.state.get("task_transactions") or [],
+            at=str(self.attempt or ""),
+        )
+        if chain.get("revisions"):
+            self.log(
+                f"  [Ontology] 工作区链：revision +{chain['revisions']} / "
+                f"patch +{chain['patches']} / symbol +{chain['symbols']}"
+            )
         verify_report = self.state.get("verify_report")
         verify_report = verify_report if isinstance(verify_report, dict) else {}
         ontology.evaluate_against_verify(
             graph, verify_report, contract_problems=contract_problems,
             skeleton_conformance=self.state.get("skeleton_conformance"),
             contract_checked=bool(self.state.get("contract_checked")),
+            parent_revision=str(chain.get("head_revision") or ""),
             at=str(self.attempt or ""),
         )
         no_power = list(
@@ -5648,15 +5911,35 @@ class Orchestrator:
             unresolved_contracts=[],  # 契约问题已在 blockers 中，避免双重计数
             plan_gap=plan_gap,
         )
-        # 语义图自身校验结果留痕（issues 派生视图 P1 使用，本轮只记录不重复裁决）。
+        # 语义图自身校验：结构化结果（方案§十四）+ 旧版字符串留痕。
+        # 方案§十二/§十三：任何 severity=error 的语义完整性问题都必须硬阻断 PASS ——
+        # 以前 problems 只展示不拦，现在统一在这里把 Proof Gate 翻成 FAILED。
+        problems_by_check = ontology_validate.validate_all_structured(graph)
+        integrity = ontology_validate.semantic_integrity_audit(graph, self.state)
+        problems_by_check["semantic_integrity"] = integrity
+        gate_errors = ontology_validate.blocking_errors(problems_by_check)
         self.state["ontology"] = graph.to_dict()
-        self.state["ontology_problems"] = ontology_validate.validate_all(graph)
+        self.state["ontology_problems"] = {
+            check: [p.message for p in items] for check, items in problems_by_check.items()
+        }
+        self.state["ontology_problems_structured"] = [
+            p.to_dict() for items in problems_by_check.values() for p in items
+        ]
+        if gate_errors:
+            proof["status"] = "FAILED"
+            proof["can_pass"] = False
+            proof["code"] = "ontology_integrity_error"
+            proof["failed"] = list(proof.get("failed") or []) + [
+                f"ontology_integrity[{p.source}/{p.code}]：{p.message}" for p in gate_errors
+            ]
+            proof["ontology_error_count"] = len(gate_errors)
         self.state["proof_gate"] = proof
         self._persist_ontology(graph, "review")
         if proof["status"] != "PROVEN":
             self.log(
                 f"  [ProofGate] status={proof['status']} can_pass={proof['can_pass']}"
-                f"（缺证 {len(proof['mandatory_missing'])} / 失败 {len(proof['failed'])}）"
+                f"（缺证 {len(proof['mandatory_missing'])} / 失败 {len(proof['failed'])}"
+                f" / 语义 error {len(gate_errors)}）"
             )
         return proof
 
@@ -5721,10 +6004,80 @@ class Orchestrator:
                 self.state["ontology_failure_id"] = fid
 
             self.state["ontology"] = graph.to_dict()
-            self.state["ontology_problems"] = ontology_validate.validate_all(graph)
+            _problems = ontology_validate.validate_all_structured(graph)
+            _problems["semantic_integrity"] = ontology_validate.semantic_integrity_audit(
+                graph, self.state
+            )
+            self.state["ontology_problems"] = {
+                check: [p.message for p in items] for check, items in _problems.items()
+            }
+            self.state["ontology_problems_structured"] = [
+                p.to_dict() for items in _problems.values() for p in items
+            ]
             self._persist_ontology(graph, "recovery")
         except Exception as exc:  # noqa: BLE001 —— overlay 永不阻断主路由
             self.log(f"  [Ontology] Failure 投影失败（不影响裁决）：{type(exc).__name__}: {exc}")
+
+    def _project_release_decision(self, proof: dict, verdict: str, reason: str) -> None:
+        """方案§二十六~§二十八：can_release 唯一放行裁决 → Decision 一等对象投影。
+
+        overlay 纪律同 :meth:`_project_failure_ontology`：只追加、不裁决路由（路由已由
+        diagnose.review_decision 定），任何异常仅记日志。pass 时 Decision ``based_on``
+        支撑 required PO 的 PROVEN 证据、``applies_to`` 经验证的链头 revision、
+        ``resolves`` 图上仍 OPEN 的 Defect；rework 时只挂 FAILED 证据留痕。
+        mock 运行无图（proof=None），调用方直接跳过。
+        """
+        try:
+            base = self.state.get("ontology")
+            if not isinstance(base, dict):
+                return
+            graph = ontology.OntologyGraph.from_dict(base)
+            gate = ontology.can_release(
+                proof_status=proof, review_verdict=verdict, graph=graph,
+            )
+            if gate["can_pass"]:
+                basis = ontology.release_basis(graph)
+                evidence_ids = basis["evidence_ids"]
+                defect_ids = sorted(
+                    o.id for o in graph.objects.values()
+                    if o.type == ontology.TYPE_DEFECT and str(o.status or "OPEN") == "OPEN"
+                )
+            else:
+                required_po = {po.id for po in graph.obligations.values() if po.required}
+                evidence_ids = sorted({
+                    ev.id for ev in graph.evidence.values()
+                    if ev.status == ontology.PO_STATUS_FAILED and (
+                        not required_po
+                        or {str(x) for x in (ev.proof_obligation_ids or [])} & required_po
+                    )
+                })
+                defect_ids = []
+            decision_id = ontology.project_decision(
+                graph, verdict=gate["verdict"], reason=reason,
+                revision=gate["verified_revision"], evidence_ids=evidence_ids,
+                defect_ids=defect_ids, round_no=self.attempt, at=str(self.attempt or ""),
+            )
+            self.state["ontology"] = graph.to_dict()
+            self.state["release_gate"] = dict(gate, decision_id=decision_id)
+            # Decision 落图后复跑全量校验留痕（pass 无 based_on 的 warning 应于此清除）。
+            problems = ontology_validate.validate_all_structured(graph)
+            problems["semantic_integrity"] = ontology_validate.semantic_integrity_audit(
+                graph, self.state
+            )
+            self.state["ontology_problems"] = {
+                check: [p.message for p in items] for check, items in problems.items()
+            }
+            self.state["ontology_problems_structured"] = [
+                p.to_dict() for items in problems.values() for p in items
+            ]
+            self._persist_ontology(graph, "decision")
+            if not gate["can_pass"]:
+                self.log(
+                    "  [ReleaseGate] 机器不可放行："
+                    + "；".join(str(x) for x in gate["blocking_reasons"][:3])
+                )
+        except Exception as exc:  # noqa: BLE001 —— overlay 永不阻断主路由
+            self.log(f"  [Ontology] Decision 投影失败（不影响裁决）：{type(exc).__name__}: {exc}")
 
     def _normalize_review(self, review: dict) -> tuple[list[str], list[str], list[str], bool]:
         """把评审的返工项按作用域分三档；全是 needs_external 时强制放行（防止无意义空转）。
@@ -5952,6 +6305,16 @@ class Orchestrator:
         review["reasons"] = reasons
         # Proof Gate 裁决随评审产物留痕（mock 运行为 None）。
         review["proof_status"] = proof
+        if proof is not None:
+            # 方案§二十六~§二十八：机器放行裁决（can_release）与 Decision 对象投影。
+            # 路由仍以上方 diagnose 裁决为准；Decision 是该裁决在语义图上的一等留痕，
+            # 同时把 PASS 条件收敛到 can_release 一处，供交付闸门与审计直接消费。
+            decision_reason = "；".join(
+                str(x) for x in ([decision["reason"]] + reasons[-3:]) if str(x).strip()
+            )
+            self._project_release_decision(
+                proof, str(review.get("verdict") or ""), decision_reason
+            )
         return in_material, architect, external, forced_pass
 
     # ------------------------------------------------------------------ 状态持久化
@@ -6955,15 +7318,9 @@ class Orchestrator:
 
         现算（人工可能直接改过产物），与 ``_pm_decision_conflicts`` 同纪律。
         """
-        scope = prompts.normalize_pm_questions(self.state.get("scope"))
-        scope = prompts.apply_pm_decisions(scope, self.pm_decisions)
-        intake = prompts.apply_intake_decisions(
-            self.state.get("intake") or {}, self.intake_decisions
-        )
-        rows = prompts.intake_items(intake)
         blocking: list[dict[str, Any]] = []
         resolved: list[dict[str, Any]] = []
-        for gi, group in enumerate(prompts.claim_conflict_groups(scope, rows)):
+        for gi, group in enumerate(self._scope_conflict_groups()):
             claims = [
                 {"id": f["id"], "subject": f"conflict-group-{gi}",
                  "polarity": f["polarity"], "source": f["source"], "truth": f["truth"]}
@@ -6986,6 +7343,20 @@ class Orchestrator:
         # 高优先级覆盖记录留痕（只追加，供 issues 派生视图/回放）
         self.state["claim_conflicts_resolved"] = resolved
         return blocking
+
+    def _scope_conflict_groups(self) -> list[list[dict[str, Any]]]:
+        """机械发现的跨字段极性冲突事实组（已并回人工裁决），现算。
+
+        PM 闸门（:meth:`_claim_contradictions`）与 Ontology Release 兜底
+        （``_proof_gate`` 的 project_conflict_claims）共用这一个真源，
+        避免两层各算一遍口径漂移。
+        """
+        scope = prompts.normalize_pm_questions(self.state.get("scope"))
+        scope = prompts.apply_pm_decisions(scope, self.pm_decisions)
+        intake = prompts.apply_intake_decisions(
+            self.state.get("intake") or {}, self.intake_decisions
+        )
+        return prompts.claim_conflict_groups(scope, prompts.intake_items(intake))
 
     def _should_pause(self, stage: str) -> bool:
         """兼容旧签名的薄包装：等价于「该阶段之后是否会 interrupt」。"""

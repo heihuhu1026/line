@@ -1379,12 +1379,12 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 - 续跑/打回：`POST /api/runs/20260924-185507/resume`（body 可选 `from`/`feedback`/`max_rework`/`pause_after`），
   或直接命令行 `cd D:\AI\line && python -m pipeline.cli --resume 20260924-185507`。
 - 关键位置（**2026-09-27 已核对；行号会漂移，优先按符号名找**）：
-  评审提示词 `prompts.py:3223 parts_review`；fix 列表拼装 `orchestrator.py:6587 self.fixes = fixes`；
+  评审提示词 `prompts.py:3241 parts_review`；fix 列表拼装 `orchestrator.py:6587 self.fixes = fixes`；
   运行态相位 `console.html:842 runPhase`、续跑按钮 `console.html:1262 btn-resume`；
-  入口探测 `verify.py:520 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
-  跨文件契约比对 `verify.py:1101 contract_check`；跨轮合并 `orchestrator.py:2406 _merge_impl_across_rounds`；
-  缺陷单 `tasktype.py:367 bug_report_from_state`；施工图字段强制 `orchestrator.py:1997 _plan_contract_gaps`；
-  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:4542 _task_drawing_is_thin`；
+  入口探测 `verify.py:538 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
+  跨文件契约比对 `verify.py:1119 contract_check`；跨轮合并 `orchestrator.py:2503 _merge_impl_across_rounds`；
+  缺陷单 `tasktype.py:367 bug_report_from_state`；施工图字段强制 `orchestrator.py:2093 _plan_contract_gaps`；
+  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:4778 _task_drawing_is_thin`；
   确定性拆任务 `taskcompiler.py:49 compile_plan`（容量错误通道；施工图包装 `taskcompiler.py:82 compile_tasks`；
   执行 DAG 装配/环校验 `taskcompiler.py:470 _assemble_dependency_dag`）/ 编译审计 `taskcompiler.py:694 plan_needs_compile`；
   **编译层**：Plan IR 归一 `planir.py:274 normalize_plan`、二开现存 import 边 `planir.py:152 existing_import_edges`、
@@ -1403,12 +1403,12 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
   交付指纹无变化 → escalate_plan / escalate_human；阈值 `diagnose.py RECOVERY_STREAK_AFTER=2`）、
   缺陷身份 v2 `diagnose.py:634 defect_key`（类型+check_id+文件+符号，line/what 仅证据）、
   跨轮台账 `diagnose.py:668 ledger`（含 evidence_streak）；
-  当前代码取源 `orchestrator.py:2585 _current_candidates`（按文件 `orchestrator.py:2640 _current_sources`）；
-  方案漏项回流 `orchestrator.py:5256 _plan_uncovered_defects`；
-  判负补丁结构化投影 `orchestrator.py:5155 _patch_failures`（classify 三分类的输入）；
+  当前代码取源 `orchestrator.py:2682 _current_candidates`（按文件 `orchestrator.py:2737 _current_sources`）；
+  方案漏项回流 `orchestrator.py:5492 _plan_uncovered_defects`；
+  判负补丁结构化投影 `orchestrator.py:5391 _patch_failures`（classify 三分类的输入）；
   **输出截断处理**：抬高上限一次数 `ollama_client.py:40 _MAX_ESCALATIONS`、
-  逐张调用组装 `orchestrator.py:4599 _dev_task_call`、
-  截断自动拆半 `orchestrator.py:4642 _dev_split_retry`。
+  逐张调用组装 `orchestrator.py:4835 _dev_task_call`、
+  截断自动拆半 `orchestrator.py:4878 _dev_split_retry`。
   复检脚本：`python tools/check_refs.py`（抽 CONTEXT.md 里所有 `文件:行号` 并比对当前代码；
   含"该行附近是否还有文档声称的符号名"这一层，能抓出"行号还在但内容已换"的漂移）。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。

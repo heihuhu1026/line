@@ -1,0 +1,20 @@
+{
+  "id": "fixture-012-workspace-revision-chain",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_workspace_revision_chain；§十九~§二十四 工作区父子链"],
+  "description": "两个已提交任务事务形成 BASE→r1→r2 真实父子链：Patch materialized_in 各自 revision，链头为最后一个任务 revision；事务台账与图链对齐校验零 error。",
+  "scenario": "workspace_chain",
+  "input": {
+    "task_id": "stask:1",
+    "file": "main.py",
+    "symbol": "run",
+    "base": "wsr:wip:base000000"
+  },
+  "expect": {
+    "result_revisions": 2,
+    "base_revision": "wsr:wip:base000000",
+    "patches": 2,
+    "symbols": 1,
+    "alignment_errors": 0
+  }
+}

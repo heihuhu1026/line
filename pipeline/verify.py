@@ -427,8 +427,15 @@ def plan_commands(
     *,
     max_commands: int,
     impl: dict | None = None,
+    command_meta: dict | None = None,
 ) -> list[dict]:
-    """决定在沙箱里跑什么：语法检查（必跑）→ 测试阶段声明的命令 → 兜底探测。"""
+    """决定在沙箱里跑什么：语法检查（必跑）→ 测试阶段声明的命令 → 兜底探测。
+
+    ``command_meta``（命令串→``target_po_ids / assertions / expect_exit``）来自 TestCompiler
+    编译产物（方案§十）：机械生成的语法/导入/探测命令不带绑定；只有测试声明命令
+    在绑定映射里有记录时才把 PO 归属与机械断言盖到执行 spec 上，供 run_command 判定、
+    供执行结果证据原样继承。
+    """
     specs: list[dict] = []
     py_files = [w for w in written if w.endswith(".py") and (work / w).exists()]
     if py_files and max_commands > 0:
@@ -484,23 +491,34 @@ def plan_commands(
         # `-m pkg` 等形态的兜底；明确排除 `python -c "import main"` 这类只导入不执行的。
         return " -c " not in command and any(name in command for name in entry_names)
 
-    declared_specs = [
-        {"command": command, "source": "planned", "display": "测试阶段声明的命令"}
-        for command in declared
-    ]
+    declared_specs: list[dict] = []
+    for command in declared:
+        spec: dict[str, Any] = {"command": command, "source": "planned",
+                                  "display": "测试阶段声明的命令"}
+        meta = (command_meta or {}).get(command)
+        if isinstance(meta, dict):
+            spec["target_po_ids"] = [str(x) for x in (meta.get("target_po_ids") or [])]
+            spec["assertions"] = [str(x) for x in (meta.get("assertions") or [])]
+            spec["expect_exit"] = int(meta.get("expect_exit") or 0)
+        declared_specs.append(spec)
     declared_specs.sort(key=lambda s: 0 if _runs_named_entry(str(s["command"])) else 1)
     for spec in declared_specs:
         if len(specs) >= max_commands:
             break
         specs.append(spec)
-    # 去重：开发声明的入口命令与测试阶段声明的命令常常是同一条，别跑两遍白等一轮
-    seen: set[str] = set()
+    # 去重：开发声明的入口命令与测试阶段声明的命令常常是同一条，别跑两遍白等一轮。
+    # 同串命令若一条带 TestCompiler 绑定（PO 归属/断言）、另一条是机械探测，保留**带绑定**
+    # 的那条 —— 否则证据绑定会在去重时被静默丢掉（方案§十：绑定必须继承到执行结果）。
+    seen: dict[str, int] = {}
     deduped: list[dict] = []
     for spec in specs:
         key = str(spec.get("command") or "").strip()
         if key in seen:
+            idx = seen[key]
+            if spec.get("target_po_ids") and not deduped[idx].get("target_po_ids"):
+                deduped[idx] = spec
             continue
-        seen.add(key)
+        seen[key] = len(deduped)
         deduped.append(spec)
     return deduped[:max_commands]
 
@@ -1726,10 +1744,45 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def eval_assertions(assertions: list[str], *, exit_code: int | None,
+                    stdout_tail: str, stderr_tail: str) -> list[str]:
+    """逐条判定 TestCompiler 透传的声明式机械断言（方案§九），返回失败断言原文。
+
+    支持：``exit_code==0`` / ``exit_code!=0`` / ``stdout_contains:<文本>`` /
+    ``stderr_contains:<文本>`` / ``stdout_regex:<正则>``。无法识别的断言按**不通过**
+    处理（fail-closed：模型写错断言不能被静默当成通过）。
+    """
+    failed: list[str] = []
+    for raw in assertions or []:
+        assertion = str(raw or "").strip()
+        if not assertion:
+            continue
+        if assertion == "exit_code==0":
+            ok = exit_code == 0
+        elif assertion == "exit_code!=0":
+            ok = exit_code not in (None, 0)
+        elif assertion.startswith("stdout_contains:"):
+            ok = assertion[len("stdout_contains:"):] in (stdout_tail or "")
+        elif assertion.startswith("stderr_contains:"):
+            ok = assertion[len("stderr_contains:"):] in (stderr_tail or "")
+        elif assertion.startswith("stdout_regex:"):
+            try:
+                ok = re.search(assertion[len("stdout_regex:"):], stdout_tail or "") is not None
+            except re.error:
+                ok = False
+        else:
+            ok = False
+        if not ok:
+            failed.append(assertion)
+    return failed
+
+
 def run_command(spec: dict, *, cwd: Path, timeout: int, allowed_bins: frozenset[str],
                 deny_patterns: tuple[str, ...], mock: bool = False) -> dict:
     """执行一条命令并采集结果（不经过 shell；被拒绝/超时/mock 都如实记录）。"""
     command = str(spec.get("command") or "")
+    spec_assertions = [str(x) for x in (spec.get("assertions") or [])]
+    expected_exit = int(spec.get("expect_exit") or 0)
     out: dict[str, Any] = {
         "command": command,
         "source": spec.get("source") or "",
@@ -1740,6 +1793,11 @@ def run_command(spec: dict, *, cwd: Path, timeout: int, allowed_bins: frozenset[
         "stdout_tail": "",
         "stderr_tail": "",
         "reason": "",
+        # TestCompiler 绑定继承（方案§十）：无绑定的机械命令为空列表/0，行为与旧版完全一致
+        "target_po_ids": [str(x) for x in (spec.get("target_po_ids") or [])],
+        "assertions": spec_assertions,
+        "expect_exit": expected_exit,
+        "assertion_failures": [],
     }
     if mock:
         out["reason"] = "mock 运行：不执行真实命令（只计划）"
@@ -1763,9 +1821,20 @@ def run_command(spec: dict, *, cwd: Path, timeout: int, allowed_bins: frozenset[
             creationflags=_NO_WINDOW,
         )
         out["exit_code"] = proc.returncode
-        out["status"] = "ok" if proc.returncode == 0 else "fail"
         out["stdout_tail"] = (proc.stdout or "")[-OUTPUT_TAIL:]
         out["stderr_tail"] = (proc.stderr or "")[-OUTPUT_TAIL:]
+        # 期望退出码（负向断言场景 exit_code!=0 仍是「按预期通过」）
+        out["status"] = "ok" if proc.returncode == expected_exit else "fail"
+        # 声明式断言逐条判定：退出码符合但输出断言不过 ⇒ 该命令判失败（rc=0 冒充不了行为证据）
+        if out["status"] == "ok" and spec_assertions:
+            failed_assertions = eval_assertions(
+                spec_assertions, exit_code=proc.returncode,
+                stdout_tail=out["stdout_tail"], stderr_tail=out["stderr_tail"],
+            )
+            if failed_assertions:
+                out["status"] = "fail"
+                out["assertion_failures"] = failed_assertions
+                out["reason"] = "断言未通过：" + "；".join(failed_assertions[:3])
     except subprocess.TimeoutExpired as exc:
         out["status"] = "timeout"
         out["reason"] = f"超过 {timeout}s 未结束（已终止）"
@@ -1890,19 +1959,26 @@ def negative_control(
     回归保护），把它判成阻断会让开发去改一条本来就正确的断言 —— 那又是一轮无谓返工。
 
     任何一步出错都**静默跳过**：这是附加检查，绝不能因为它自己出问题而影响交付判定。
+
+    返回的 ``runs`` 是每条重跑命令的**执行痕迹**（command/exit_code/status），供
+    Ontology 投影为合法的 ``negative_control`` 执行证据（方案§十八：执行类证据必须
+    带 command/exit_code/execution source/workspace_revision，禁止无痕迹 PROVEN）。
     """
     if mock or not written:
-        return {"checked": 0, "no_power": [], "skipped": "mock 运行 / 没有写入文件"}
+        return {"checked": 0, "no_power": [], "runs": [],
+                "skipped": "mock 运行 / 没有写入文件"}
     targets = [
         c for c in (commands or [])
         if str(c.get("status")) == "ok"
         and any(h in str(c.get("command") or "").lower() for h in _ASSERT_HINTS)
     ]
     if not targets:
-        return {"checked": 0, "no_power": [], "skipped": "本轮没有通过的断言型命令"}
+        return {"checked": 0, "no_power": [], "runs": [],
+                "skipped": "本轮没有通过的断言型命令"}
     repo_path = Path(repo) if repo else None
     backups: list[tuple[Path, bytes | None]] = []
     no_power: list[str] = []
+    runs: list[dict[str, Any]] = []
     checked = 0
     try:
         for rel in list(written)[:80]:
@@ -1921,10 +1997,19 @@ def negative_control(
                 spec, cwd=work, timeout=min(int(timeout), 60),
                 allowed_bins=allowed_bins, deny_patterns=deny_patterns, mock=False,
             )
+            # 只给真实执行（有退出码）的命令留痕；被安全拒绝/不可用的不充当证据。
+            if row.get("exit_code") is not None:
+                runs.append({
+                    "command": str(spec.get("command") or ""),
+                    "exit_code": row.get("exit_code"),
+                    "status": str(row.get("status") or ""),
+                    "stdout_tail": row.get("stdout_tail"),
+                    "stderr_tail": row.get("stderr_tail"),
+                })
             if row.get("status") == "ok":
                 no_power.append(str(spec.get("command")))
     except Exception as exc:  # noqa: BLE001 - 附加检查，坏了也不能影响判定
-        return {"checked": checked, "no_power": no_power,
+        return {"checked": checked, "no_power": no_power, "runs": runs,
                 "skipped": f"负向对照未完成：{type(exc).__name__}: {exc}"}
     finally:
         for dest, data in backups:
@@ -1935,7 +2020,7 @@ def negative_control(
                     dest.write_bytes(data)
             except OSError:
                 pass
-    return {"checked": checked, "no_power": no_power, "skipped": ""}
+    return {"checked": checked, "no_power": no_power, "runs": runs, "skipped": ""}
 
 
 #: 与断言型命令无关的通用未验证项。**刻意固定列出来**：覆盖率/性能/并发这类东西，
@@ -2000,8 +2085,13 @@ def verify(
     deny_patterns: tuple[str, ...] = (),
     mock: bool = False,
     project_type: str = "secondary",
+    command_meta: dict | None = None,
 ) -> dict:
-    """物化 → 计划 → 执行 → 汇总结论。返回可直接落盘/进 prompt 的 verify_report。"""
+    """物化 → 计划 → 执行 → 汇总结论。返回可直接落盘/进 prompt 的 verify_report。
+
+    ``command_meta`` 为 TestCompiler 绑定（命令→PO/断言/期望退出码），由 plan_commands
+    盖到对应执行 spec，run_command 判定后随执行结果原样返回（证据绑定继承，方案§十）。
+    """
     report: dict[str, Any] = {
         "verdict": "skipped",
         "summary": "",
@@ -2029,7 +2119,6 @@ def verify(
         report["reason_code"] = "no_implementation"
         return report
 
-    repo_path = Path(repo) if repo else None
     if not audit.get("source_available"):
         # 注意：source_available=True 但 repo 目录不存在（truthy Path）是历史既有的
         # 「空基线」调用约定（analyze_all 按新增合并、materialize 走 _no_repo），
@@ -2102,7 +2191,8 @@ def verify(
         return report
 
     specs = plan_commands(
-        work, list(mat["written"]), test_report, max_commands=max_commands, impl=impl
+        work, list(mat["written"]), test_report, max_commands=max_commands, impl=impl,
+        command_meta=command_meta,
     )
     if not specs:
         report["notes"].append("没有可执行的命令（测试阶段也没声明 automated_commands）")

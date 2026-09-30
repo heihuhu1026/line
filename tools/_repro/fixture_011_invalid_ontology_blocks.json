@@ -1,0 +1,15 @@
+{
+  "id": "fixture-011-invalid-ontology-blocks",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_invalid_ontology_blocks；§十二~§十五 Ontology Hard Gate"],
+  "description": "旧产物反序列化出非法 predicate（graph.relate 正常路径会拒绝写入，这里模拟脏数据直接 append）。结构化校验必须报 illegal_predicate 的 severity=error；Proof Gate 遇到任何 error 即就地降级 FAILED，can_release 不得放行。",
+  "scenario": "invalid_ontology",
+  "input": {
+    "predicate": "totally_unknown_predicate",
+    "subject": "stask:1",
+    "object": "req:1"
+  },
+  "expect": {
+    "error_code": "illegal_predicate"
+  }
+}

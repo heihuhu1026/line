@@ -1,0 +1,28 @@
+{
+  "id": "fixture-009-proof-one-evidence-one-po",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_proof_one_evidence_one_po；§三 显式证据绑定"],
+  "description": "一条断言证据显式绑定 PO-A ⇒ 仅 PO-A PROVEN；同图 required PO-B 没有任何绑定证据，保持 UNPROVEN（禁止串证）。Proof Gate 整体 UNPROVEN、不可放行。",
+  "scenario": "proof_binding",
+  "input": {
+    "requirement": "命令行记账工具",
+    "obligations": [
+      {"id": "po:A", "kind": "behavior", "required": true, "claim": "运行测试后输出 OK"},
+      {"id": "po:B", "kind": "behavior", "required": true, "claim": "余额结算正确"}
+    ],
+    "verify_report": {
+      "verdict": "pass",
+      "commands": [
+        {"command": "python test_a.py", "status": "ok", "exit_code": 0,
+         "stdout_tail": "OK", "stderr_tail": "", "target_po_ids": ["po:A"]}
+      ]
+    }
+  },
+  "expect": {
+    "proven_po": "po:A",
+    "unproven_po": "po:B",
+    "proof_status": "UNPROVEN",
+    "proof_code": "required_proof_unproven",
+    "can_pass": false
+  }
+}

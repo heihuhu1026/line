@@ -349,11 +349,17 @@ TEST_GAP = {
 }
 
 # 命令拆成 {command, description}：裸命令看不出它验的是哪条用例、该观察什么输出。
+# target_po / assertions / expect_exit 为**可选**字段（方案§五~§十）：测试模型据此把命令
+# 显式归挂到 ProofObligation；命令本身仍是 DERIVED 候选，归属/断言强度由 TestCompiler
+# 机械裁定（模型不填时一切照旧，旧 run / 旧产物安全缺省）。
 TEST_COMMAND = {
     "type": "object",
     "properties": {
         "command": {"type": "string"},
         "description": {"type": "string"},
+        "target_po": {"type": "string"},
+        "assertions": {"type": "array", "items": {"type": "string"}},
+        "expect_exit": {"type": "integer"},
     },
     "required": ["command", "description"],
 }

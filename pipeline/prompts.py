@@ -292,6 +292,11 @@ SYSTEM: dict[str, str] = {
         "  · automated_commands 每项给 {command, description}：命令要能**验证行为**"
         "（跑测试套件、断言脚本、校验命令），而不是「直接启动程序看一眼」；"
         "description 说明它验的是哪条用例；\n"
+        "    ⚠ **每条命令必须带 target_po**：从上方【证明义务清单】里**原样抄写**该命令验证的义务 id"
+        "（找不到归属的入口冒烟命令可留空，但它不能证明任何业务行为）；有输出可校验时加 assertions"
+        "（机器可判的字符串，如 \"stdout_contains:OK\" / \"stdout_regex:^ok$\" / \"exit_code!=0\"），"
+        "期望非 0 退出码时加 expect_exit。target_po 乱写清单外 id、assertions 与实际输出不符，"
+        "该命令都会被机械编译器判失败；\n"
         "    ⚠ **至少要有一条「断言型」命令**：形如 "
         "`python -c \"import m; assert m.f(2) == 4\"` 或 `python -m unittest`，"
         "让机器用退出码替你判断对不对。只写 `python main.py` 这类「启动一下」的命令，"
@@ -2886,6 +2891,19 @@ def test_view_block(view: Any) -> str:
                 lines.append(f"      exposes：{', '.join(exposes[:8])}")
             if uses:
                 lines.append(f"      uses：{', '.join(uses[:8])}")
+
+    obligations = view.get("proof_obligations") or []
+    if obligations:
+        # 方案§七/§十：每条可执行命令必须显式归挂一个证明义务；id 只能从下表原样抄写。
+        lines.append("■ 证明义务清单（automated_commands[].target_po 只能从下列 id 中**原样抄写**，"
+                     "禁止自造；一条命令验证哪条义务就挂哪个 id）：")
+        for item in obligations[:20]:
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                required = "" if item.get("required", True) else "（可选）"
+                lines.append(
+                    f"  · {str(item.get('id')).strip()} [{str(item.get('kind') or '')}]{required}"
+                    f" {str(item.get('name') or '')[:80]}"
+                )
     return "\n".join(lines)
 
 
@@ -3474,6 +3492,10 @@ SYSTEM_NEW: dict[str, str] = {
         "例如「调用后返回长度为 3 的列表」；「正常运行」「无异常」「符合约定」这类说法一律不合格；\n"
         "  · automated_commands 每项给 {command, description}：命令要能**验证行为**"
         "（跑测试套件、断言脚本、校验命令），而不是「直接启动程序看一眼」；\n"
+        "    ⚠ **每条命令必须带 target_po**：从上方【证明义务清单】原样抄写该命令验证的义务 id"
+        "（入口冒烟类可留空但不能证明业务行为）；有输出可校验时加 assertions"
+        "（如 \"stdout_contains:OK\" / \"stdout_regex:^ok$\" / \"exit_code!=0\"），"
+        "期望非 0 退出码时加 expect_exit；乱写 id 或断言与实际输出不符会被机械判失败；\n"
         "    ⚠ **至少要有一条「断言型」命令**：形如 "
         "`python -c \"import m; assert m.f(2) == 4\"` 或 `python -m unittest`，"
         "让机器用退出码替你判断对不对。只写「启动一下」的命令，退出码 0 证明不了任何行为；\n"

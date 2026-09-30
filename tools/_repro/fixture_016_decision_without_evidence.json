@@ -1,0 +1,13 @@
+{
+  "id": "fixture-016-decision-without-evidence",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_decision_without_evidence；§二十六/§二十八 Decision 必须以证据为基"],
+  "description": "图上存在 verdict=pass 的 Decision 却没有 based_on 任何 Evidence ⇒ decision_without_evidence（error，Phase 6 起硬阻断）；can_release 对空证明同样不可放行。",
+  "scenario": "decision_without_evidence",
+  "input": {
+    "decision_id": "dec:bogus000001"
+  },
+  "expect": {
+    "error_code": "decision_without_evidence"
+  }
+}

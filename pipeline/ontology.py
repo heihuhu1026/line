@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
@@ -122,6 +123,7 @@ PREDICATES: frozenset[str] = frozenset({
     "supersedes",           # Artifact supersedes Artifact
     "based_on",             # Decision based_on Evidence
     "resolves",             # Decision resolves Defect
+    "applies_to",           # Decision applies_to WorkspaceRevision（裁决针对哪个版本）
     "has_revision",         # Workspace has_revision WorkspaceRevision
 })
 
@@ -153,6 +155,7 @@ _PREDICATE_TYPE_RULES: dict[str, dict[str, frozenset[str]]] = {
     "supersedes": {_SUBJECT_TYPES: frozenset({TYPE_ARTIFACT}), _OBJECT_TYPES: frozenset({TYPE_ARTIFACT})},
     "based_on": {_SUBJECT_TYPES: frozenset({TYPE_DECISION}), _OBJECT_TYPES: frozenset({TYPE_EVIDENCE})},
     "resolves": {_SUBJECT_TYPES: frozenset({TYPE_DECISION}), _OBJECT_TYPES: frozenset({TYPE_DEFECT})},
+    "applies_to": {_SUBJECT_TYPES: frozenset({TYPE_DECISION}), _OBJECT_TYPES: frozenset({TYPE_WORKSPACE_REVISION})},
     "has_revision": {_SUBJECT_TYPES: frozenset({TYPE_WORKSPACE}), _OBJECT_TYPES: frozenset({TYPE_WORKSPACE_REVISION})},
 }
 
@@ -204,6 +207,23 @@ EVIDENCE_CHECKER_KINDS: frozenset[str] = frozenset({
     "syntax", "import", "contract", "skeleton_conformance", "patch_audit", "rule",
     "materialization", "api_digest", "coverage",
 })
+
+#: PO kind → 允许证明它的证据 kind（方案§三 3.3 第 6 条：kind 必须匹配，禁止字符串模糊搜索）。
+#: 行为/回归/命令类只认真实断言执行（test_result）——rc==0 的入口冒烟（command_result）
+#: 永远不能单独证明业务行为（方案§九）；机械类各自由其专属检查器证据证明。
+PO_KIND_EVIDENCE_KINDS: dict[str, frozenset[str]] = {
+    PO_KIND_BEHAVIOR: frozenset({"test_result"}),
+    PO_KIND_REGRESSION: frozenset({"test_result"}),
+    PO_KIND_INVARIANT: frozenset({"test_result", "rule"}),
+    PO_KIND_COMMAND: frozenset({"test_result"}),
+    PO_KIND_SYNTAX: frozenset({"command_result", "test_result", "syntax"}),
+    PO_KIND_IMPORT: frozenset({"command_result", "test_result", "import"}),
+    PO_KIND_DELIVERY: frozenset({"command_result", "test_result", "materialization"}),
+    PO_KIND_MATERIALIZATION: frozenset({"materialization"}),
+    PO_KIND_INTERFACE: frozenset({"command_result", "test_result"}),
+    PO_KIND_CONTRACT: frozenset({"contract", "test_result", "command_result"}),
+    PO_KIND_INTERFACE_FREEZE: frozenset({"contract", "skeleton_conformance"}),
+}
 
 
 # --------------------------------------------------------------------- 工具函数
@@ -892,6 +912,73 @@ def _is_assertion_command(command: str) -> bool:
     return bool(re.search(r"[a-z0-9_\-]*test[a-z0-9_\-]*\.py\b", low))
 
 
+def _as_evidence(evidence: "EvidenceRecord | dict[str, Any]") -> "EvidenceRecord":
+    return evidence if isinstance(evidence, EvidenceRecord) else EvidenceRecord.from_dict(evidence)
+
+
+def evidence_po_bound(evidence: "EvidenceRecord | dict[str, Any]", po: "ProofObligation") -> bool:
+    """方案§三 3.3 第 1/6 条：证据**显式绑定**该 PO 且证据 kind 与 PO kind 匹配。
+
+    禁止字符串模糊匹配（``"add" in command`` 之类一律不算证明关系）。
+    """
+    ev = _as_evidence(evidence)
+    if po.id not in (ev.proof_obligation_ids or []):
+        return False
+    return ev.kind in PO_KIND_EVIDENCE_KINDS.get(po.kind, frozenset())
+
+
+def evidence_proves_po(
+    evidence: "EvidenceRecord | dict[str, Any]",
+    po: "ProofObligation",
+    *,
+    head_revision: str = "",
+) -> bool:
+    """严格判定一条证据能否证明一个 PO（方案§三 3.3，六条全部满足才 True）。
+
+    1. ``evidence.proof_obligation_ids`` 显式包含 ``po.id``（禁止一条证据默认证明全部 PO）；
+    2. ``evidence.truth == PROVEN``（真实机械/执行事实；DERIVED/ASSERTED 不能证明）；
+    3. ``evidence.status == PROVEN``（valid；失败证据走 :func:`evidence_fails_po`）；
+    4. 证据绑定的 ``workspace_revision`` 与当前验证 revision 一致；
+    5. 证据未被 supersede：证据没有独立 supersedes 边，其绑定 revision 一旦不再是
+       head（被后续 revision 取代）即视为 stale —— 与第 4 条同判（旧 revision 证据不可证明当前交付）；
+    6. ``evidence.kind`` 与 ``po.kind`` 匹配（behavior 只认 test_result，rc==0 冒充业务证明被拒）。
+
+    纯函数、无 IO、无模糊匹配。
+    """
+    ev = _as_evidence(evidence)
+    if not evidence_po_bound(ev, po):
+        return False
+    if ev.truth != TRUTH_PROVEN or ev.status != PO_STATUS_PROVEN:
+        return False
+    if not ev.workspace_revision:
+        return False
+    if head_revision and ev.workspace_revision != head_revision:
+        return False
+    return True
+
+
+def evidence_fails_po(
+    evidence: "EvidenceRecord | dict[str, Any]",
+    po: "ProofObligation",
+    *,
+    head_revision: str = "",
+) -> bool:
+    """严格判定一条证据能否判一个 PO **FAILED**（绑定/kind/revision 规则同 proves，状态取 FAILED）。
+
+    失败同样必须精确归因：未绑定到该 PO 的失败证据不能判它 FAILED（应 UNPROVEN）。
+    """
+    ev = _as_evidence(evidence)
+    if not evidence_po_bound(ev, po):
+        return False
+    if ev.truth != TRUTH_PROVEN or ev.status != PO_STATUS_FAILED:
+        return False
+    if not ev.workspace_revision:
+        return False
+    if head_revision and ev.workspace_revision != head_revision:
+        return False
+    return True
+
+
 def evaluate_against_verify(
     graph: OntologyGraph,
     verify_report: Any,
@@ -899,6 +986,8 @@ def evaluate_against_verify(
     contract_problems: Iterable[Any] = (),
     skeleton_conformance: Any = None,
     contract_checked: bool = False,
+    command_po_bindings: "Mapping[str, Iterable[str]] | None" = None,
+    parent_revision: str = "",
     at: str = "",
 ) -> OntologyGraph:
     """规格§二十/§三十二/§十八：把真实 verify 报告机械映射为 Evidence + PO 三态（纯函数）。
@@ -913,6 +1002,12 @@ def evaluate_against_verify(
     ``contract_checked`` 显式声明 contract_check 这轮真机跑过（它由编排器聚合验证调用，
     不在 verify() 内部）；``skeleton_conformance`` 传 ``None`` 表示该来源缺席（UNPROVEN）。
 
+    ``command_po_bindings``（命令串→PO id 列表）与命令 dict 自带的 ``target_po`` /
+    ``target_po_ids`` / ``proof_obligation_ids`` 字段是**显式证据绑定**（方案§三 3.3）：
+    只要任一绑定来源出现，behavior/command/regression/invariant 类 PO 就走严格路径，
+    只有显式绑定且 kind 匹配的 PROVEN 证据能证明它，禁止串证；无任何绑定来源时
+    保留旧行为（pass + 断言型证据 → 行为族 PO 全 PROVEN），兼容旧调用方与旧 run。
+
     **self_check 不参与本函数** —— 这里的每一条证据都来自机械执行/静态检查。
     """
     report = verify_report if isinstance(verify_report, dict) else {}
@@ -923,6 +1018,15 @@ def evaluate_against_verify(
         c for c in (report.get("commands") or [])
         if isinstance(c, dict) and str(c.get("status") or "") in ("ok", "fail", "timeout", "error")
     ]
+    # ---- 显式证据绑定（方案§三 3.3）：入参 bindings + 命令 dict 自带 target_po 字段 ----
+    explicit_bindings: dict[str, list[str]] = {}
+    if command_po_bindings:
+        for cmd_text, po_ids in command_po_bindings.items():
+            explicit_bindings[str(cmd_text)] = [str(x) for x in (po_ids or []) if str(x)]
+    has_explicit_bindings = bool(explicit_bindings) or any(
+        isinstance(c, dict) and (c.get("target_po") or c.get("target_po_ids") or c.get("proof_obligation_ids"))
+        for c in (report.get("commands") or [])
+    )
     interface = report.get("interface_audit") if isinstance(report.get("interface_audit"), dict) else {}
     missing_symbols = list(interface.get("missing_symbols") or [])
     contracts = [str(p) for p in (contract_problems or ())]
@@ -933,8 +1037,11 @@ def evaluate_against_verify(
     manifest_digest = stable_hash(materialized)
     rev_id = f"wsr:verify:{manifest_digest[:12]}"
     rev_status = {"pass": "VERIFIED", "fail": "FAILED"}.get(verdict, "UNVERIFIED")
+    # verify 工作区由在制链头物化而来（方案§二十三）：父链已存在才挂，缺省安全。
+    rev_parent = parent_revision if (parent_revision and parent_revision in graph.revisions) else ""
     graph.add_revision(WorkspaceRevision(
         revision_id=rev_id, workspace_id=graph.workspace_id, source="verify",
+        parent_revision=rev_parent,
         manifest_digest=manifest_digest,
         verification_digest=stable_hash(
             {"v": verdict, "c": [
@@ -968,14 +1075,33 @@ def evaluate_against_verify(
     assertion_evidence: list[str] = []
     for c in executed:
         cmd = str(c.get("command") or "")
-        is_test = _is_assertion_command(cmd)
+        # TestCompiler 透传了业务断言（exit_code==0 之外）的命令等价于断言型测试：
+        # 它的通过/失败有机械断言支撑；裸 rc=0 的入口冒烟仍然只是 command_result。
+        behavioral_assertions = [
+            str(a).strip() for a in (c.get("assertions") or [])
+            if str(a).strip() not in ("", "exit_code==0")
+        ]
+        is_test = _is_assertion_command(cmd) or bool(behavioral_assertions)
         kind = "test_result" if is_test else "command_result"
         eid = _ev_id(kind, f"{cmd}:{c.get('exit_code')}")
         ok = str(c.get("status") or "") == "ok"
+        # 显式绑定：命令 dict 自带字段优先，其次入参 bindings（只绑图上已存在的 PO）。
+        bound_pos: list[str] = []
+        for raw in (
+            c.get("proof_obligation_ids"),
+            c.get("target_po_ids"),
+            [c.get("target_po")] if c.get("target_po") else None,
+            explicit_bindings.get(cmd),
+        ):
+            for pid in (raw or []):
+                pid = str(pid or "")
+                if pid and pid in graph.obligations and pid not in bound_pos:
+                    bound_pos.append(pid)
         ev = EvidenceRecord(
             id=eid, kind=kind, source=cmd,
             status=PO_STATUS_PROVEN if ok else PO_STATUS_FAILED,
             truth=TRUTH_PROVEN, workspace_revision=rev_id,
+            proof_obligation_ids=bound_pos,
             command=cmd, exit_code=c.get("exit_code"),
             stdout_hash=_text_hash(c.get("stdout_tail")),
             stderr_hash=_text_hash(c.get("stderr_tail")),
@@ -986,16 +1112,32 @@ def evaluate_against_verify(
         if is_test:
             assertion_evidence.append(eid)
 
-    # ---- 负向对照证据 ----
-    nc_ev_id = ""
-    if control.get("checked"):
-        nc_ev_id = _ev_id("negative_control", str(control.get("checked")))
-        nc_ok = not no_power
+    # ---- 负向对照证据（方案§十八：必须合法化）----
+    # negative_control 是**执行类**证据：每条都必须真实重跑过，带
+    # command/exit_code/execution source/workspace_revision，四者缺一就不许产生证据，
+    # 更不许无痕迹标 PROVEN。撤掉改动后断言仍过 ⇒ 无判别力（FAILED，命令进 no_power）；
+    # 撤掉后变红 ⇒ 有判别力（PROVEN）。旧报告没有 runs 字段时缺省为不产生证据（旧 run 可读）。
+    nc_ev_ids: list[str] = []
+    for run in (control.get("runs") or []):
+        if not isinstance(run, dict):
+            continue
+        nc_cmd = str(run.get("command") or "")
+        nc_code = run.get("exit_code")
+        nc_st = str(run.get("status") or "")
+        if (not nc_cmd or not isinstance(nc_code, int)
+                or nc_st not in ("ok", "fail", "timeout", "error")):
+            continue
+        eid = _ev_id("negative_control", nc_cmd)
         graph.add_evidence(EvidenceRecord(
-            id=nc_ev_id, kind="negative_control", source="verify.negative_control",
-            status=PO_STATUS_PROVEN if nc_ok else PO_STATUS_FAILED,
+            id=eid, kind="negative_control",
+            source="verify.negative_control:" + nc_cmd,
+            status=PO_STATUS_FAILED if nc_st == "ok" else PO_STATUS_PROVEN,
             truth=TRUTH_PROVEN, workspace_revision=rev_id, created_at=at,
+            command=nc_cmd, exit_code=nc_code,
+            stdout_hash=_text_hash(run.get("stdout_tail")),
+            stderr_hash=_text_hash(run.get("stderr_tail")),
         ))
+        nc_ev_ids.append(eid)
 
     # ---- 契约 / 冻结骨架双路静态证据（规格§十八 Interface Freeze）----
     # 两路都只在真机静态检查真的跑过时产生；缺席 = 没有该来源证据（UNPROVEN），
@@ -1094,8 +1236,29 @@ def evaluate_against_verify(
                 new_status = PO_STATUS_PROVEN if cmd_evidence else PO_STATUS_UNPROVEN
                 ev_ids = cmd_evidence[:1]
         else:
-            # behavior / command / regression / invariant：需要断言型真实执行
-            if verdict == "pass" and assertion_evidence:
+            # behavior / command / regression / invariant
+            if has_explicit_bindings:
+                # 严格路径（方案§三 3.3）：只认显式绑定到本 PO、kind 匹配、revision 一致的证据，
+                # 任何未绑定给它的断言通过都不能串证（含 rc==0 的入口冒烟 command_result）。
+                proven_evs = [
+                    eid for eid in cmd_evidence
+                    if evidence_proves_po(graph.evidence[eid], po, head_revision=rev_id)
+                ]
+                failed_evs = [
+                    eid for eid in cmd_evidence
+                    if evidence_fails_po(graph.evidence[eid], po, head_revision=rev_id)
+                ]
+                if proven_evs:
+                    new_status = PO_STATUS_PROVEN
+                    ev_ids = proven_evs
+                elif failed_evs:
+                    new_status = PO_STATUS_FAILED
+                    ev_ids = failed_evs
+                else:
+                    # 跑了但没有绑定给本 PO 的匹配证据（含只跑入口冒烟/断言未覆盖）⇒ UNPROVEN
+                    new_status = PO_STATUS_UNPROVEN
+            elif verdict == "pass" and assertion_evidence:
+                # 兼容路径：调用方未提供任何绑定信息时保留旧行为（旧 smoke/旧 run 依赖）
                 new_status = PO_STATUS_PROVEN
                 ev_ids = assertion_evidence
             elif verdict == "pass" and cmd_evidence and not assertion_evidence:
@@ -1105,7 +1268,7 @@ def evaluate_against_verify(
                 new_status = PO_STATUS_FAILED
                 ev_ids = [e for e in cmd_evidence
                           if graph.evidence.get(e) and graph.evidence[e].status == PO_STATUS_FAILED]
-        if nc_ev_id and po.required and new_status == PO_STATUS_PROVEN and no_power:
+        if nc_ev_ids and po.required and new_status == PO_STATUS_PROVEN and no_power:
             new_status = PO_STATUS_UNPROVEN
         po.status = new_status
         po.evidence_ids = ev_ids
@@ -1690,6 +1853,277 @@ def project_interface_freeze(graph: "OntologyGraph", frozen: Iterable[dict[str, 
     return po_ids
 
 
+# --------------------------------------------------------------------- Task→Patch→WorkspaceRevision 投影（方案§十九~§二十四）
+
+#: 任务事务产生的工作区 revision 状态。
+WSR_STATUS_BASE = "BASE"
+WSR_STATUS_COMMITTED = "COMMITTED"
+WSR_STATUS_WIP = "WIP"
+
+
+def workspace_symbol_id(file_path: str, name: str) -> str:
+    """Symbol 的确定性语义身份（方案§二十一：必须来自确定性解析，禁止 LLM 猜）。
+
+    身份只依赖 ``(文件相对路径, 符号名)``，与措辞/轮次无关。
+    """
+    return "sym:" + stable_hash(
+        [str(file_path or "").replace("\\", "/"), str(name or "")], length=12
+    )
+
+
+def _relate_once(graph: "OntologyGraph", subject: str, predicate: str, obj: str,
+                 *, truth: str = TRUTH_DERIVED) -> bool:
+    """(subject,predicate,object) 去重后再 relate —— relate 本身只 append。
+
+    返回 True 表示本次确实新增了一条边（供投影计数）。
+    """
+    if any(r.subject == subject and r.predicate == predicate and r.object == obj
+           for r in graph.relations):
+        return False
+    graph.relate(subject, predicate, obj, truth=truth)
+    return True
+
+
+def project_workspace_chain(
+    graph: "OntologyGraph",
+    transactions: Iterable[dict[str, Any]],
+    *,
+    at: str = "",
+) -> dict[str, Any]:
+    """方案§十九~§二十四：把 task transactions 投影为
+    ``Task → Patch → Symbol / Patch materialized_in WorkspaceRevision`` 真实父子链。
+
+    输入事务（orchestrator ``state["task_transactions"]`` 的行，字段全部缺省安全）：
+    ``task_semantic_id / patch_id / base_manifest / parent_workspace_revision /
+    result_workspace_revision / status / round / patches``，其中 patches 为**真正物化
+    成功**的 ``[{path, symbol, change_type, patch_mode}]``。
+
+    纪律：纯函数、幂等（对象按 id 覆盖同数据、关系三元组去重）；只追加投影、不裁决；
+    parent 只指向图上**已存在**的 revision（旧事务的复合 base 串不可用作 id，宁断不造
+    悬空端点）。返回投影计数与链式 head（供 verify revision 挂父）。
+    """
+    prov = Provenance(source="taskcompiler", stage="task_transaction")
+    revision_count = patch_count = symbol_count = 0
+    head = ""
+    head_round: Any = None
+    base_added: set[str] = set()
+
+    for seq, txn in enumerate(transactions or []):
+        if not isinstance(txn, dict):
+            continue
+        result_id = str(txn.get("result_workspace_revision") or "")
+        round_no = txn.get("round")
+        semantic_id = str(txn.get("task_semantic_id") or "")
+        patch_digest = str(txn.get("patch_id") or "")
+
+        if result_id and result_id not in graph.revisions:
+            # 父 revision：优先事务里机械记录的链头；旧事务无该字段时，同轮按执行顺序
+            # 接当前 head（内容寻址链的兜底，绝不引用图上不存在的 id）。
+            recorded_parent = str(txn.get("parent_workspace_revision") or "")
+            if recorded_parent and recorded_parent not in graph.revisions:
+                recorded_parent = ""
+            if not recorded_parent and head and head in graph.revisions and round_no == head_round:
+                recorded_parent = head
+            # 根：本轮基线内容 revision（source=base，只挂一次）。
+            base_manifest = str(txn.get("base_manifest") or "")
+            if not recorded_parent and base_manifest and base_manifest not in graph.revisions \
+                    and base_manifest not in base_added:
+                graph.add_revision(WorkspaceRevision(
+                    revision_id=base_manifest, workspace_id=graph.workspace_id,
+                    source="base", manifest_digest=base_manifest,
+                    created_at=at, status=WSR_STATUS_BASE,
+                ))
+                base_added.add(base_manifest)
+                if graph.get("ws:main") is None:
+                    graph.add(SemanticObject(id="ws:main", type=TYPE_WORKSPACE,
+                                             payload={"workspace_id": graph.workspace_id}))
+                _relate_once(graph, "ws:main", "has_revision", base_manifest)
+                if not recorded_parent:
+                    recorded_parent = base_manifest
+            status = WSR_STATUS_COMMITTED if str(txn.get("status") or "") == "committed" \
+                else WSR_STATUS_WIP
+            graph.add_revision(WorkspaceRevision(
+                revision_id=result_id, workspace_id=graph.workspace_id,
+                parent_revision=recorded_parent,
+                source="task", task_id=semantic_id,
+                patch_digest=patch_digest,
+                manifest_digest=result_id,
+                created_at=str(txn.get("at") or at), status=status,
+            ))
+            if graph.get("ws:main") is None:
+                graph.add(SemanticObject(id="ws:main", type=TYPE_WORKSPACE,
+                                         payload={"workspace_id": graph.workspace_id}))
+            _relate_once(graph, "ws:main", "has_revision", result_id)
+            revision_count += 1
+
+        # ---- Patch / Symbol（只给真正物化成功的文件；方案§二十二）----
+        if result_id and result_id in graph.revisions:
+            task_obj = graph.objects.get(semantic_id) if semantic_id else None
+            task_files = set()
+            if task_obj is not None:
+                task_files = {
+                    str(p).replace("\\", "/")
+                    for p in (task_obj.payload.get("target_files") or [])
+                }
+            for entry in (txn.get("patches") or []):
+                if not isinstance(entry, dict):
+                    continue
+                path = str(entry.get("path") or "").replace("\\", "/")
+                if not path:
+                    continue
+                pid = "patch:" + stable_hash(
+                    [patch_digest or semantic_id or str(txn.get("task") or ""),
+                     str(round_no), seq, path], length=12)
+                if graph.get(pid) is None:
+                    graph.add(SemanticObject(
+                        id=pid, type=TYPE_PATCH, truth=TRUTH_DERIVED,
+                        payload={
+                            "patch_digest": patch_digest,
+                            "task_semantic_id": semantic_id,
+                            "task_id": semantic_id,  # validate_tasks 的越权判据别名
+                            "path": path,
+                            "change_type": str(entry.get("change_type") or ""),
+                            "patch_mode": str(entry.get("patch_mode") or ""),
+                        },
+                        provenance=[prov],
+                    ))
+                    patch_count += 1
+                _relate_once(graph, pid, "materialized_in", result_id)
+                symbol_name = str(entry.get("symbol") or "")
+                if symbol_name:
+                    sid = workspace_symbol_id(path, symbol_name)
+                    if graph.get(sid) is None:
+                        graph.add(SemanticObject(
+                            id=sid, type=TYPE_SYMBOL, truth=TRUTH_DERIVED,
+                            payload={"name": symbol_name, "file": path, "path": path},
+                            provenance=[prov],
+                        ))
+                        symbol_count += 1
+                    _relate_once(graph, pid, "changes", sid)
+                    # owns 只在符号文件属于该 Task 目标面时挂（租约口径，避免误报越权）。
+                    if task_obj is not None and (not task_files or path in task_files):
+                        _relate_once(graph, semantic_id, "owns", sid)
+
+        if result_id:
+            head = result_id
+            head_round = round_no
+
+    return {
+        "revisions": revision_count,
+        "patches": patch_count,
+        "symbols": symbol_count,
+        "head_revision": head,
+    }
+
+
+def project_artifact_chain(graph: "OntologyGraph", envelopes: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """方案§三十/§三十一：artifact envelope → Artifact 一等对象 + provenance 边。
+
+    **不另造一套 artifact hash**：直接消费编排器 ``_record`` 已算好的 envelope
+    （artifact_id / stage / artifact_revision / supersedes / input_hash /
+    output_hash / caused_by / truth）。关系只挂已存在端点：
+
+    * ``derived_from`` —— envelope 的 ``caused_by`` 直接上游（intake→pm→plan→…→verify）；
+    * ``supersedes``   —— 同阶段上一版（旧版不删，replay 可还原「当时基于哪个 Plan」）。
+
+    两遍处理（先建对象再挂边），幂等。返回新增计数
+    ``{"artifacts", "derived_from", "supersedes"}``。
+    """
+    rows = [e for e in (envelopes or []) if isinstance(e, dict) and str(e.get("artifact_id") or "")]
+    count = {"artifacts": 0, "derived_from": 0, "supersedes": 0}
+    for env in rows:
+        aid = str(env["artifact_id"])
+        if graph.get(aid) is not None:
+            continue
+        stage_name = str(env.get("stage") or "")
+        # 人工闸门产物携带人工事实（ASSERTED 必须有 user/human provenance，见校验器）。
+        source = "human" if stage_name == "human_review" else str(
+            env.get("produced_by") or stage_name or "pipeline"
+        )
+        try:
+            revision = int(env.get("revision") or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        graph.add(SemanticObject(
+            id=aid, type=TYPE_ARTIFACT,
+            truth=str(env.get("truth") or TRUTH_DERIVED),
+            payload={
+                "stage": str(env.get("stage") or ""),
+                "artifact_revision": revision,
+                "input_hash": str(env.get("input_hash") or ""),
+                "output_hash": str(env.get("output_hash") or ""),
+                "created_at": str(env.get("created_at") or ""),
+            },
+            provenance=[Provenance(source=source, stage=str(env.get("stage") or ""))],
+        ))
+        count["artifacts"] += 1
+    for env in rows:
+        aid = str(env["artifact_id"])
+        for up in (env.get("caused_by") or []):
+            up = str(up or "")
+            if up and graph.get(up) is not None and _relate_once(
+                graph, aid, "derived_from", up,
+                truth=str(env.get("truth") or TRUTH_DERIVED),
+            ):
+                count["derived_from"] += 1
+        for old in (env.get("supersedes") or []):
+            old = str(old or "")
+            if old and graph.get(old) is not None and _relate_once(
+                graph, aid, "supersedes", old, truth=TRUTH_DERIVED
+            ):
+                count["supersedes"] += 1
+    return count
+
+
+def project_conflict_claims(
+    graph: "OntologyGraph", groups: Iterable[Iterable[dict[str, Any]]]
+) -> int:
+    """方案§三十二/§三十三：把机械发现的极性冲突组投影为带 subject/polarity 的 Claim。
+
+    入参为 :func:`prompts.claim_conflict_groups` 的产物（每组 ≥2 条事实，组内已经过
+    「同话题 + 极性翻转」严判据连通）。组内事实共享一个内容派生的 ``subject``，
+    随后由 ``validate_contradictions_structured`` 复用 ``reconcile_claims`` 仲裁：
+    同级对立 ⇒ ``claim_contradiction``（硬阻断）；不同事实等级 ⇒ 高者覆盖，不报错。
+
+    Claim 身份由 (subject, text, source) 稳定决定，跨轮重投幂等。返回新建 Claim 数。
+    """
+    created = 0
+    for group in (groups or []):
+        members = [f for f in group if isinstance(f, dict) and str(f.get("text") or "").strip()]
+        if len(members) < 2:
+            continue
+        subject = "conflict:" + stable_hash(
+            sorted(str(m.get("text") or "") for m in members), length=12
+        )
+        for fact in members:
+            try:
+                polarity = int(fact.get("polarity") or 0)
+            except (TypeError, ValueError):
+                polarity = 0
+            if polarity not in (-1, 1):
+                continue
+            text = str(fact.get("text") or "")
+            source = str(fact.get("source") or "pm")
+            cid = "claim:conflict:" + stable_hash([subject, text, source], length=12)
+            if graph.get(cid) is not None:
+                continue
+            truth = TRUTH_ASSERTED if str(fact.get("truth") or "").upper() == "ASSERTED" else TRUTH_DERIVED
+            graph.add(SemanticObject(
+                id=cid, type=TYPE_CLAIM, truth=truth,
+                payload={
+                    "subject": subject,
+                    "polarity": polarity,
+                    "text": text[:300],
+                    "where": str(fact.get("where") or ""),
+                },
+                provenance=[Provenance(
+                    source=source, stage="intake_decision" if source == "human" else "pm"
+                )],
+            ))
+            created += 1
+    return created
+
+
 # --------------------------------------------------------------------- Schema Guardian（规格§五十八）
 
 def schema_self_check() -> list[str]:
@@ -1756,5 +2190,145 @@ def schema_self_check() -> list[str]:
         if binding.get("kind") not in ("smoke", "tool", "module"):
             problems.append(f"内置 Invariant {inv_id} 的绑定 kind 非法：{binding.get('kind')!r}")
     return problems
+
+
+# --------------------------------------------------------------------- Release Decision（方案§二十六~§二十八）
+
+#: 机器放行裁决闭集：pass（可交付）/ rework（继续整改或转人工）。
+DECISION_PASS = "pass"
+DECISION_REWORK = "rework"
+
+
+def release_basis(graph: "OntologyGraph") -> dict[str, Any]:
+    """汇总放行裁决的事实基础：被验证的链头 revision + 支撑必需 PO 的证据。
+
+    返回 ``{"revision": str, "evidence_ids": list[str]}``：
+
+    * ``revision`` —— 只认真实执行 verify 产生（``source=="verify"``）且当前仍是
+      工作区链头的 WorkspaceRevision；链头停在 WIP 时返回空串（未验证版本不得放行）；
+    * ``evidence_ids`` —— 与任意 required PO 绑定、状态 PROVEN 的证据 id（稳定排序去重）。
+
+    纯函数、缺省安全：空图 / 缺字段返回空基础，不抛异常。
+    """
+    head = graph.head_revision()
+    rev = graph.revisions.get(head) if head else None
+    verified = head if rev is not None and rev.source == "verify" else ""
+    required_po = {po.id for po in graph.obligations.values() if po.required}
+    ids: set[str] = set()
+    for ev in graph.evidence.values():
+        if ev.status != PO_STATUS_PROVEN:
+            continue
+        bound = {str(x) for x in (ev.proof_obligation_ids or [])}
+        if required_po.intersection(bound):
+            ids.add(ev.id)
+    return {"revision": verified, "evidence_ids": sorted(ids)}
+
+
+def can_release(
+    *,
+    proof_status: dict[str, Any] | None,
+    review_verdict: str,
+    verified_workspace_revision: str = "",
+    graph: "OntologyGraph | None" = None,
+) -> dict[str, Any]:
+    """方案§二十八：放行条件的**唯一收敛点**（纯确定性函数，不问 LLM）。
+
+    机器允许 ``pass`` 当且仅当同时满足：
+
+    1. 语义评审终判为 pass（含确定性裁决层的复核）；
+    2. Proof Gate 机械证明 ``status == PROVEN``（required PO 全 PROVEN、verify 真跑且过、
+       无阻断级机械证据、无语义完整性 error —— 后者已由 gate 就地降级进 proof_status）；
+    3. 存在经 verify 验证且仍是链头的 WorkspaceRevision（可给 graph 时自动核对）。
+
+    返回 ``{"can_pass": bool, "verdict": "pass"|"rework", "status": PROVEN/UNPROVEN/FAILED,
+    "verified_revision": str, "blocking_reasons": [str, ...]}``。
+    """
+    proof = proof_status if isinstance(proof_status, dict) else {}
+    reasons: list[str] = []
+
+    verified = str(verified_workspace_revision or "")
+    if not verified and graph is not None:
+        verified = str(release_basis(graph).get("revision") or "")
+
+    if str(review_verdict or "").strip() != DECISION_PASS:
+        reasons.append("semantic_review_not_pass：语义评审终判不是 pass")
+    if not verified:
+        reasons.append("no_verified_workspace：没有经 verify 验证且仍是链头的 WorkspaceRevision")
+    p_status = str(proof.get("status") or "UNPROVEN")
+    if p_status != PO_STATUS_PROVEN:
+        for item in (proof.get("failed") or []):
+            reasons.append(f"proof_failed：{item}")
+        for item in (proof.get("mandatory_missing") or []):
+            reasons.append(f"proof_unproven：{item}")
+        if not proof.get("failed") and not proof.get("mandatory_missing"):
+            reasons.append(f"proof_status_{p_status.lower()}：机械证明未达 PROVEN")
+
+    can_pass = not reasons
+    if can_pass:
+        status = PO_STATUS_PROVEN
+        verdict = DECISION_PASS
+    else:
+        status = PO_STATUS_FAILED if proof.get("failed") else PO_STATUS_UNPROVEN
+        verdict = DECISION_REWORK
+    return {
+        "can_pass": can_pass,
+        "verdict": verdict,
+        "status": status,
+        "verified_revision": verified,
+        "blocking_reasons": reasons,
+    }
+
+
+def project_decision(
+    graph: "OntologyGraph",
+    *,
+    verdict: str,
+    reason: str = "",
+    revision: str = "",
+    evidence_ids: Iterable[str] = (),
+    defect_ids: Iterable[str] = (),
+    round_no: Any = 0,
+    at: str = "",
+) -> str:
+    """方案§二十六：把一次放行裁决投影为 Decision 一等对象（DERIVED，幂等）。
+
+    关系只挂**已存在**的端点（不造悬空）：``based_on`` Evidence、``resolves`` Defect、
+    ``applies_to`` WorkspaceRevision。身份由「轮次 + 裁决 + 版本 + 证据集合」稳定决定，
+    同一轮重投不产生重复对象/边。返回 Decision id。
+    """
+    ev_ids = sorted({str(x) for x in evidence_ids if str(x)})
+    df_ids = sorted({str(x) for x in defect_ids if str(x)})
+    did = "dec:" + stable_hash(
+        canonical_json([int(round_no or 0), str(verdict), str(revision), ev_ids]),
+        length=12,
+    )
+    if graph.get(did) is None:
+        graph.add(SemanticObject(
+            id=did, type=TYPE_DECISION, truth=TRUTH_DERIVED,
+            payload={
+                "verdict": str(verdict or ""),
+                "reason": str(reason or "")[:500],
+                "revision": str(revision or ""),
+                "at": str(at or ""),
+                "round": int(round_no or 0),
+            },
+            provenance=[Provenance(source="release_gate", stage="review")],
+        ))
+    else:
+        obj = graph.get(did)
+        obj.payload.update({
+            "verdict": str(verdict or ""),
+            "reason": str(reason or "")[:500],
+            "revision": str(revision or ""),
+        })
+    for ev_id in ev_ids:
+        if ev_id in graph.evidence:
+            _relate_once(graph, did, "based_on", ev_id, truth=TRUTH_DERIVED)
+    if revision and revision in graph.revisions:
+        _relate_once(graph, did, "applies_to", revision, truth=TRUTH_DERIVED)
+    for defect_id in df_ids:
+        if graph.get(defect_id) is not None:
+            _relate_once(graph, did, "resolves", defect_id, truth=TRUTH_DERIVED)
+    return did
 
 

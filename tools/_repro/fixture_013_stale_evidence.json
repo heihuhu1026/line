@@ -1,0 +1,14 @@
+{
+  "id": "fixture-013-stale-evidence",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_stale_evidence；§二十五 证据只认链头"],
+  "description": "PROVEN 执行证据绑定的是旧 verify revision，当前链头已推进到新 revision ⇒ stale_evidence（error）。旧证据不能证明新工作区。",
+  "scenario": "stale_evidence",
+  "input": {
+    "old_revision": "wsr:verify:000000000001",
+    "new_revision": "wsr:verify:000000000002"
+  },
+  "expect": {
+    "error_code": "stale_evidence"
+  }
+}

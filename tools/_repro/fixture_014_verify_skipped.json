@@ -1,0 +1,22 @@
+{
+  "id": "fixture-014-verify-skipped",
+  "source_run": "20260929-121404",
+  "derived_from": ["方案§三十七 fixture_verify_skipped；§三十八 真机 run 20260929-121404 永久回归；§二十九 skipped≠pass"],
+  "description": "真机形态：verify=skipped、语义评审 pass。Proof Gate 必须判 UNPROVEN（mandatory_missing 点名 verify_skipped 与未证 required PO），确定性裁决翻回 rework_dev，can_release 不可放行。该 fixture 是 run 20260929-121404 的永久回归。",
+  "scenario": "verify_skipped",
+  "input": {
+    "semantic_pass": true,
+    "verify_verdict": "skipped",
+    "workspace_verified": false,
+    "obligations": [
+      {"id": "po:behavior", "kind": "behavior", "required": true, "claim": "程序运行行为符合需求"}
+    ]
+  },
+  "expect": {
+    "proof_status": "UNPROVEN",
+    "proof_code": "required_proof_unproven",
+    "decision": "rework_dev",
+    "blocking_reason_contains": "verify_skipped",
+    "can_release": false
+  }
+}

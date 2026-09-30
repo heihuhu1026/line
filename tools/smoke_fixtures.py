@@ -17,9 +17,11 @@ sys.path.insert(0, str(ROOT))
 
 from pipeline import diagnose as DGN  # noqa: E402
 from pipeline import ontology as O  # noqa: E402
+from pipeline import ontology_validate as OV  # noqa: E402
 from pipeline import patches  # noqa: E402
 from pipeline import planir as P  # noqa: E402
 from pipeline import taskcompiler as TC  # noqa: E402
+from pipeline import testcompiler as TSC  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -192,6 +194,181 @@ def _replay_recompile_id(fx: dict, inp: dict, exp: dict) -> None:
           f"{fx['id']}：supersedes 指向上版 {t1['id']}", str(t2.get("supersedes")))
 
 
+# ----------------------------------------------------------------- 方案§三十七 新增 8 fixture
+
+def _graph_with_required(inp: dict) -> O.OntologyGraph:
+    """建 Requirement + required PO（行为类）底图。"""
+    g = O.OntologyGraph()
+    g.add(O.SemanticObject(
+        id="req:1", type=O.TYPE_REQUIREMENT, truth=O.TRUTH_ASSERTED,
+        payload={"text": str(inp.get("requirement") or "需求")},
+        provenance=[O.Provenance(source="user", stage="intake")],
+    ))
+    for raw in inp.get("obligations") or []:
+        g.add_obligation(O.ProofObligation(
+            id=raw["id"], name=str(raw.get("claim") or raw["id"]),
+            claim=str(raw.get("claim") or raw["id"]),
+            requirement_id="req:1", kind=str(raw.get("kind") or O.PO_KIND_BEHAVIOR),
+            required=bool(raw.get("required", True)),
+            verifier={"kind": "command", "command": "python -m pytest"},
+        ))
+    return g
+
+
+def _replay_proof_binding(fx: dict, inp: dict, exp: dict) -> None:
+    g = _graph_with_required(inp)
+    O.evaluate_against_verify(g, inp["verify_report"])
+    proven = g.obligations[exp["proven_po"]]
+    unproven = g.obligations[exp["unproven_po"]]
+    check(proven.status == O.PO_STATUS_PROVEN, f"{fx['id']}：显式绑定的 PO PROVEN", proven.status)
+    check(unproven.status == O.PO_STATUS_UNPROVEN,
+          f"{fx['id']}：未绑定证据的 required PO 保持 UNPROVEN（禁止串证）", unproven.status)
+    proof = O.release_proof_status(
+        semantic_pass=True, verify_verdict=inp["verify_report"]["verdict"],
+        obligations=list(g.obligations.values()), workspace_verified=True)
+    check(proof["status"] == exp["proof_status"] and proof["code"] == exp["proof_code"]
+          and proof["can_pass"] == exp["can_pass"],
+          f"{fx['id']}：Proof Gate {exp['proof_status']}/{exp['proof_code']}",
+          f"{proof['status']}/{proof['code']}")
+    check(any(exp["unproven_po"] in m for m in proof["mandatory_missing"]),
+          f"{fx['id']}：mandatory_missing 点名 {exp['unproven_po']}")
+
+
+def _replay_testcompiler_runtime(fx: dict, inp: dict, exp: dict) -> None:
+    res = TSC.compile_scenarios(obligations=inp["obligations"], files=inp["files"])
+    by_target = {s["target_po"]: s for s in res["scenarios"]}
+    scen = by_target.get(exp["executable_target"])
+    check(scen is not None and scen["status"] == TSC.STATUS_EXECUTABLE
+          and any(exp["executable_command_contains"] in str(c)
+                  for c in scen.get("automated_commands") or []),
+          f"{fx['id']}：{exp['executable_target']} 机械编译出可执行场景",
+          str(scen))
+    check(exp["coverage_gap_contains"] in (res.get("coverage_gap") or []),
+          f"{fx['id']}：无机械命令的 PO 落 coverage_gap {exp['coverage_gap_contains']}",
+          str(res.get("coverage_gap")))
+
+
+def _replay_invalid_ontology(fx: dict, inp: dict, exp: dict) -> None:
+    g = O.OntologyGraph()
+    g.add(O.SemanticObject(
+        id="req:1", type=O.TYPE_REQUIREMENT, truth=O.TRUTH_ASSERTED,
+        provenance=[O.Provenance(source="user", stage="intake")]))
+    g.add(O.SemanticObject(
+        id=inp["subject"], type=O.TYPE_TASK, truth=O.TRUTH_DERIVED,
+        provenance=[O.Provenance(source="taskcompiler", stage="compile_plan")]))
+    # 脏数据（旧产物反序列化）：relate 正常路径会拒绝，直接 append 模拟。
+    g.relations.append(O.OntologyRelation(
+        id="rel:bad", subject=inp["subject"], predicate=inp["predicate"],
+        object=inp["object"]))
+    errors = OV.blocking_errors(OV.validate_all_structured(g))
+    codes = {p.code for p in errors}
+    check(exp["error_code"] in codes, f"{fx['id']}：硬阻断 {exp['error_code']}", str(codes))
+
+
+def _replay_workspace_chain(fx: dict, inp: dict, exp: dict) -> None:
+    g = O.OntologyGraph()
+    g.add(O.SemanticObject(
+        id="req:1", type=O.TYPE_REQUIREMENT, truth=O.TRUTH_ASSERTED,
+        provenance=[O.Provenance(source="user", stage="intake")]))
+    tid = inp["task_id"]
+    g.add(O.SemanticObject(
+        id=tid, type=O.TYPE_TASK, truth=O.TRUTH_DERIVED,
+        payload={"target_files": [inp["file"]], "symbols": []},
+        provenance=[O.Provenance(source="taskcompiler", stage="compile_plan")]))
+    g.relate(tid, "implements", "req:1")
+
+    def _txn(seq: int, parent: str) -> dict:
+        return {
+            "round": 1, "task": f"T{seq}", "task_semantic_id": tid,
+            "base_manifest": inp["base"] if seq == 1 else "",
+            "parent_workspace_revision": parent,
+            "result_workspace_revision": f"wsr:wip:r{seq:08d}",
+            "patches": [{"path": inp["file"], "symbol": inp["symbol"],
+                         "change_type": "add", "patch_mode": "new_file"}],
+            "status": "committed",
+        }
+
+    t1 = _txn(1, "")
+    t2 = _txn(2, t1["result_workspace_revision"])
+    count = O.project_workspace_chain(g, [t1, t2], at="1")
+    check((count["revisions"], count["patches"], count["symbols"])
+          == (exp["result_revisions"], exp["patches"], exp["symbols"]),
+          f"{fx['id']}：链投影计数 {exp['result_revisions']}/{exp['patches']}/{exp['symbols']}",
+          str(count))
+    check(exp["base_revision"] in g.revisions
+          and g.revisions[t1["result_workspace_revision"]].parent_revision == exp["base_revision"],
+          f"{fx['id']}：r1 挂在 source=base 的根 revision 之下")
+    check(g.revisions[t2["result_workspace_revision"]].parent_revision
+          == t1["result_workspace_revision"], f"{fx['id']}：r2.parent = r1")
+    check(g.head_revision() == t2["result_workspace_revision"], f"{fx['id']}：链头 = r2")
+    state = {"task_transactions": [t1, t2]}
+    audit_errors = [p for p in OV.semantic_integrity_audit(g, state) if p.severity == "error"]
+    check(len(audit_errors) == exp["alignment_errors"],
+          f"{fx['id']}：事务对齐零 error", str([p.code for p in audit_errors]))
+
+
+def _replay_stale_evidence(fx: dict, inp: dict, exp: dict) -> None:
+    g = O.OntologyGraph()
+    g.add_revision(O.WorkspaceRevision(
+        revision_id=inp["old_revision"], workspace_id="ws", source="verify",
+        status="VERIFIED"))
+    g.add_revision(O.WorkspaceRevision(
+        revision_id=inp["new_revision"], workspace_id="ws", source="verify",
+        status="VERIFIED"))
+    g.add_evidence(O.EvidenceRecord(
+        id="ev:old", kind="test_result", source="python test_x.py",
+        status=O.PO_STATUS_PROVEN, truth=O.TRUTH_PROVEN,
+        workspace_revision=inp["old_revision"],
+        command="python test_x.py", exit_code=0))
+    codes = {p.code for p in OV.blocking_errors(OV.validate_all_structured(g))}
+    check(exp["error_code"] in codes, f"{fx['id']}：{exp['error_code']} 硬阻断", str(codes))
+
+
+def _replay_verify_skipped(fx: dict, inp: dict, exp: dict) -> None:
+    g = _graph_with_required(inp)
+    proof = O.release_proof_status(
+        semantic_pass=bool(inp["semantic_pass"]),
+        verify_verdict=inp["verify_verdict"],
+        obligations=list(g.obligations.values()),
+        workspace_verified=bool(inp["workspace_verified"]))
+    check(proof["status"] == exp["proof_status"] and proof["code"] == exp["proof_code"],
+          f"{fx['id']}：Proof Gate {exp['proof_status']}/{exp['proof_code']}",
+          f"{proof['status']}/{proof['code']}")
+    check(any(exp["blocking_reason_contains"] in m for m in proof["mandatory_missing"]),
+          f"{fx['id']}：mandatory_missing 点名 {exp['blocking_reason_contains']}",
+          str(proof["mandatory_missing"]))
+    dec = DGN.review_decision(
+        semantic_verdict="pass", blocked=False, has_in_material=False,
+        has_architect_fixes=False, verify_pass=False, evidence_clean=True, proof=proof)
+    check(dec["verdict"] == exp["decision"], f"{fx['id']}：裁决 != pass（{exp['decision']}）",
+          f"{dec['verdict']}/{dec['action']}")
+    gate = O.can_release(proof_status=proof, review_verdict="pass", graph=g)
+    check(gate["can_pass"] == exp["can_release"] and gate["verdict"] == "rework",
+          f"{fx['id']}：can_release 不可放行", str(gate["blocking_reasons"]))
+
+
+def _replay_selfcheck_not_proven(fx: dict, inp: dict, exp: dict) -> None:
+    g = O.OntologyGraph()
+    g.add(O.SemanticObject(
+        id=inp["object_id"], type=O.TYPE_CLAIM, truth=O.TRUTH_PROVEN,
+        payload={"text": "开发自陈：功能已完成"},
+        provenance=[O.Provenance(source=inp["source"], stage="dev")]))
+    codes = {p.code for p in OV.blocking_errors(OV.validate_all_structured(g))}
+    check(exp["error_code"] in codes, f"{fx['id']}：{exp['error_code']} 硬阻断", str(codes))
+
+
+def _replay_decision_without_evidence(fx: dict, inp: dict, exp: dict) -> None:
+    g = O.OntologyGraph()
+    g.add(O.SemanticObject(
+        id=inp["decision_id"], type=O.TYPE_DECISION, truth=O.TRUTH_DERIVED,
+        payload={"verdict": "pass", "reason": "无证据裁决（反例）", "revision": ""},
+        provenance=[O.Provenance(source="release_gate", stage="review")]))
+    codes = {p.code for p in OV.semantic_integrity_audit(g)}
+    check(exp["error_code"] in codes, f"{fx['id']}：{exp['error_code']} 硬阻断", str(codes))
+    gate = O.can_release(proof_status=None, review_verdict="pass")
+    check(not gate["can_pass"], f"{fx['id']}：空证明 can_release 不可放行")
+
+
 DISPATCH = {
     "patches_apply": _replay_patches_apply,
     "interface_freeze": _replay_interface_freeze,
@@ -199,6 +376,14 @@ DISPATCH = {
     "stale_defect": _replay_stale_defect,
     "plan_gap": _replay_plan_gap,
     "recompile_id": _replay_recompile_id,
+    "proof_binding": _replay_proof_binding,
+    "testcompiler_runtime": _replay_testcompiler_runtime,
+    "invalid_ontology": _replay_invalid_ontology,
+    "workspace_chain": _replay_workspace_chain,
+    "stale_evidence": _replay_stale_evidence,
+    "verify_skipped": _replay_verify_skipped,
+    "selfcheck_not_proven": _replay_selfcheck_not_proven,
+    "decision_without_evidence": _replay_decision_without_evidence,
 }
 
 

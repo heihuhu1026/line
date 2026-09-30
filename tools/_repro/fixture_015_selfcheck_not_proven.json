@@ -1,0 +1,14 @@
+{
+  "id": "fixture-015-selfcheck-not-proven",
+  "source_run": "",
+  "derived_from": ["方案§三十七 fixture_selfcheck_not_proven；§三十四 self_check 自陈不能 PROVEN"],
+  "description": "开发/自检来源的对象被标成 PROVEN ⇒ selfcheck_proven（error）。自陈永远只能 DERIVED，机械证明只能来自真实执行/检查器。",
+  "scenario": "selfcheck_not_proven",
+  "input": {
+    "object_id": "claim:self:1",
+    "source": "self_check"
+  },
+  "expect": {
+    "error_code": "selfcheck_proven"
+  }
+}

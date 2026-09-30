@@ -334,3 +334,28 @@ def compile_scenarios(
         # 规格§三十一：一条安全的 planned 命令都没有 ⇒ 行为证据为空，只能 UNPROVEN
         "automated_commands_empty": safe_planned_count == 0,
     }
+
+
+def audit_po_test_coverage(compiled: Any) -> dict[str, list[str]]:
+    """方案§八：required PO 的测试覆盖三分类（纯函数，直接消费 compile_scenarios 产物）。
+
+    * ``covered`` —— 存在 **executable** 场景（含有效断言的真实命令）；
+    * ``weak``    —— 有场景但只有 rc=0（weak_evidence），按未覆盖处理；
+    * ``missing`` —— 没有任何可执行场景（coverage_gap 扣除 weak）。
+
+    weak / missing 都不允许被证明，区别仅留痕给评审与人工。
+    """
+    compiled = compiled if isinstance(compiled, dict) else {}
+    scenarios = [s for s in (compiled.get("scenarios") or []) if isinstance(s, dict)]
+    weak = [str(x) for x in (compiled.get("weak_evidence") or [])]
+    # weak_evidence 里存的是 scenario id，换算成 target_po 便于与 PO 状态对账。
+    weak_pos = [str(s.get("target_po") or "") for s in scenarios
+                 if str(s.get("id") or "") in set(weak)]
+    covered = sorted({
+        str(s.get("target_po") or "")
+        for s in scenarios
+        if str(s.get("status") or "") == STATUS_EXECUTABLE and str(s.get("target_po") or "")
+    })
+    gap = [str(x) for x in (compiled.get("coverage_gap") or [])]
+    missing = sorted(p for p in gap if p not in set(weak_pos))
+    return {"covered": covered, "weak": sorted(p for p in weak_pos if p), "missing": missing}
