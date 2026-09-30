@@ -2831,3 +2831,126 @@ test 要的是"接口 + 要测的行为"，不是几百行代码；裁掉正文�
 「从 AI 代码生成器 → AI 软件工程团队」同意，但组织结构的价值不来自角色数量，而来自每个角色的输出是确定性的。
 这份建议里真正能立刻收敛缺陷的是 **Failure Analyzer 的机械版 + 缺陷台账 + Schema Guardian** 三件；
 而「再加 6 个 Agent」在单驻留 14B 上会先撞预算、再撞归因——那正是现在最难查的故障类型。
+
+## §35 语义链断点修复：Phase A–G 落地与未完成交接（2026-09-30）
+
+> 本节是**交接章节**：记录本轮做了什么、怎么验证、以及**还没做什么**（可直接接着做）。
+> 本轮针对的是六类问题：需求事实在上游丢失 / 任务语义过宽 / 同文件施工边界失真 /
+> 架构接口容易发散 / 测试不覆盖关键 Proof / 前端看不清放行依据。
+
+### 一、提交链（**均未推送**，`origin/main` 停在更早的提交）
+
+| commit | 内容 |
+|---|---|
+| `1905484` | Phase A–C：需求契约 / 方案完整性 / 任务 facet 绑定与同文件租约 |
+| `4dd6032` | Phase D：方案静态 lint + 符号清单 + AST 符号冲突阻断 |
+| `b53e666` | Phase E：TestCompiler 权威绑定 + Proof 覆盖硬指标 |
+| `b497d00` | Phase F：放行裁决统一入口 `build_release_decision` |
+| `346479f` | Phase G1：控制塔后端派生视图 + `/live` 端点 |
+| `613a47a` | Phase G2：前端交付控制塔（5 张卡片，原生 HTML/JS） |
+| `4a543ea` | §39/§40：8 份回放夹具 + 真机基线 + 轮询走 `/live` |
+
+### 二、已完成机制（落点用符号名，行号会漂移）
+
+**Phase A — Grounded Requirement Contract**
+`pipeline/semantics.py` 的 `build_requirement_contract(original_requirement, intake)`（纯函数）：
+把用户原文固化成 ASSERTED 事实集合（`declared_files` / `hard_constraints` /
+`explicit_exclusions` / `acceptance_items` / `behavior_claims` / `source_facts` /
+`derived_facts` / `grounding_errors`）。三条红线：`source_quote` 必须逐字可查（查不到即撤销
+ASSERTED）；Intake 产物恒为 DERIVED、绝不污染 ASSERTED；无上下文的文件名进 `grounding_errors` **不猜**。
+⚠ 实测前提：`state.json` 里的 requirement **换行符数量为 0**（Markdown 被拍平、表格靠 `||` 分隔），
+所以解析按 `。；|` 切句段而非按行。
+
+**Phase B — 契约传到底 + 缺失即阻断**
+`prompts.grounded_contract_block()`；PM 与 Architect 都**走 `pin` 注入**（走 `parts` 会被 token
+预算尾部截断 = 事实又丢一次）。Design Gate 新增判据 `plan_missing_declared_file`
+（`semantics.plan_missing_declared_files()`），老 run 无契约 / 方案无 `changes` 时返回空、不误伤。
+
+**Phase C — 任务语义编译器 + 同文件施工边界**
+`taskcompiler.bind_task_requirements()` / `_bind_requirements_by_facet()`：把**文件级**需求收窄到
+每张图**自己的 facet**（symbols / change / interface / acceptance），复用语义图既有的确定性匹配器；
+对不上号的只留 `candidate_requirement_ids`（**不无条件复制**）；显式声称却证不成 →
+`invalid_requirement_binding`。优先级：显式 `requirement_ids` > `claim_ids` > PO 反解（`po:FR-04:…`
+→ `req:FR-04`）> 文件级（仅候选）。`file_owner_map()` / `same_file_add_violations()`：
+文件创建租约台账 + `SAME_FILE_MULTI_ADD` 阻断（**1 owner + N modify 是正常形态，不得误判**）。
+
+**Phase D — 方案静态 lint + 符号安全**
+`planir.validate_architect_plan()`（纯函数，已接进 Design Gate 第 ⑦ 条）：`PLAN_INTERFACE_UNKNOWN`
+（真机 `Game().start()`）/ `PLAN_CONTRACT_UNKNOWN`（真机 `SNAKE_BODY_COLOR`）/
+`PLAN_UNDECLARED_DEPENDENCY`（pygame 等 → block）/ `PLAN_UNRELATED_DEPENDENCY`（math/time → 仅 warn）/
+`PLAN_SYMBOL_UNKNOWN_OWNER`。
+⚠ 归属核对**只能用顶层符号集合**，否则「`Game.score` 自己拆出 `Game`」会让检查恒真。
+`symbols.build_symbol_manifest()` / `planned_vs_actual()`（来源只取 TaskCompiler + 骨架，
+**不从 DEV 代码反推设计**；diff 只判"声明了却没写出来"）；`symbols.validate_symbol_collisions()`
+（AST 级，`SYMBOL_MEMBER_COLLISION` 抓 `is_game_over` 属性/方法同名，已接在 DEV 产出之后，
+只看 `add` 的整份正文）。
+
+**Phase E — TestCompiler 权威绑定 + Proof 覆盖**
+`testcompiler.bind_target_po()`：LLM 的 `target_po` 是**候选**（字段 `target_po_candidate`，兼容旧名）；
+形态不符（syntax 类 PO 却给运行命令等）→ 返回 `""`；证不成的进 `unbound_commands`，
+**不再静默归给 delivery PO**（那正是"一条 Evidence 证明多个无关 PO"的入口）。
+`testcompiler.proof_coverage_gate()` → `{required, covered, missing, weak, unexecutable}`（弱证据不计入 covered）。
+
+**Phase F — 放行裁决单一入口**
+`ontology.build_release_decision()`：以 `ontology.can_release()` 为机械收敛点，外层补
+ontology 完整性（一票否决）与 `next_action`；`semantic_verdict_is_candidate_only=True`
+（**语义 PASS 永远只是候选**）；`next_action_for()` 能按错误码前缀（`PLAN_`）路由到 Architect。
+常量 `ONTO_VALID/ONTO_BLOCKED/WS_VERIFIED/WS_UNVERIFIED`。
+
+**Phase G — 控制塔**
+后端 `pipeline/controlplane.py`：`build_control_plane(detail)`（**只聚合不裁决**）与
+`build_live(detail)`（轻量轮询）。⚠ `runstore.run_detail()` 的 state 是**白名单** ——
+已登记 `ontology` / `ontology_problems_structured` / `ontology_revision` / `ontology_design_problems` /
+`proof_gate` / `release_gate` / `workspace_chain` / `requirement_contract` / `plan_file_owners` /
+`symbol_collisions` / `plan_lint_warnings` / `plan_compiled_tasks` / `defect_ledger` / `defect_task_resolution`；
+**新键必须登记**，否则页面"一片干净"（真机校准踩过）。
+`server._detail()` 注入 `detail["control_plane"]`；新增 `GET /api/runs/<run_id>/live`。
+前端 `console.html`：`d-control-card`（交付闸门 + 机器放行 + **语义评审标为候选** + 核心指标 +
+下一步 + 为什么不能交付）、`d-proof-card`（证明矩阵）、`d-evidence-card`（证据链，只显示后端已绑定的
+`target_po`）、`d-ontology-card`（error → **阻断发布**）、`d-workspace-card`；`renderControlPlane(d)`
+由 `renderDetail` 调用；轮询改走 `/live`（仅阶段/状态/放行结论变化或结束时才重拉整份 detail）。
+
+**§39/§40 回放基线**
+`tools/_repro/fixture_017..024` 各钉住一个本轮修掉的问题；`tests/test_replay_fixtures.py`
+夹具驱动 8 条 + run `20260930-000332` 真机验收 8 条。需求原文固化为
+`tools/_repro/requirement_snake_20260930.txt`（**不依赖 `runs/`**，那是 gitignore 的）。
+
+### 三、验证方式（改完必跑）
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python -m pytest tests -q            # 当前 156 passed
+python -X utf8 tools/smoke_all.py    # 当前 19 套全绿
+python tools/fix_refs.py             # 我改了行数后必须跑，否则 check_refs 红
+python tools/check_refs.py           # 引用一致性
+```
+⚠ **坑**：`smoke_all` 用 `subprocess` 起子套件，**继承不到 `-X utf8`**。
+不设 `PYTHONUTF8=1` 时会**误报 16 套失败**（子套件在 GBK 控制台打中文崩）。
+另：`smoke_console` 起临时服务，偶发端口未释放导致失败，**单独复跑即可确认**。
+
+### 四、未完成清单（可直接接着做，按建议优先级）
+
+1. **§12.5 机械测试自动生成（P0 尾项）**：`testcompiler` 目前只有 `_syntax_actions` /
+   `_import_actions`；`contract` / `interface_freeze` / `materialization` 三类**尚未**机械生成
+   （`compile_scenarios` 的 `①` 机械分支要扩）。
+   ⚠ 注意 `smoke_mock` / `smoke_ontology` 对 freeze PO 数量有断言，加之前先看这些断言。
+2. **P0-12 测试分类不再硬性「每轮 new/regression/compat 三类」**：改 `prompts.py` 的测试阶段
+   提示词（按 round_kind 聚焦：新项目首轮要 new、BUG 修复要 regression、架构返工要 contract/interface）。
+3. **P0-13 贪吃蛇最小行为测试集合**：把 FR-01…FR-08 的行为项交给 PO→compiler 机械分类
+   （mechanical / unit / GUI smoke / resident / human-only）。
+4. **Phase H 剩余**：§36 review context 压缩（机械摘要在前、语义上下文其次、原文折叠）；
+   §37 llm-calls 增加 telemetry（`semantic_task_id` / `proof_obligation_count` / `evidence_count` /
+   `ontology_revision`）。
+5. **G2 尾项**：§30 阶段图/证明链切换按钮、§34 固定导航与 sticky control bar。
+6. **`SAME_FILE_MULTI_ADD` 的 DEV 侧接线**：现在只有编译期防御；补丁层是"丢弃非 owner 的 add"，
+   尚未升级为具名阻断。
+7. **facet 需求匹配阈值**：现阈值按**文件级**文本调；facet 文本更短更难达标
+   （实测 T-02 的 FR-04 落入候选 —— 未漏未误判，只是未命中）。若要提升命中率需为该粒度单独校准。
+
+### 五、关键设计红线（不要违背）
+
+- 不新增 LLM Agent、不新增第二个 Review 模型、不引入前端框架、不把规则继续堆进 Prompt。
+- **PROVEN 只能来自真实机械证据**；LLM 输出默认 DERIVED；语义评审 pass 只是**候选**。
+- 前端**不得**自行推理语义（"这条证据证明了什么"必须由后端绑定后给出）。
+- 断言只在能逐字校验时成立（`source_quote` 必须可在原文找到）。
+- 拿不准一律 `UNBOUND` / `grounding_errors`，**绝不猜**。
