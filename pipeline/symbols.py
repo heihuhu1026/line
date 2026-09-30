@@ -34,6 +34,7 @@ verify 阶段才有真实代码索引。混用会让解析结果随阶段漂移�
 """
 from __future__ import annotations
 
+import ast
 import sys
 from typing import Any
 
@@ -514,4 +515,169 @@ def unresolved_warnings(rows: Any) -> list[dict]:
                 "candidates": list(row.get("candidates") or []),
             }
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Symbol Manifest（P0-8）与符号冲突检测（P0-9）
+# ---------------------------------------------------------------------------
+
+def _skeleton_symbols(skeleton: Any) -> dict[str, list[str]]:
+    """从冻结骨架里取出 {path: [symbols]}（骨架有多种历史形态，逐个兼容）。"""
+    out: dict[str, list[str]] = {}
+    if not isinstance(skeleton, dict):
+        return out
+    files = skeleton.get("files")
+    if isinstance(files, dict):
+        for path, val in files.items():
+            key = _norm(path)
+            if not key:
+                continue
+            if isinstance(val, dict):
+                names = [str(s) for s in (val.get("symbols") or []) if str(s).strip()]
+            elif isinstance(val, list):
+                names = [str(s) for s in val if str(s).strip()]
+            else:
+                names = []
+            if names:
+                out.setdefault(key, []).extend(names)
+    for ch in skeleton.get("changes") or []:
+        if not isinstance(ch, dict):
+            continue
+        key = _norm(ch.get("path"))
+        names = [str(s) for s in (ch.get("symbols") or []) if str(s).strip()]
+        if key and names:
+            out.setdefault(key, []).extend(names)
+    return out
+
+
+def build_symbol_manifest(tasks: Any, skeleton: Any = None) -> dict:
+    """DEV **之前**生成的确定性符号清单（P0-8）。
+
+    来源优先：TaskCompiler 的施工图 + 冻结骨架；**不从 DEV 代码反推设计** ——
+    反推等于让实现给自己发证（实现缺什么，清单就少什么，永远对得上）。
+    DEV 产出后用这里的 planned 与实际的 actual_symbols 做机械 diff。
+
+    返回 ``{"version": 1, "files": {path: [symbols]}, "sources": [...]}``。
+    """
+    manifest: dict[str, list[str]] = {}
+    sources: list[str] = []
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        names = [str(s).strip() for s in (task.get("symbols") or []) if str(s).strip()]
+        if not names:
+            continue
+        for raw in task.get("target_files") or []:
+            path = _norm(raw)
+            if not path:
+                continue
+            bucket = manifest.setdefault(path, [])
+            for name in names:
+                if name not in bucket:
+                    bucket.append(name)
+        if "taskcompiler" not in sources:
+            sources.append("taskcompiler")
+    for path, names in _skeleton_symbols(skeleton).items():
+        bucket = manifest.setdefault(path, [])
+        for name in names:
+            if name not in bucket:
+                bucket.append(name)
+        if "skeleton" not in sources:
+            sources.append("skeleton")
+    return {"version": 1, "files": manifest, "sources": sources}
+
+
+def planned_vs_actual(manifest: dict, actual: dict[str, list[str]]) -> dict:
+    """计划符号 vs 实际产出符号的机械 diff（P0-8 的下半段）。
+
+    只看**缺失**（声明了却没写出来）；实际多出来的不判罪 ——
+    实现里允许有辅助符号，硬卡"只多不少"会把合法实现打成缺陷。
+    """
+    planned_files = (manifest or {}).get("files") or {}
+    missing: dict[str, list[str]] = {}
+    for path, names in planned_files.items():
+        got = {str(s).strip() for s in (actual or {}).get(path) or []}
+        lack = [n for n in names if n not in got]
+        if lack:
+            missing[path] = lack
+    return {"missing": missing, "missing_count": sum(len(v) for v in missing.values())}
+
+
+def validate_symbol_collisions(files: dict[str, str]) -> list[dict]:
+    """**确定性 AST 检查**（P0-9）：DEV 刚产出就越权/自相矛盾的符号定义。
+
+    真机出现过的形态：``Game.is_game_over`` 既是属性（``self.is_game_over = False``）
+    又是方法（``def is_game_over(self)``）—— 运行期方法被属性值覆盖，
+    不能等 pyright / review 才发现。
+
+    检查项：
+      * ``SYMBOL_MEMBER_COLLISION`` —— 同类中同名「self 属性赋值 + 方法」
+      * ``DUPLICATE_TOP_LEVEL_SYMBOL`` —— 顶层类/函数/变量重名
+      * ``DUPLICATE_METHOD`` —— 同类中方法重名
+    语法错误不在这里报（交给语法档），解析不了就跳过该文件。
+    """
+    out: list[dict] = []
+    for path, source in (files or {}).items():
+        if not isinstance(source, str) or not source.strip():
+            continue
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        # ---- 顶层重名
+        top: dict[str, int] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                top[node.name] = top.get(node.name, 0) + 1
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        top[target.id] = top.get(target.id, 0) + 1
+        for name, count in top.items():
+            if count > 1:
+                out.append({
+                    "code": "DUPLICATE_TOP_LEVEL_SYMBOL",
+                    "file": str(path), "symbol": name, "severity": "block",
+                    "detail": f"{path}: 顶层符号 {name} 被定义 {count} 次（后定义的会覆盖先定义的）",
+                })
+        # ---- 类内冲突
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods: dict[str, int] = {}
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods[item.name] = methods.get(item.name, 0) + 1
+            attrs: set[str] = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Assign):
+                    for target in sub.targets:
+                        if (isinstance(target, ast.Attribute)
+                                and isinstance(target.value, ast.Name)
+                                and target.value.id == "self"):
+                            attrs.add(target.attr)
+                elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
+                    target = sub.target
+                    if (isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"):
+                        attrs.add(target.attr)
+            for name in sorted(set(methods) & attrs):
+                out.append({
+                    "code": "SYMBOL_MEMBER_COLLISION",
+                    "file": str(path), "symbol": f"{node.name}.{name}", "severity": "block",
+                    "detail": (
+                        f"{path}: {node.name} 里 {name} 同时被当作**属性**（self.{name} = …）"
+                        f"和**方法**（def {name}）定义 —— 运行期方法会被属性值覆盖"
+                        "（真机 Game.is_game_over 的形态）"
+                    ),
+                })
+            for name, count in methods.items():
+                if count > 1:
+                    out.append({
+                        "code": "DUPLICATE_METHOD",
+                        "file": str(path), "symbol": f"{node.name}.{name}", "severity": "block",
+                        "detail": f"{path}: {node.name} 里方法 {name} 被定义 {count} 次",
+                    })
     return out

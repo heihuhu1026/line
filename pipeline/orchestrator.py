@@ -1773,6 +1773,22 @@ class Orchestrator:
                     ),
                 }
             )
+        # ⑦ 方案静态 lint（P0-6）：symbols / interface / contracts 三者互证。
+        # 目的就是**不再等 DEV 发现接口明显错误** —— `Game().start()` 没定义 start、
+        # `uses` 了不存在的常量、冒出 pygame，这些纯机械可判，进开发前就该拦下。
+        # 只把 severity=block 的当阻断；warn（如 math/time 未必被要求）只记录不阻断。
+        plan_lint = planir.validate_architect_plan(
+            self.state.get("plan"), self.state.get("skeleton")
+        )
+        warnings_only = [f for f in plan_lint if f.get("severity") != "block"]
+        if warnings_only:
+            self.state["plan_lint_warnings"] = warnings_only
+            for item in warnings_only:
+                self.log(f"        [方案lint] {item.get('code')}：{item.get('detail')}")
+        for item in plan_lint:
+            if item.get("severity") != "block":
+                continue
+            blockers.append({"kind": str(item.get("code") or "plan_lint"), **item})
         return blockers
 
     def _design_gate_reask(self, parts: Any, pin: Any, blockers: list[dict]) -> None:
@@ -2560,10 +2576,43 @@ class Orchestrator:
             + (f"；⚠ 上一轮有 {len(lost)} 条未进合并结果：{'、'.join(lost[:4])}" if lost else "")
         )
         self.state["implementation"] = merged_impl
+        # P0-9：**DEV 刚产出**就机械抓符号冲突，不等 pyright / review
+        self._check_symbol_collisions(merged_impl)
         # 把累积实现落成 dev 阶段唯一的产物快照（见 _save_impl_snapshot 的原由：
         # 不落这一次，续跑时 `_restore` 会拿"某次调用的产物"当实现，越改越少）。
         self._save_impl_snapshot(merged_impl)
         return self.state["implementation"]
+
+    def _check_symbol_collisions(self, impl: Any) -> None:
+        """P0-9：对 DEV 刚产出的整份新文件做 AST 级符号冲突检查。
+
+        只查 ``change_type == "add"`` 的整份正文 —— 定点改的片段不是完整文件，
+        拿它做类内属性/方法比对会误判（片段里看不到另一个定义）。
+
+        真机形态：``Game.is_game_over`` 既是属性又是方法，运行期方法被 bool 覆盖；
+        这类问题在 pyright 里也会被报，但**等到 review 就已经烧掉一整轮**。
+        """
+        if not isinstance(impl, dict):
+            return
+        sources: dict[str, str] = {}
+        for edit in impl.get("edits") or []:
+            if not isinstance(edit, dict):
+                continue
+            path = str(edit.get("path") or "")
+            if not path.endswith(".py"):
+                continue
+            if str(edit.get("change_type") or "") != "add":
+                continue
+            patch = str(edit.get("patch") or "")
+            if patch.strip():
+                sources[path] = patch
+        if not sources:
+            return
+        hits = symbol_resolver.validate_symbol_collisions(sources)
+        self.state["symbol_collisions"] = hits
+        if hits:
+            for item in hits[:6]:
+                self.log(f"        [符号冲突] {item.get('code')}：{item.get('detail')}")
 
     @staticmethod
     def _merge_impl_across_rounds(prev: dict | None, cur: dict) -> dict:

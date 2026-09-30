@@ -883,3 +883,173 @@ def tasks_digest(tasks: Any) -> str:
             }
         )
     return hashlib.sha1(_stable_json(out).encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# Architect Plan Static Lint（P0-6）
+# ---------------------------------------------------------------------------
+# 这一层的目的：**不要再等 DEV 发现接口明显错误**。
+# 方案里的 symbols / interface / contracts 三者必须互相可解释 ——
+# 接口里写了 `Game().start()` 却没声明 `start`、契约里 `uses` 了一个不存在的符号、
+# 需求只允许标准库却冒出 pygame，这些都是**纯机械**可判的，进 DEV 之前就该拦下。
+
+#: 明确禁止的第三方依赖（需求只允许标准库时出现在 uses 里 = 硬阻断）
+_NON_STDLIB_BLOCK: tuple[str, ...] = (
+    "pygame", "numpy", "requests", "pytest", "pandas", "scipy",
+    "flask", "django", "torch", "matplotlib", "click", "rich",
+)
+
+#: 「能 import 但未必被要求」的弱依赖 —— 只记录 warning，不随意阻断（规格 §8.5）
+_WEAK_DEPS: tuple[str, ...] = (
+    "math", "time", "random", "collections", "itertools", "functools", "copy", "re",
+)
+
+#: 接口/契约文本里的噪声词（Python 关键字与常用内建），不参与"未声明"判定
+_STOPWORDS: frozenset[str] = frozenset({
+    "self", "cls", "print", "return", "import", "from", "def", "class", "if", "else",
+    "for", "while", "in", "not", "and", "or", "True", "False", "None", "len", "str",
+    "int", "float", "bool", "list", "dict", "set", "tuple", "range", "enumerate",
+    "super", "type", "isinstance", "raise", "try", "except", "with", "as", "pass",
+    "lambda", "yield", "assert", "del", "global", "break", "continue", "main",
+})
+
+
+def _idents(text: Any) -> set[str]:
+    """从一段文本里取出标识符（不用正则：方案文本里混着中英文与标点）。"""
+    out: set[str] = set()
+    cur = ""
+    for ch in str(text or ""):
+        if ch.isalnum() or ch == "_":
+            cur += ch
+            continue
+        if cur and not cur[0].isdigit():
+            out.add(cur)
+        cur = ""
+    if cur and not cur[0].isdigit():
+        out.add(cur)
+    return out
+
+
+def _declared_symbol_names(plan: Any, skeleton: Any = None) -> tuple[set[str], set[str]]:
+    """方案 + 骨架声明过的符号，返回 ``(broad, top_level)`` 两个集合。
+
+    ``broad``
+        含完整写法与其各段（`Game.score` → `Game.score` / `Game` / `score`），
+        供 interface / contracts 的**引用**比对用。
+    ``top_level``
+        **只含无点号的顶层符号** —— 成员写法的归属核对必须用这一份。
+        若也把 `Game.score` 拆出的 `Game` 算进"已声明"，那
+        「`Game.score` 有没有归属」这个问题会**恒为真**（自己证明自己），检查形同虚设。
+    """
+    broad: set[str] = set()
+    top_level: set[str] = set()
+
+    def _add(raw: Any) -> None:
+        sym = str(raw or "").strip()
+        if not sym:
+            return
+        broad.add(sym)
+        for part in sym.split("."):
+            part = part.strip()
+            if part:
+                broad.add(part)
+        if "." not in sym:
+            top_level.add(sym)
+
+    for bucket in (plan.get("changes") if isinstance(plan, dict) else None,
+                   plan.get("tasks") if isinstance(plan, dict) else None):
+        for item in bucket or []:
+            if not isinstance(item, dict):
+                continue
+            for sym in item.get("symbols") or []:
+                _add(sym)
+            for sym in item.get("target_symbols") or []:
+                _add(sym)
+    if isinstance(skeleton, dict):
+        for path, val in (skeleton.get("files") or {}).items():
+            if isinstance(path, str) and path.endswith(".py"):
+                stem = path[:-3].rsplit("/", 1)[-1]
+                broad.add(stem)
+                top_level.add(stem)
+            for sym in (val.get("symbols") if isinstance(val, dict) else val) or []:
+                _add(sym)
+        for item in skeleton.get("changes") or []:
+            if isinstance(item, dict):
+                for sym in item.get("symbols") or []:
+                    _add(sym)
+    return broad, top_level
+
+
+def validate_architect_plan(plan: Any, skeleton: Any = None) -> list[dict]:
+    """方案静态 lint（**纯函数**，零模型）：symbols / interface / contracts 三者互证。
+
+    返回 finding 列表，每项 ``{code, task, symbol, severity, detail}``；
+    ``severity`` 为 ``block``（阻断，回架构师）或 ``warn``（只提示，不阻断）。
+
+      * ``PLAN_SYMBOL_UNKNOWN_OWNER``  —— `Game.score` 这种成员写法，但 `Game` 没声明
+      * ``PLAN_INTERFACE_UNKNOWN``     —— interface 里调用了没声明的符号（§8.2）
+      * ``PLAN_CONTRACT_UNKNOWN``      —— contracts.uses 引用了方案里不存在的符号（§8.3）
+      * ``PLAN_UNDECLARED_DEPENDENCY`` —— 出现明确禁止的第三方依赖（§8.4）
+      * ``PLAN_UNRELATED_DEPENDENCY``  —— math/time 这类未必被要求的依赖（§8.5，仅 warn）
+    """
+    findings: list[dict] = []
+    if not isinstance(plan, dict):
+        return findings
+    declared, top_level = _declared_symbol_names(plan, skeleton)
+    for task in plan.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        tid = str(task.get("id") or "")
+        # ---- §8.1 成员写法必须有归属
+        for raw in task.get("symbols") or []:
+            sym = str(raw or "").strip()
+            if "." not in sym:
+                continue
+            owner = sym.split(".")[0].strip()
+            if owner and owner not in top_level:
+                findings.append({
+                    "code": "PLAN_SYMBOL_UNKNOWN_OWNER", "task": tid, "symbol": sym,
+                    "severity": "block",
+                    "detail": f"{tid} 声明了成员符号 {sym}，但 {owner} 未在方案/骨架里声明",
+                })
+        # ---- §8.2 interface 调用了没声明的符号
+        interface = str(task.get("interface") or "").strip()
+        if interface:
+            for name in sorted(_idents(interface)):
+                # 单字母（`x`/`i`）一律是局部名/参数，不可能是"方案该声明的符号"
+                if len(name) <= 1 or name in _STOPWORDS or name in declared:
+                    continue
+                findings.append({
+                    "code": "PLAN_INTERFACE_UNKNOWN", "task": tid, "symbol": name,
+                    "severity": "block",
+                    "detail": f"{tid} 的 interface 用到 {name}，但方案 symbols/骨架里没有它（§8.2）",
+                })
+        # ---- §8.3 / §8.4 / §8.5 contracts
+        contracts = task.get("contracts") if isinstance(task.get("contracts"), dict) else {}
+        for raw in contracts.get("uses") or []:
+            ref = str(raw or "").strip()
+            if not ref:
+                continue
+            module = ref.split(".")[0].strip()
+            symbol = ref.split(".")[-1].strip()
+            if module in _NON_STDLIB_BLOCK:
+                findings.append({
+                    "code": "PLAN_UNDECLARED_DEPENDENCY", "task": tid, "symbol": ref,
+                    "severity": "block",
+                    "detail": f"{tid} 依赖 {module}（非标准库且未被需求允许）",
+                })
+                continue
+            if module in _WEAK_DEPS:
+                findings.append({
+                    "code": "PLAN_UNRELATED_DEPENDENCY", "task": tid, "symbol": ref,
+                    "severity": "warn",
+                    "detail": f"{tid} 用到 {module}，但接口/行为未要求它（§8.5，仅提示）",
+                })
+                continue
+            if symbol and symbol not in declared and module not in declared:
+                findings.append({
+                    "code": "PLAN_CONTRACT_UNKNOWN", "task": tid, "symbol": ref,
+                    "severity": "block",
+                    "detail": f"{tid} 的 contracts.uses 引用 {ref}，但方案里没有定义 {symbol}（§8.3）",
+                })
+    return findings
