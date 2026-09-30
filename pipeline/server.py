@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import advice as advice_mod
 from . import config as config_mod
+from . import controlplane
 from . import flow
 from . import gateway
 from . import issues as issues_mod
@@ -413,6 +414,13 @@ class Handler(BaseHTTPRequestHandler):
                         _log_tail(run_dir / runstore.LOG_NAME, lines).encode("utf-8"),
                         "text/plain; charset=utf-8",
                     )
+                if len(parts) == 4 and parts[3] == "live":
+                    # 运行中轮询的**轻量**视图（P1 §33）：只回状态数字，不 tail 日志、
+                    # 不算问题记录 —— 避免每 2.5s 反复拉整个 detail。
+                    live_mark, mark = _run_live(run_id, run_dir)
+                    base = runstore.run_detail(run_dir)
+                    base["running"] = bool(live_mark)
+                    return self._json(200, controlplane.build_live(base))
                 if len(parts) == 4 and parts[3] == "advice":
                     # 裁决参谋的问答线程 + 该阶段待确认项（只读）：页面进闸门时拉一次
                     return self._advice_view(run_id, run_dir)
@@ -782,6 +790,9 @@ class Handler(BaseHTTPRequestHandler):
         detail["project_type"] = (detail.get("state") or {}).get("project_type") or fallback
         # 若这次运行被入口总闸拆成了作业，详情页要能看到「东西去哪了」
         detail["gateway"] = gateway.read_link(self.runs_dir, run_id)
+        # 交付控制塔（P1 §32）：后端派生视图。前端只消费这一份，
+        # **不得**自己去解析 state.ontology 等内部结构（那是让 UI 猜语义）。
+        detail["control_plane"] = controlplane.build_control_plane(detail)
         return detail
 
     def _create_run(self) -> None:

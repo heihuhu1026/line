@@ -725,6 +725,23 @@ def run_detail(run_dir: Path) -> dict:
                 "mode",
                 "mock",
                 "requirement",
+                # ---- 交付控制塔（P1 §32）需要的机械结论键：**必须登记**否则页面一片干净
+                # （视图是白名单，上面摊平过的键不登记等于白摊 —— 真机校准踩过）
+                "ontology",                      # 语义图（Evidence / PO / Decision 的来源）
+                "ontology_problems_structured",  # 语义完整性 error 明细
+                "ontology_revision",
+                "ontology_design_problems",
+                "proof_gate",                    # Proof Gate 结论（PO 状态与命令归属）
+                "release_gate",                  # 放行裁决（can_pass / next_action）
+                "workspace_chain",
+                # ---- 本轮（Phase A–F）新增的机械信号
+                "requirement_contract",
+                "plan_file_owners",
+                "symbol_collisions",
+                "plan_lint_warnings",
+                "plan_compiled_tasks",
+                "defect_ledger",
+                "defect_task_resolution",
             )
         },
         "requirement": requirement,
