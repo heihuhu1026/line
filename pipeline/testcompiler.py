@@ -252,6 +252,7 @@ def compile_scenarios(
     #    （"工作区被真实验证"的语义本就由任意真实入口运行承担），其余一律不猜。
     by_po: dict[str, list[TestAction]] = {}
     unclaimed: list[str] = []
+    unbound: list[dict] = []
     delivery_po = next(
         (p["id"] for p in required if p["kind"] == ontology.PO_KIND_DELIVERY), ""
     )
@@ -271,9 +272,20 @@ def compile_scenarios(
             unsafe.append({"command": command, "reason": action.reject_reason})
             continue
         safe_planned_count += 1
-        target = str(item.get("target_po") or "")
-        if target and target in {p["id"] for p in required}:
-            by_po.setdefault(target, []).append(action)
+        # P0-10 §12.1/12.2：LLM 给的只是**候选**（`target_po_candidate`，兼容旧名 `target_po`），
+        # 最终归属由 **compiler** 按一致性判定 —— 定不了就 UNBOUND，**不猜**、
+        # 也不静默塞给 delivery PO（那会让一条无关命令"证明"了交付）。
+        target = str(item.get("target_po_candidate") or item.get("target_po") or "")
+        if target:
+            bound = bind_target_po(target, command, action.assertions, required)
+            if bound:
+                by_po.setdefault(bound, []).append(action)
+            else:
+                unbound.append({
+                    "command": command,
+                    "candidate": target,
+                    "reason": "候选归属未通过一致性校验 → UNBOUND（不猜）",
+                })
         elif delivery_po:
             by_po.setdefault(delivery_po, []).append(action)
         else:
@@ -331,6 +343,8 @@ def compile_scenarios(
         "weak_evidence": weak,
         "unsafe_commands": unsafe,
         "unclaimed_commands": unclaimed,
+        # P0-10 §12.3：LLM 声称了归属但**证不成**的命令（不静默归给别的 PO）
+        "unbound_commands": unbound,
         # 规格§三十一：一条安全的 planned 命令都没有 ⇒ 行为证据为空，只能 UNPROVEN
         "automated_commands_empty": safe_planned_count == 0,
     }
@@ -359,3 +373,88 @@ def audit_po_test_coverage(compiled: Any) -> dict[str, list[str]]:
     gap = [str(x) for x in (compiled.get("coverage_gap") or [])]
     missing = sorted(p for p in gap if p not in set(weak_pos))
     return {"covered": covered, "weak": sorted(p for p in weak_pos if p), "missing": missing}
+
+
+def bind_target_po(
+    candidate: str,
+    command: str,
+    assertions: list[str] | None,
+    required: Any,
+) -> str:
+    """**Compiler 权威绑定**（P0-10 §12.2/§12.3）：判定一条命令真正证明哪个 PO。
+
+    LLM 输出的 ``target_po`` 只是**候选**（§12.1）。这里按一致性重判：
+
+      * 候选不是 required PO → UNBOUND（不猜）；
+      * 候选与命令**形态**不符（如 syntax 类 PO 却给了一条运行命令）→ UNBOUND；
+      * 其余按候选绑定；断言强弱（行为类只有 rc=0）由 weak 逻辑单独处理，
+        不属于"绑错"，故不在这里判 UNBOUND。
+
+    返回确定的 PO id；定不了返回 ``""``（调用方按 UNBOUND 处理）。
+    """
+    pos = [_as_po(p) for p in (required or [])]
+    by_id = {p["id"]: p for p in pos if p["id"]}
+    cand = str(candidate or "").strip()
+    if not cand:
+        return ""
+    po = by_id.get(cand)
+    if po is None:
+        return ""  # 声称了一个根本不在 required 里的 PO —— 不猜
+    cmd = str(command or "").lower()
+    kind = str(po.get("kind") or "")
+    # 形态一致性：机械类 PO 必须由对应形态的命令来证
+    if kind == ontology.PO_KIND_SYNTAX and not (
+        "py_compile" in cmd or "compileall" in cmd or "-m compile" in cmd
+    ):
+        return ""
+    if kind == ontology.PO_KIND_IMPORT and "import" not in cmd:
+        return ""
+    return cand
+
+
+def proof_coverage_gate(required: Any, compiled: Any) -> dict:
+    """业务 Proof 覆盖硬指标（P0-11 §13）：required PO **有没有被真正证明**。
+
+    返回 ``{required, covered, missing, weak, unexecutable}``：
+
+      * ``covered``      —— 有 executable 场景且带有效断言；
+      * ``weak``         —— 有场景但只有 rc=0 ⇒ **等于没证明**（§13.2）；
+      * ``missing``      —— required PO 根本没有场景（§13.1）；
+      * ``unexecutable`` —— 场景存在但不可执行（无命令 / 不安全 / 需外部）⇒ 不能伪装成 PASS。
+
+    真机形态「13 cases / 3 条 FR 覆盖」就是靠这个数字暴露，而不是等 Review 说"测试少"。
+    """
+    pos = [_as_po(p) for p in (required or [])]
+    needed = [p for p in pos if p.get("required")]
+    compiled = compiled if isinstance(compiled, dict) else {}
+    scenarios = [s for s in (compiled.get("scenarios") or []) if isinstance(s, dict)]
+
+    strong_covered: set[str] = set()
+    weak: set[str] = set()
+    unexecutable: set[str] = set()
+    for sc in scenarios:
+        target = str(sc.get("target_po") or "")
+        if not target:
+            continue
+        status = str(sc.get("status") or "")
+        if status == STATUS_EXECUTABLE:
+            strong_covered.add(target)
+        elif status == STATUS_WEAK:
+            weak.add(target)
+        else:
+            unexecutable.add(target)
+    needed_ids = [p["id"] for p in needed if p["id"]]
+    covered_ids = [p for p in needed_ids if p in strong_covered]
+    missing = [p for p in needed_ids
+               if p not in strong_covered and p not in weak and p not in unexecutable]
+    return {
+        "required": len(needed_ids),
+        "covered": len(covered_ids),
+        "missing": len(missing),
+        "weak": len([p for p in needed_ids if p in weak]),
+        "unexecutable": len([p for p in needed_ids if p in unexecutable]),
+        "missing_ids": sorted(missing),
+        "weak_ids": sorted(p for p in needed_ids if p in weak),
+        "unexecutable_ids": sorted(p for p in needed_ids if p in unexecutable),
+        "covered_ids": sorted(covered_ids),
+    }
