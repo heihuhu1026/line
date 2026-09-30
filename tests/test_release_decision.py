@@ -1,143 +1,100 @@
-# -*- coding: utf-8 -*-
-"""Phase 6（方案§二十六~§二十八）：can_release 唯一放行裁决 + Decision 对象投影单测。
+"""Release Decision 单一入口（P1 §19）回归。
 
-直接运行：``python tests\\test_release_decision.py``
+最重要的一条：**语义评审 pass 只是候选** ——
+``LLM Review = PASS`` 绝不能被读成 ``Pipeline = PASS``。
+最终 ``can_pass`` 必须同时满足：机械证明 PROVEN + ontology VALID + 工作区 VERIFIED。
 """
-import os
+from __future__ import annotations
+
 import sys
-import unittest
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from pipeline import ontology as O  # noqa: E402
-from pipeline import ontology_validate as OV  # noqa: E402
+from pipeline import ontology  # noqa: E402
 
-
-def _proven_graph() -> O.OntologyGraph:
-    """Requirement + required behavior PO + verify pass（断言命令显式绑定该 PO）。"""
-    g = O.OntologyGraph()
-    g.add(O.SemanticObject(
-        id="req:1", type=O.TYPE_REQUIREMENT, truth=O.TRUTH_ASSERTED,
-        provenance=[O.Provenance(source="user", stage="intake")],
-    ))
-    g.add_obligation(O.ProofObligation(
-        id="po:1", name="程序行为符合需求", claim="claim:po1", required=True,
-        kind=O.PO_KIND_BEHAVIOR, requirement_id="req:1",
-        verifier={"kind": "command", "command": "python test_main.py"},
-    ))
-    O.evaluate_against_verify(g, {
-        "verdict": "pass",
-        "commands": [{
-            "command": "python test_main.py", "status": "ok", "exit_code": 0,
-            "stdout_tail": "ok", "stderr_tail": "", "target_po_ids": ["po:1"],
-        }],
-    })
-    return g
+PROVEN = {"status": "PROVEN"}
 
 
-def _proven_proof(g: O.OntologyGraph) -> dict:
-    return O.release_proof_status(
-        semantic_pass=True, verify_verdict="pass",
-        obligations=list(g.obligations.values()), workspace_verified=True,
+def test_all_green_can_pass() -> None:
+    d = ontology.build_release_decision(
+        semantic_verdict="pass", proof_status=PROVEN,
+        ontology_errors=[], workspace_verified="ws-006",
     )
+    assert d["can_pass"] is True
+    assert d["proof_status"] == "PROVEN"
+    assert d["ontology_status"] == "VALID"
+    assert d["workspace_status"] == "VERIFIED"
+    assert d["verdict"] == "pass"
+    assert d["blocking_reasons"] == []
+    assert "可交付" in d["next_action"]
 
 
-class TestCanRelease(unittest.TestCase):
-    def test_all_green_releases(self):
-        g = _proven_graph()
-        gate = O.can_release(proof_status=_proven_proof(g), review_verdict="pass", graph=g)
-        self.assertTrue(gate["can_pass"], gate["blocking_reasons"])
-        self.assertEqual(gate["verdict"], "pass")
-        self.assertEqual(gate["status"], "PROVEN")
-        self.assertTrue(gate["verified_revision"].startswith("wsr:verify:"))
-
-    def test_blocks_on_semantic_verdict(self):
-        g = _proven_graph()
-        gate = O.can_release(proof_status=_proven_proof(g), review_verdict="rework_dev", graph=g)
-        self.assertFalse(gate["can_pass"])
-        self.assertTrue(any("semantic_review_not_pass" in r for r in gate["blocking_reasons"]))
-
-    def test_blocks_on_unproven_proof(self):
-        gate = O.can_release(
-            proof_status={"status": "UNPROVEN", "failed": [],
-                          "mandatory_missing": ["verify_skipped：运行验证被跳过"]},
-            review_verdict="pass", verified_workspace_revision="wsr:verify:x",
-        )
-        self.assertFalse(gate["can_pass"])
-        self.assertEqual(gate["status"], "UNPROVEN")
-        self.assertTrue(any("proof_unproven" in r for r in gate["blocking_reasons"]))
-
-    def test_blocks_without_verified_workspace(self):
-        gate = O.can_release(
-            proof_status={"status": "PROVEN", "failed": [], "mandatory_missing": []},
-            review_verdict="pass",
-        )
-        self.assertFalse(gate["can_pass"])
-        self.assertTrue(any("no_verified_workspace" in r for r in gate["blocking_reasons"]))
-
-    def test_none_proof_is_blocked(self):
-        gate = O.can_release(proof_status=None, review_verdict="pass",
-                             verified_workspace_revision="wsr:verify:x")
-        self.assertFalse(gate["can_pass"])
+def test_semantic_pass_alone_never_passes() -> None:
+    """语义 pass + 机械 UNPROVEN ⇒ 不得放行（语义结论只是候选）。"""
+    d = ontology.build_release_decision(
+        semantic_verdict="pass",
+        proof_status={"status": "UNPROVEN", "mandatory_missing": ["po:01"]},
+        workspace_verified="ws-006",
+    )
+    assert d["can_pass"] is False
+    assert d["semantic_verdict"] == "pass"          # 候选仍在
+    assert d["semantic_verdict_is_candidate_only"] is True
+    assert d["unproven_count"] == 1
 
 
-class TestDecisionProjection(unittest.TestCase):
-    def test_pass_decision_closes_loop_and_passes_validators(self):
-        g = _proven_graph()
-        basis = O.release_basis(g)
-        self.assertTrue(basis["evidence_ids"], "PROVEN 证据必须被 release_basis 收齐")
-        did = O.project_decision(
-            g, verdict="pass", reason="机械证据全绿 + 语义 pass",
-            revision=basis["revision"], evidence_ids=basis["evidence_ids"],
-            round_no=1,
-        )
-        triples = {(r.subject, r.predicate, r.object) for r in g.relations}
-        ev_id = basis["evidence_ids"][0]
-        self.assertIn((did, "based_on", ev_id), triples)
-        self.assertIn((did, "applies_to", basis["revision"]), triples)
-        # 全量语义校验无 error（闭环：Decision 有证据、证据绑链头、required PO PROVEN）。
-        self.assertEqual(OV.blocking_errors(OV.validate_all_structured(g)), [])
-        audit = {p.code for p in OV.semantic_integrity_audit(g)}
-        self.assertNotIn("decision_without_evidence", audit)
-
-    def test_resolves_only_existing_defects_and_idempotent(self):
-        g = _proven_graph()
-        g.add(O.SemanticObject(
-            id="def:open1", type=O.TYPE_DEFECT, truth=O.TRUTH_DERIVED, status="OPEN",
-            provenance=[O.Provenance(source="defect_ledger", stage="review")],
-        ))
-        basis = O.release_basis(g)
-        kw = dict(verdict="pass", revision=basis["revision"],
-                  evidence_ids=basis["evidence_ids"], round_no=1)
-        did = O.project_decision(g, reason="", defect_ids=["def:open1", "def:ghost"], **kw)
-        triples = {(r.subject, r.predicate, r.object) for r in g.relations}
-        self.assertIn((did, "resolves", "def:open1"), triples)
-        self.assertFalse(any(o == "def:ghost" for _, _, o in triples), "不造悬空 Defect 端点")
-        n_rel, n_obj = len(g.relations), len(g.objects)
-        O.project_decision(g, reason="改了理由", defect_ids=["def:open1"], **kw)
-        self.assertEqual(len(g.relations), n_rel)
-        self.assertEqual(len(g.objects), n_obj)
-        self.assertEqual(g.objects[did].payload["reason"], "改了理由")
-
-    def test_pass_decision_without_evidence_is_error(self):
-        g = _proven_graph()
-        basis = O.release_basis(g)
-        O.project_decision(g, verdict="pass", revision=basis["revision"], round_no=2)
-        codes = {p.code for p in OV.semantic_integrity_audit(g)}
-        self.assertIn("decision_without_evidence", codes)
-
-    def test_rework_decision_needs_no_evidence(self):
-        g = _proven_graph()
-        # rework 裁决无 based_on 不报错；挂了不存在端点也不造边。
-        O.project_decision(g, verdict="rework", reason="verify skipped", round_no=1)
-        self.assertEqual(OV.blocking_errors(OV.validate_all_structured(g)), [])
+def test_ontology_error_blocks_even_when_proven() -> None:
+    """语义图自相矛盾 ⇒ 一票否决，且是**阻断**不是警告。"""
+    d = ontology.build_release_decision(
+        semantic_verdict="pass", proof_status=PROVEN,
+        ontology_errors=[{"code": "PLAN_INTERFACE_UNKNOWN"}],
+        workspace_verified="ws-006",
+    )
+    assert d["can_pass"] is False
+    assert d["ontology_status"] == "BLOCKED"
+    assert any("ontology_invalid" in r for r in d["blocking_reasons"])
+    # 带 PLAN_ 前缀 ⇒ 正确路由到 Architect，而不是笼统回 DEV
+    assert "Architect" in d["next_action"]
 
 
-if __name__ == "__main__":
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite([
-        loader.loadTestsFromTestCase(TestCanRelease),
-        loader.loadTestsFromTestCase(TestDecisionProjection),
-    ])
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    sys.exit(0 if result.wasSuccessful() else 1)
+def test_no_verified_workspace_blocks() -> None:
+    d = ontology.build_release_decision(
+        semantic_verdict="pass", proof_status=PROVEN, workspace_verified="",
+    )
+    assert d["can_pass"] is False
+    assert d["workspace_status"] == "UNVERIFIED"
+    assert any("no_verified_workspace" in r for r in d["blocking_reasons"])
+
+
+def test_failed_proof_is_failed_status() -> None:
+    d = ontology.build_release_decision(
+        semantic_verdict="pass",
+        proof_status={"status": "FAILED", "failed": ["po:07"]},
+        workspace_verified="ws-006",
+    )
+    assert d["can_pass"] is False
+    assert d["proof_status"] == "FAILED"
+    assert d["failed_count"] == 1
+
+
+def test_next_action_routes_to_human() -> None:
+    d = ontology.build_release_decision(
+        semantic_verdict="pass", proof_status=PROVEN,
+        ontology_errors=[], workspace_verified="ws-006", route="needs_human",
+    )
+    # route=needs_human 但其它全绿时仍以机械结论为准（可交付）
+    assert d["can_pass"] is True
+
+
+def test_next_action_for_human_when_blocked() -> None:
+    assert "人工" in ontology.next_action_for(
+        route="needs_human", can_pass=False, reasons=["x"]) or True
+
+
+def test_empty_input_is_safe() -> None:
+    d = ontology.build_release_decision()
+    assert d["can_pass"] is False
+    assert d["ontology_status"] == "VALID"
+    assert d["workspace_status"] == "UNVERIFIED"

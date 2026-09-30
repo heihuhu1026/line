@@ -2279,6 +2279,99 @@ def can_release(
     }
 
 
+def build_release_decision(
+    *,
+    semantic_verdict: str = "",
+    proof_status: dict[str, Any] | None = None,
+    ontology_errors: Iterable[Any] | None = None,
+    workspace_verified: str = "",
+    route: str = "",
+    graph: "OntologyGraph | None" = None,
+) -> dict[str, Any]:
+    """**放行裁决的最终单一入口**（P1 §19）：各处不得再各写一套 PASS 条件。
+
+    为什么还要它：`can_release` 已经是机械收敛点，但**缺两件事** ——
+    ontology 完整性（语义图自相矛盾时不能放行）与下一步动作；
+    而且"语义评审 pass"必须被显式标成**候选**，否则人会把
+    ``LLM Review = PASS`` 直接读成 ``Pipeline = PASS``。
+
+      * ``semantic_verdict``  —— **只是候选**（LLM 评审结论），从不单独决定放行；
+      * ``proof_status``      —— PROVEN / UNPROVEN / FAILED（机械证据）；
+      * ``ontology_status``   —— VALID / BLOCKED（语义图 error 一票否决）；
+      * ``workspace_status``  —— VERIFIED / UNVERIFIED；
+      * ``can_pass``          —— **纯确定性**：上面四者同时成立才行；
+      * ``next_action``       —— 给人看的下一步（回 DEV / 回 Architect / 交人工）。
+
+    返回结构与规格 §19 一致，另附 ``verified_revision`` 与 ``blocking_reasons``。
+    """
+    core = can_release(
+        proof_status=proof_status,
+        review_verdict=semantic_verdict,
+        verified_workspace_revision=workspace_verified,
+        graph=graph,
+    )
+    errors = [e for e in (ontology_errors or []) if e]
+    reasons: list[str] = list(core.get("blocking_reasons") or [])
+    if errors:
+        # 把错误码带进原因串：`PLAN_...` 这类前缀才能把下一步正确路由到 Architect，
+        # 否则只会得到一句笼统的"回 DEV"。
+        sample: list[str] = []
+        for item in errors[:3]:
+            code = str(item.get("code") or "") if isinstance(item, dict) else str(item or "")
+            if code:
+                sample.append(code)
+        reasons.append(
+            f"ontology_invalid：语义完整性有 {len(errors)} 处 error"
+            + (f"（{'、'.join(sample)}）" if sample else "")
+            + " —— 阻断发布，不是警告"
+        )
+    can_pass = not reasons
+    proof = proof_status if isinstance(proof_status, dict) else {}
+    verified = str(core.get("verified_revision") or "")
+    return {
+        "semantic_verdict": str(semantic_verdict or ""),
+        "proof_status": str(core.get("status") or PO_STATUS_UNPROVEN),
+        "ontology_status": ONTO_BLOCKED if errors else ONTO_VALID,
+        "workspace_status": WS_VERIFIED if verified else WS_UNVERIFIED,
+        "can_pass": can_pass,
+        "verdict": DECISION_PASS if can_pass else core.get("verdict") or DECISION_REWORK,
+        "verified_revision": verified,
+        "blocking_reasons": reasons,
+        "next_action": next_action_for(route=route, can_pass=can_pass, reasons=reasons),
+        # 显式提醒消费方：语义评审的 pass **不是**放行结论
+        "semantic_verdict_is_candidate_only": True,
+        "failed_count": len(proof.get("failed") or []),
+        "unproven_count": len(proof.get("mandatory_missing") or []),
+    }
+
+
+#: ontology / workspace 状态字面量（前端与测试共用，避免各处硬编码字符串）
+ONTO_VALID = "VALID"
+ONTO_BLOCKED = "BLOCKED"
+WS_VERIFIED = "VERIFIED"
+WS_UNVERIFIED = "UNVERIFIED"
+
+
+def next_action_for(*, route: str = "", can_pass: bool = False,
+                    reasons: list[str] | None = None) -> str:
+    """把机械结论翻译成**人能直接照做**的下一步（不给模糊表述）。"""
+    if can_pass:
+        return "可交付：机械证据、语义完整性、已验证工作区三者均通过"
+    text = " ".join(str(r) for r in (reasons or []))
+    key = str(route or "")
+    if "architect" in key:
+        return "回 Architect：方案层问题（缺失声明文件 / 未知接口 / 未知契约 / 依赖越界）"
+    if "human" in key or "needs_external" in text:
+        return "去人工审核：存在机器无法判定或需外部确认的事项"
+    if "PLAN_" in text or "plan" in text or "architect" in text:
+        return "回 Architect：方案层问题未消除"
+    if "proof" in text or "verify" in text or "evidence" in text:
+        return "去 Test 阶段：补齐缺失的 Proof 证据"
+    if "semantic_review" in text:
+        return "回 DEV：按评审的实现层返工项修改"
+    return "回 DEV：存在未消除的机械阻断"
+
+
 def project_decision(
     graph: "OntologyGraph",
     *,
