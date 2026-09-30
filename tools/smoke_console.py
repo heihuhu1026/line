@@ -209,6 +209,8 @@ def check_control_plane(port: int, run_id: str) -> None:
                 "d-ontology-card", "d-workspace-card"):
         check(f'id="{cid}"' in html, f"前端存在卡片 {cid}")
     check("renderControlPlane(d)" in html, "renderDetail 会调用 renderControlPlane")
+    # P1 §33：运行中轮询走 /live，不再每 2.5s 拉整份 detail
+    check("/live" in html, "前端轮询改走 /live（仅在状态变化时重拉整份详情）")
 
 
 def main() -> int:

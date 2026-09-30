@@ -1,0 +1,49 @@
+{
+  "id": "fixture-023-unproven-required-po",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "15-test.json",
+    "18-verify.json"
+  ],
+  "description": "§13：required PO 根本没有场景 ⇒ UNPROVEN/missing，不得伪装成 PASS。真机「13 cases / 3 条 FR 覆盖」就是靠这个数字暴露。",
+  "input": {
+    "required": [
+      {
+        "id": "po:01",
+        "kind": "behavior",
+        "required": true,
+        "claim": "吃到食物得分+10",
+        "name": "po:01"
+      },
+      {
+        "id": "po:02",
+        "kind": "behavior",
+        "required": true,
+        "claim": "撞墙游戏结束",
+        "name": "po:02"
+      },
+      {
+        "id": "po:opt",
+        "kind": "behavior",
+        "required": false,
+        "claim": "可选",
+        "name": "po:opt"
+      }
+    ],
+    "scenarios": [
+      {
+        "id": "sc-1",
+        "target_po": "po:01",
+        "status": "executable"
+      }
+    ]
+  },
+  "expect": {
+    "required": 2,
+    "covered": 1,
+    "missing": 1,
+    "missing_ids": [
+      "po:02"
+    ]
+  }
+}

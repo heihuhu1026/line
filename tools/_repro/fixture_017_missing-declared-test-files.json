@@ -1,0 +1,41 @@
+{
+  "id": "fixture-017-missing-declared-test-files",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "04-architect_plan.json"
+  ],
+  "description": "问题 A：用户明确声明 5 个文件（含两个测试文件），Architect 方案的 changes 只剩 3 个 —— 测试文件从计划层消失。契约必须能从原文恢复，闸门必须判出缺失并回架构师。",
+  "input": {
+    "requirement": "用 Python 3.12 实现一个可在 Windows 上直接双击运行的贪吃蛇游戏。启动方式固定为：`python main.py`。**只允许使用 Python 标准库**。文件与分层（硬约束）：| 文件 | 职责 || --- | --- || `main.py` | 程序入口 || `game_logic.py` | 纯逻辑层 || `ui.py` | 渲染层 || `game_logic_test.py` | `game_logic` 的单元测试 || `ui_test.py` | `ui` 与 `main` 的冒烟测试 |**分层是硬性要求**：`game_logic.py` 中**不得出现 `import tkinter`**。不做音效。不做最高分持久化。",
+    "plan_changes": [
+      {
+        "path": "game_logic.py",
+        "symbols": [
+          "Game",
+          "Snake",
+          "Food"
+        ]
+      },
+      {
+        "path": "ui.py",
+        "symbols": [
+          "GameUI"
+        ]
+      },
+      {
+        "path": "main.py",
+        "symbols": [
+          "main"
+        ]
+      }
+    ]
+  },
+  "expect": {
+    "declared_files_count": 5,
+    "missing": [
+      "game_logic_test.py",
+      "ui_test.py"
+    ],
+    "blocker_kind": "plan_missing_declared_file"
+  }
+}

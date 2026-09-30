@@ -1281,9 +1281,35 @@ async function loadDetail(){
 function startPolling(){
   if(S.timer) clearInterval(S.timer);
   if(S.tick) clearInterval(S.tick);
+  // P1 §33：运行中轮询改走 **/live**（只回状态数字），不再每 2.5s 拉整份 detail。
+  // 只有「阶段变化 / 状态变化 / 放行结论变化 / 运行结束」才重新拉完整详情。
   S.timer = setInterval(async () => {
-    if(!S.detail) return;
-    if(S.detail.running){ try { await loadDetail(); await loadRuns(); } catch(e){} }
+    if(!S.detail || !S.detail.running) return;
+    try {
+      const live = await api("/api/runs/" + encodeURIComponent(S.current) + "/live");
+      const sig = [live.running, live.status, live.cursor,
+                   live.can_pass, live.proof_status].join("|");
+      const prev = S.liveSig || "";
+      S.liveSig = sig;
+      // 轻量字段**就地**更新：控制塔与进度条不必等整份详情回来
+      if(S.detail.state){
+        S.detail.state.status = live.status;
+        S.detail.state.cursor = live.cursor;
+      }
+      const cp = S.detail.control_plane || (S.detail.control_plane = {});
+      cp.release_gate = Object.assign(cp.release_gate || {}, {
+        can_pass: live.can_pass,
+        proof_status: live.proof_status,
+        verified_revision: live.workspace_revision,
+      });
+      try { renderControlPlane(S.detail); } catch(e){}
+      if(sig !== prev || !live.running){
+        try { await loadDetail(); await loadRuns(); } catch(e){}
+      }
+    } catch(e){
+      // live 端点不可用（老服务）→ 退回整份刷新，不影响功能
+      try { await loadDetail(); await loadRuns(); } catch(e2){}
+    }
   }, 2500);
   // 运行中每秒刷新进度卡片（已用时间 / 当前阶段），不整页重渲
   S.tick = setInterval(() => {

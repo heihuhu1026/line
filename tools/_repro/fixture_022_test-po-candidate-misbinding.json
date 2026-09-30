@@ -1,0 +1,41 @@
+{
+  "id": "fixture-022-test-po-candidate-misbinding",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "15-test.json"
+  ],
+  "description": "§12.1/12.2：Test LLM 把一条运行命令标成 syntax 类 PO（target_po_candidate=po:syntax）。形态不符 ⇒ UNBOUND，且**不得**静默归给 delivery PO（那会让一条无关命令证明多个 PO）。",
+  "input": {
+    "required": [
+      {
+        "id": "po:syntax",
+        "kind": "syntax",
+        "required": true,
+        "claim": "语法可编译",
+        "name": "syntax"
+      },
+      {
+        "id": "po:delivery",
+        "kind": "delivery",
+        "required": true,
+        "claim": "工作区被验证",
+        "name": "delivery"
+      }
+    ],
+    "planned_commands": [
+      {
+        "command": "python main.py",
+        "source": "test-llm",
+        "assertions": [
+          "exit_code==0"
+        ],
+        "target_po_candidate": "po:syntax"
+      }
+    ]
+  },
+  "expect": {
+    "unbound_count": 1,
+    "unbound_candidate": "po:syntax",
+    "assigned_to_delivery": false
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "id": "fixture-018-file-level-requirement-overbinding",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "06-task_plan.json"
+  ],
+  "description": "问题 C：同一文件的三张施工图都继承同一批 FR（T-01/02/03 全是 FR-01 FR-04 FR-05）。按 facet 重绑后，三张图不得再拿到完全相同的一批需求。",
+  "input": {
+    "scope": {
+      "functional_requirements": [
+        {
+          "id": "FR-01",
+          "description": "棋盘 20x20，蛇初始长度 3 段，初始位置居中，初始朝向向右",
+          "acceptance": [
+            "snake 初始长度为 3"
+          ]
+        },
+        {
+          "id": "FR-04",
+          "description": "吃到食物得分 +10 长度 +1，每 3 个食物速度提升一档",
+          "acceptance": [
+            "score 加 10"
+          ]
+        },
+        {
+          "id": "FR-05",
+          "description": "撞墙或撞到自身游戏结束，显示最终得分",
+          "acceptance": [
+            "game_over 状态正确"
+          ]
+        }
+      ]
+    },
+    "file_level": [
+      "req:FR-01",
+      "req:FR-04",
+      "req:FR-05"
+    ],
+    "tasks": [
+      {
+        "id": "T-01",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Snake",
+          "Food"
+        ],
+        "change": "实现 Snake 与 Food 类及棋盘",
+        "acceptance": "snake 初始长度 3"
+      },
+      {
+        "id": "T-02",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Game.score"
+        ],
+        "change": "实现计分",
+        "acceptance": "score 加 10"
+      },
+      {
+        "id": "T-03",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Game.is_game_over"
+        ],
+        "change": "实现碰撞与游戏结束判定",
+        "acceptance": "game_over 状态"
+      }
+    ]
+  },
+  "expect": {
+    "distinct_binding_sets": true,
+    "all_tasks_keep_candidates": true
+  }
+}

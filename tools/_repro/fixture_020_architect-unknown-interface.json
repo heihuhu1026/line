@@ -1,0 +1,34 @@
+{
+  "id": "fixture-020-architect-unknown-interface",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "04-architect_plan.json"
+  ],
+  "description": "真机形态：T-02 的 interface 写了 Game().start()，但方案/骨架里根本没有 start。必须在 DEV 之前被判出（§8.2）。",
+  "input": {
+    "plan": {
+      "changes": [
+        {
+          "path": "game_logic.py",
+          "symbols": [
+            "Game"
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "T-02",
+          "symbols": [
+            "Game"
+          ],
+          "interface": "Game().start()"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "code": "PLAN_INTERFACE_UNKNOWN",
+    "symbol": "start",
+    "severity": "block"
+  }
+}

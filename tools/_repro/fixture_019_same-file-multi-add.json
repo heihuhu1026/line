@@ -1,0 +1,70 @@
+{
+  "id": "fixture-019-same-file-multi-add",
+  "source_run": "20260929-093329",
+  "derived_from": [
+    "13-dev-T-01.json",
+    "14-dev-T-02.json"
+  ],
+  "description": "问题 B：同一个新文件 game_logic.py 被多张施工图整份 add（后写的覆盖先写的，符号与文件头都丢）。1 个 owner + N 张 modify 是正常形态；出现第二个创建者才是 SAME_FILE_MULTI_ADD。",
+  "input": {
+    "tasks": [
+      {
+        "id": "T-01",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Snake"
+        ],
+        "creates_file": true
+      },
+      {
+        "id": "T-02",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Game.score"
+        ],
+        "creates_file": true
+      }
+    ],
+    "normal_tasks": [
+      {
+        "id": "T-01",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Snake"
+        ],
+        "creates_file": true
+      },
+      {
+        "id": "T-02",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Game.score"
+        ]
+      },
+      {
+        "id": "T-03",
+        "target_files": [
+          "game_logic.py"
+        ],
+        "symbols": [
+          "Game.is_game_over"
+        ]
+      }
+    ]
+  },
+  "expect": {
+    "code": "SAME_FILE_MULTI_ADD",
+    "extra_creators": [
+      "T-02"
+    ],
+    "normal_is_clean": true
+  }
+}

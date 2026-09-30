@@ -1,0 +1,18 @@
+{
+  "id": "fixture-021-symbol-member-collision",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "13-dev-T-01.json"
+  ],
+  "description": "真机形态：Game.is_game_over 同时是属性（self.is_game_over = False）和方法（def is_game_over(self)）—— 运行期方法被 bool 覆盖。DEV 刚产出就必须被 AST 抓住。",
+  "input": {
+    "files": {
+      "game_logic.py": "class Game:\n    def __init__(self):\n        self.is_game_over = False\n\n    def is_game_over(self):\n        return True\n"
+    }
+  },
+  "expect": {
+    "code": "SYMBOL_MEMBER_COLLISION",
+    "symbol": "Game.is_game_over",
+    "severity": "block"
+  }
+}

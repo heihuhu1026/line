@@ -1,0 +1,28 @@
+{
+  "id": "fixture-024-control-plane-release-block",
+  "source_run": "20260930-000332",
+  "derived_from": [
+    "04-architect_plan.json",
+    "19-review.json"
+  ],
+  "description": "§19/§24：语义评审 pass 但 ontology 有 error（PLAN_INTERFACE_UNKNOWN）⇒ 控制塔必须显示 BLOCKED、can_pass=false，并把下一步指向 Architect。语义 PASS 只是候选。",
+  "input": {
+    "semantic_verdict": "pass",
+    "proof_status": {
+      "status": "PROVEN"
+    },
+    "ontology_errors": [
+      {
+        "code": "PLAN_INTERFACE_UNKNOWN",
+        "object": "T-02"
+      }
+    ],
+    "workspace_verified": "ws-006"
+  },
+  "expect": {
+    "can_pass": false,
+    "ontology_status": "BLOCKED",
+    "next_action_contains": "Architect",
+    "semantic_verdict": "pass"
+  }
+}
