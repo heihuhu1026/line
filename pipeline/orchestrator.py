@@ -1277,9 +1277,15 @@ class Orchestrator:
         # 被剔除的技术问题原样复活（真机 run 20260928-180933：归一后的 state 被
         # 含 5 条问题的快照覆盖，「数据库表结构」重新下发给下游）。
         pm_parts = prompts.parts_pm(requirement, self.state.get("intake"))
+        # P0-2：契约**钉死**注入（走 pin，不进 parts）—— 它是用户事实，
+        # 不能被 token 预算尾部截断；截掉就等于事实在上游又丢一次。
+        contract_block = prompts.grounded_contract_block(
+            self._requirement_contract(requirement)
+        )
         self.state["scope"] = self._call(
             "pm",
             pm_parts,
+            pin=[contract_block] if contract_block else None,
             post=lambda data: prompts.normalize_pm_questions(data, log=self.log),
         )
         # ---- 裁决一致性机械校验（P0①，run 20260929-093329）
@@ -1335,6 +1341,33 @@ class Orchestrator:
         self.state["assessment"] = self._grounded_call("architect_assess", parts)
         return self.state["assessment"]
 
+    def _requirement_contract(self, requirement: str) -> dict:
+        """Grounded Requirement Contract（P0-1）：把用户原文固化成**可断言的事实集合**。
+
+        问题的根因是「需求事实从来不是一个对象」——它只散在提示词里，
+        Intake/PM/Architect 每一层都能改写它，于是用户明确写的 5 个文件到方案层只剩 3 个。
+        这里一次性编译成契约并缓存进 state：下游只**引用**它，不再各自转述。
+
+        纯函数（无模型、无 IO）、结果稳定，所以缓存安全；老 run 没有该字段时
+        这里会即时补算（续跑/回放照样拿得到）。
+        """
+        cached = self.state.get("requirement_contract")
+        if isinstance(cached, dict) and cached.get("version"):
+            return cached
+        contract = semantics.build_requirement_contract(
+            requirement, self.state.get("intake")
+        )
+        self.state["requirement_contract"] = contract
+        files = [f.get("path") for f in contract.get("declared_files") or []]
+        errors = contract.get("grounding_errors") or []
+        self.log(
+            f"        [需求契约] 用户声明文件 {len(files)} 个"
+            f"（{'、'.join(str(f) for f in files) or '无'}）；"
+            f"硬约束 {len(contract.get('hard_constraints') or [])} 条；"
+            f"无法确证 {len(errors)} 项"
+        )
+        return contract
+
     def _stage_plan(self, requirement: str, fixes: list[str] | None = None) -> Any:
         scope = self.state.get("scope")
         assessment = self.state.get("assessment")
@@ -1342,6 +1375,13 @@ class Orchestrator:
         # 当成既有事实承接，写进验收标准（真机出现过）。
         warn_block = prompts.grounding_warning_block(self.grounding_warnings)
         pin = [warn_block] if warn_block else None
+        # P0-2：架构师必须同时看到「PM Scope + 用户硬事实契约 + 人工裁决」。
+        # 只给 PM scope 是问题 A 的直接成因 —— scope 里没提的文件，架构师就当不存在。
+        contract_block = prompts.grounded_contract_block(
+            self._requirement_contract(requirement)
+        )
+        if contract_block:
+            pin = [*(pin or []), contract_block]
         # 回退到方案重跑时（评审把根因判为方案层），把运行验证的失败证据与「上一版方案/实现
         # 声明要产出哪些文件」一并给出 —— 让方案能自己判断「是我漏规划了文件，还是补丁没落地」。
         verify = self.state.get("verify_report")
@@ -1576,8 +1616,13 @@ class Orchestrator:
             plan_obj, ir=ir, existing_files=self._existing_repo_files(),
             # 上一版**已编译**施工图（不是架构师 draft）：用于 semantic_task_id 版本链。
             previous_tasks=self.state.get("plan_compiled_tasks"),
+            # P0-3：传 scope 才能按**每张图的 facet**重绑需求（不传则维持文件级旧行为）
+            scope=self.state.get("scope"),
         )
         errors = list(result.get("errors") or [])
+        # P0-4：文件创建租约台账（同文件谁有权整份新建、谁只能定点增补）
+        if isinstance(result.get("file_owners"), dict):
+            self.state["plan_file_owners"] = result["file_owners"]
         compiled = list(result.get("tasks") or [])
         self.state["plan_compile_errors"] = errors
         if compiled:
@@ -1707,6 +1752,27 @@ class Orchestrator:
         # 注意：任务 uses 自己 target_files 里的模块**不阻断** —— 一张施工图合法地可以
         # 同时覆盖多个文件（cli.py 用 database.py 是两文件间的正常导入）。dev 侧提示层
         # 会自行避免"文件 import 自己"那一种（见 task_focus_block 的 own_modules 丢弃）。
+        # ⑥ ``plan_missing_declared_file`` —— 用户原文声明的交付文件，方案 changes 没覆盖。
+        # 问题 A 的机械兜底：把契约喂给架构师还不够（它仍可能静默删文件），
+        # 必须在闸门里**确定性**判一次缺失 → rework_architect，
+        # 而不是等 DEV / Test / Review 才发现「测试文件从计划里消失了」。
+        # 契约缺失（老 run 没有该字段）时判据返回空 —— 向后兼容，不误伤旧运行。
+        missing_declared = semantics.plan_missing_declared_files(
+            self.state.get("requirement_contract"), self.state.get("plan")
+        )
+        if missing_declared:
+            blockers.append(
+                {
+                    "kind": "plan_missing_declared_file",
+                    "files": missing_declared,
+                    "detail": (
+                        "用户原文明确声明的交付文件未出现在方案 changes 中："
+                        + "、".join(missing_declared)
+                        + " —— 这些是用户事实，方案无权静默删除；"
+                        "请补进 changes，或显式写 plan_exception 说明为何不实现"
+                    ),
+                }
+            )
         return blockers
 
     def _design_gate_reask(self, parts: Any, pin: Any, blockers: list[dict]) -> None:

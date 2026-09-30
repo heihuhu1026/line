@@ -54,6 +54,7 @@ def compile_plan(
     ir: Any = None,
     existing_files: set[str] | None = None,
     previous_tasks: Any = None,
+    scope: Any = None,
 ) -> dict:
     """编译入口（**带错误通道**）：返回 ``{"tasks": [...], "errors": [...]}``。
 
@@ -82,7 +83,13 @@ def compile_plan(
         previous_tasks = plan.get("tasks")
     _annotate_semantic_revisions(tasks, previous_tasks)
     _annotate_create_owners(tasks, existing_files)
-    return {"tasks": tasks, "errors": errors}
+    # P0-3：把**文件级**需求收窄到每张图自己的 facet（问题 C 的根治）；
+    # P0-4：同文件多创建者 = 连续 full-file add，机械阻断。
+    # 都只在拿到 scope 时做（老调用/单测不传 scope → 行为不变，向后兼容）。
+    if scope is not None:
+        _bind_requirements_by_facet(tasks, scope, errors)
+        errors.extend(same_file_add_violations(tasks))
+    return {"tasks": tasks, "errors": errors, "file_owners": file_owner_map(tasks)}
 
 
 def compile_tasks(
@@ -242,6 +249,155 @@ def _annotate_create_owners(tasks: list[dict], existing_files: set[str] | None) 
                 continue  # 存量文件：没有"创建"动作，不设 owner
             task["creates_file"] = True
             owned.add(path)
+
+
+def file_owner_map(tasks: list[dict]) -> dict[str, dict]:
+    """每个文件的**创建租约**台账（P0-4 §6.1）：``{file: {create_owner, modify_tasks}}``。
+
+    `create_owner` 是唯一有权整份新建的图；其余同文件的图只能在**在制文件**上定点增补。
+    回答「同一个新文件为什么不应该被连续 add 三次」—— 有了 owner，第二、三张图的
+    `change_type=add` 整份重写就是越权（``SAME_FILE_MULTI_ADD``），而不是"正常施工"。
+    """
+    owners: dict[str, dict] = {}
+    for task in tasks:
+        tid = str(task.get("id") or "")
+        for raw in task.get("target_files") or []:
+            path = _norm(raw)
+            if not path:
+                continue
+            slot = owners.setdefault(path, {"create_owner": "", "modify_tasks": []})
+            if task.get("creates_file"):
+                if not slot["create_owner"]:
+                    slot["create_owner"] = tid
+                elif tid and tid != slot["create_owner"]:
+                    slot["modify_tasks"].append(tid)
+            elif tid:
+                slot["modify_tasks"].append(tid)
+    return owners
+
+
+def same_file_add_violations(tasks: list[dict]) -> list[dict]:
+    """**机械阻断**（P0-4 §6.3）：同一新文件出现**多个**创建者 = 连续 full-file add。
+
+    ``_annotate_create_owners`` 正常情况下只发一份租约，所以这里命中即说明租约被绕过
+    （或调用方没走编译链）。真机形态：T-01/T-02/T-03 都对 ``game_logic.py`` 整份 add
+    → 后写的覆盖先写的、符号丢失、modify 的 anchor 全落空。
+    合法例外只有 ``legacy migration``（显式标注且带 base revision）。
+    """
+    violations: list[dict] = []
+    for path in file_owner_map(tasks):
+        # **只看声明了创建租约的图有几张**：1 owner + N 张 modify 是**正常**形态
+        # （那是"先整份新建、再定点增补"），绝不能当成违规；
+        # 出现第 2 个创建者才是"同一新文件被连续 add"。
+        creators = [
+            t for t in tasks
+            if t.get("creates_file")
+            and any(_norm(p) == path for p in (t.get("target_files") or []))
+        ]
+        if len(creators) <= 1:
+            continue
+        ids = [str(t.get("id") or "") for t in creators]
+        violations.append({
+            "code": "SAME_FILE_MULTI_ADD",
+            "file": path,
+            "create_owner": ids[0],
+            "extra_creators": ids[1:],
+            "detail": (
+                f"{path} 出现 {len(creators)} 个创建者（{'、'.join(ids)}）"
+                " —— 同一新文件只允许第一张图 add 整份新建，其余必须 modify 定点增补；"
+                "否则后写的整份覆盖先写的，符号与文件头都会丢"
+            ),
+        })
+    return violations
+
+
+def bind_task_requirements(scope: Any, task: dict) -> dict:
+    """按**任务 facet**（不是文件）重新绑定 Requirement / Claim / PO。
+
+    为什么必须重绑：`ontology.requirement_unit_links` 是**文件级**匹配，一个文件的
+    所有施工图会拿到同一批 FR（问题 C：T-01/02/03 全是 FR-01 FR-04 FR-05），
+    任务与需求的关系因此失去精确性。这里把每张图**自己的**
+    symbols / change / interface / acceptance 喂回同一个确定性匹配器，
+    得到这张图真正对得上号的需求。
+
+    刻意复用既有匹配器（ascii 词 + CJK bigram，共享比阈值）—— 不新写
+    ``if "score" in text`` 这种模糊包含（规格 §5.4：那只能当低置信提示）。
+    """
+    if not isinstance(scope, dict) or not isinstance(task, dict):
+        return {}
+    files = [str(p) for p in (task.get("target_files") or []) if str(p)]
+    path = _norm(files[0]) if files else ""
+    pseudo = {
+        "file": path,
+        "symbols": [str(s) for s in (task.get("symbols") or [])],
+        "change": str(task.get("change") or ""),
+        "interface": str(task.get("interface") or ""),
+        "acceptance": [task.get("acceptance")] if task.get("acceptance") else [],
+        "intent": [],
+    }
+    links = ontology.requirement_unit_links(scope, [pseudo])
+    hit = (links.get("by_file") or {}).get(path) or {}
+    return {
+        "requirements": [str(x) for x in (hit.get("requirements") or [])],
+        "claims": [str(x) for x in (hit.get("claims") or [])],
+        "proof_obligations": [str(x) for x in (hit.get("proof_obligations") or [])],
+    }
+
+
+def _req_of(po_id: str) -> str:
+    """PO id 形如 ``po:FR-01:...`` → 反解出需求 id（**确定性**，不靠猜）。"""
+    parts = str(po_id or "").split(":")
+    return f"req:{parts[1]}" if len(parts) >= 2 and parts[1] else ""
+
+
+def _bind_requirements_by_facet(tasks: list[dict], scope: Any, errors: list[dict]) -> None:
+    """把文件级需求收窄到**每张图自己的 facet**（P0-3 §5.1 / §5.3）。
+
+    优先级（规格 §5.1）：
+        1. draft 图**显式**声明的 requirement_ids（模型候选，compiler 才是权威）
+        2. 显式 claim_ids
+        3. 显式 proof_obligation_ids（PO id 反解需求）
+        4. 文件级 ``requirement_unit_links`` —— **只能当候选**，必须经 facet 验证
+
+    只有第 4 档来源时：不无条件复制进 ``implements_requirements``，
+    而是留在 ``candidate_requirement_ids`` 供人工/闸门看到"这张图可能还涉及这些"。
+    显式声称却**完全无法**与 facet 对上号的 → ``invalid_requirement_binding``（不静默接受）。
+    """
+    if not isinstance(scope, dict):
+        return
+    for task in tasks:
+        file_level = [str(x) for x in (task.get("implements_requirements") or [])]
+        facet = bind_task_requirements(scope, task)
+        facet_reqs = list(facet.get("requirements") or [])
+        # 1) 显式声明（模型候选）
+        explicit = [str(x) for x in (task.get("requirement_ids") or [])]
+        # 3) PO 反解
+        from_po = [r for r in (_req_of(p) for p in (task.get("proof_obligations") or [])) if r]
+        claimed = _dedup([*(explicit or []), *(from_po or [])])
+        # facet 验证：facet 命中 ∩（显式声称 ∪ 文件级候选）
+        allowed = set(facet_reqs) | set(file_level)
+        resolved = list(facet_reqs)
+        for r in claimed:
+            if r not in resolved:
+                resolved.append(r)
+        invalid = [r for r in claimed if r not in allowed]
+        if invalid:
+            errors.append({
+                "code": "invalid_requirement_binding",
+                "task": str(task.get("id") or ""),
+                "requirements": invalid,
+                "detail": (
+                    f"{task.get('id')} 声称实现 {'、'.join(invalid)}，"
+                    "但其 acceptance / change / symbols / interface 均无法与该需求对应"
+                    " —— 不能静默接受（要么补上可证的关系，要么改声称）"
+                ),
+            })
+        task["implements_requirements"] = resolved
+        task["candidate_requirement_ids"] = [r for r in file_level if r not in resolved]
+        if facet.get("proof_obligations"):
+            task["proof_obligations"] = list(facet["proof_obligations"])
+        if facet.get("claims"):
+            task["claim_ids"] = list(facet["claims"])
 
 
 def _dedup(items: Any) -> list[str]:

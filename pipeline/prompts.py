@@ -939,6 +939,60 @@ def finalized_intake_view(intake: Any) -> Any:
     return view
 
 
+def grounded_contract_block(contract: Any) -> str:
+    """把 Grounded Requirement Contract 渲染成**必须钉死**的下游区块（P0-2）。
+
+    为什么必须 pin（不被 token 预算尾部截断）：这里每条都逐字来自用户原文
+    （`source_quote` 可查证），不是某一层的转述。被截断 = 事实丢失 =
+    正是「用户声明的 5 个文件到 Architect 只剩 3 个」的成因。
+
+    返回空串表示没有可呈现的契约（老 run 无此字段），调用方据此决定要不要注入。
+    """
+    if not isinstance(contract, dict) or not contract:
+        return ""
+    lines = [
+        "【Grounded Requirement Contract】以下事实**逐字来自用户原始需求**，"
+        "每条都带可在原文查证的 source_quote。",
+        "你**不得删除、改写、弱化**其中任何一条。"
+        "若认为存在冲突，只能新增 contradiction 说明原因，**不得覆盖**这些事实。",
+    ]
+    files = [f for f in (contract.get("declared_files") or []) if isinstance(f, dict)]
+    if files:
+        lines.append("")
+        lines.append("用户明确声明的交付文件（**方案的 changes 必须全部覆盖**）：")
+        for item in files:
+            lines.append(f"  - `{item.get('path')}`（证据：{item.get('evidence')}）")
+        lines.append(
+            "  若你认为其中某个文件不需要实现，必须显式写 plan_exception 说明原因，"
+            "**不得静默删除**——静默删除会被机械闸门判为 PLAN_MISSING_DECLARED_FILE。"
+        )
+    cons = [c for c in (contract.get("hard_constraints") or []) if isinstance(c, dict)]
+    if cons:
+        lines.append("")
+        lines.append("硬性约束：")
+        for item in cons[:12]:
+            lines.append(f"  - {item.get('text')}")
+    excl = [e for e in (contract.get("explicit_exclusions") or []) if isinstance(e, dict)]
+    if excl:
+        lines.append("")
+        lines.append("明确排除（不要做）：")
+        for item in excl[:10]:
+            lines.append(f"  - {item.get('text')}")
+    acc = [a for a in (contract.get("acceptance_items") or []) if isinstance(a, dict)]
+    if acc:
+        lines.append("")
+        lines.append("用户给出的验收依据：")
+        for item in acc[:10]:
+            lines.append(f"  - {item.get('text')}")
+    errs = contract.get("grounding_errors") or []
+    if errs:
+        lines.append("")
+        lines.append(
+            f"（另有 {len(errs)} 项无法从原文确证，已记入 grounding_errors，**不作为事实使用**）"
+        )
+    return "\n".join(lines)
+
+
 def parts_pm(requirement: str, intake: Any = None) -> list[str]:
     """产品经理输入：原始需求 + 上游补强产物（初稿或已裁决终稿）。
 
