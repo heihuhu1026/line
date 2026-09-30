@@ -176,6 +176,41 @@ def check_frontend_syntax() -> None:
         tmp.unlink(missing_ok=True)
 
 
+def check_control_plane(port: int, run_id: str) -> None:
+    """交付控制塔（P1 §32/§33/§43）：后端派生视图 + live 端点 + 前端卡片。"""
+    print("\n== 交付控制塔（control_plane）")
+    code, detail = call(port, f"/api/runs/{run_id}")
+    cp = (detail or {}).get("control_plane") if isinstance(detail, dict) else None
+    check(isinstance(cp, dict), "详情返回 control_plane 派生视图", f"HTTP {code}")
+    if not isinstance(cp, dict):
+        return
+    for key in ("release_gate", "proof_summary", "proofs", "evidence_summary",
+                "evidence", "ontology", "workspace", "tasks", "test",
+                "decision", "issues", "next_action"):
+        check(key in cp, f"control_plane 含 {key}")
+    check("can_pass" in (cp.get("release_gate") or {}),
+          "release_gate 含 can_pass（机器放行结论）")
+    # 最重要的一条认知：LLM 评审 PASS ≠ 放行
+    check((cp.get("decision") or {}).get("semantic_review_is_candidate_only") is True,
+          "语义评审 PASS 被显式标为候选（不会被读成放行）")
+    # ---- live 轮询：轻量、不得带整份明细
+    code, live = call(port, f"/api/runs/{run_id}/live")
+    ok = code == 200 and isinstance(live, dict)
+    check(ok, "live 轮询端点可用", f"HTTP {code}")
+    if ok:
+        for key in ("running", "status", "cursor", "proof_status", "proof_counts",
+                    "ontology_error_count", "workspace_revision", "can_pass"):
+            check(key in live, f"live 含 {key}")
+        check("proofs" not in live and "evidence" not in live,
+              "live 不得携带整份证明/证据明细（轻量轮询）")
+    # ---- 前端卡片存在（脚本语法由 check_frontend_syntax 的 node --check 保证）
+    html = (Path(server.__file__).resolve().parent / "console.html").read_text(encoding="utf-8")
+    for cid in ("d-control-card", "d-proof-card", "d-evidence-card",
+                "d-ontology-card", "d-workspace-card"):
+        check(f'id="{cid}"' in html, f"前端存在卡片 {cid}")
+    check("renderControlPlane(d)" in html, "renderDetail 会调用 renderControlPlane")
+
+
 def main() -> int:
     check_frontend_syntax()
     root = Path(tempfile.mkdtemp(prefix="pipeline-console-"))
@@ -942,6 +977,8 @@ def main() -> int:
             "没有仓库路径时如实说明无法验证",
             str((vfy or {}).get("notes")),
         )
+
+        check_control_plane(port, run_id)
 
         print("\n== 阶段日志切片接口（流程图节点用）")
         code, lg = call(port, f"/api/runs/{run_id}/log?stage=intake&lines=50")

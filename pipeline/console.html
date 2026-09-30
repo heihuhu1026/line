@@ -413,6 +413,54 @@
         <div id="d-msg"></div>
       </div>
 
+      <!-- ===== 交付控制塔（P1 §20–§31）=====
+           数据**只**来自后端 `control_plane`：前端不得自行解析 state.ontology，
+           也不做语义推理（"这条证据证明了什么"由后端绑定后给出）。
+           最重要的一条认知：`语义评审 PASS` 与 `机器放行` 分开展示 ——
+           LLM Review = PASS 不等于 Pipeline = PASS。 -->
+      <div class="card" id="d-control-card">
+        <div class="row">
+          <h2 style="margin:0">交付控制塔</h2>
+          <span class="grow"></span>
+          <span class="note">机器结论 · 非模型判断</span>
+        </div>
+        <div id="d-ctl-gate" style="margin-top:8px"></div>
+        <div id="d-ctl-metrics" class="note" style="margin-top:6px"></div>
+        <div id="d-ctl-next" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card" id="d-proof-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">证明义务</h2><span class="grow"></span>
+          <span class="note" id="d-proof-note"></span>
+        </div>
+        <div id="d-proof-body" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card" id="d-evidence-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">证据链</h2><span class="grow"></span>
+          <span class="note" id="d-evidence-note"></span>
+        </div>
+        <div id="d-evidence-body" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card" id="d-ontology-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">语义完整性</h2><span class="grow"></span>
+          <span class="note" id="d-ontology-note"></span>
+        </div>
+        <div id="d-ontology-body" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card" id="d-workspace-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">工作区版本</h2><span class="grow"></span>
+          <span class="note" id="d-workspace-note"></span>
+        </div>
+        <div id="d-workspace-body" style="margin-top:8px"></div>
+      </div>
+
       <div class="card" id="d-prog-card">
         <div class="row">
           <h2 style="margin:0">进度</h2>
@@ -1243,6 +1291,128 @@ function startPolling(){
   }, 1000);
 }
 
+// ---------------------------------------------------------------------------
+// 交付控制塔渲染（P1 §20–§31）
+// ---------------------------------------------------------------------------
+// 只消费后端 `control_plane`：**不做任何语义推理**。
+// 状态色统一：PROVEN=acc / FAILED=bad / UNPROVEN=warn / VALID=acc / BLOCKED=bad。
+const CP_CLS = {
+  PROVEN: "acc", FAILED: "bad", UNPROVEN: "warn",
+  VALID: "acc", BLOCKED: "bad", VERIFIED: "acc", UNVERIFIED: "warn",
+  fresh: "acc", stale: "warn",
+};
+function cpBadge(text){
+  const t = String(text || "");
+  return badge(t || "—", CP_CLS[t] || "");
+}
+
+function renderControlPlane(d){
+  const cp = d && d.control_plane ? d.control_plane : {};
+  if(!$("d-control-card")) return;
+  const gate = cp.release_gate || {}, ps = cp.proof_summary || {};
+  const es = cp.evidence_summary || {}, onto = cp.ontology || {};
+  const ws = cp.workspace || {}, dec = cp.decision || {};
+
+  // ---- 第一行：交付闸门（UNPROVEN 是**独立**状态，不是 pass/fail 的另一种说法）
+  $("d-ctl-gate").innerHTML = [
+    "<b>交付闸门</b> " + cpBadge(gate.status || "UNPROVEN"),
+    "机器放行 " + (gate.can_pass ? badge("允许", "acc") : badge("禁止", "bad")),
+    // 语义评审只是**候选**：必须紧挨着"机器放行"显示，否则人会把 PASS 读成放行
+    "语义评审 " + (gate.semantic_verdict
+      ? badge(esc(gate.semantic_verdict), "warn") + ' <span class="note">（候选，不等于放行）</span>'
+      : badge("无", "")),
+    "Ontology " + cpBadge(onto.status || "VALID"),
+    "Workspace " + cpBadge(ws.status || "UNVERIFIED"),
+  ].join(" &nbsp;·&nbsp; ");
+
+  // ---- 第二行：核心指标（数字可点：跳到对应卡片）
+  $("d-ctl-metrics").innerHTML = [
+    `Required PO <b>${ps.covered || 0} / ${ps.required || 0}</b> PROVEN`,
+    `Failed ${ps.failed || 0}`,
+    `Unproven ${ps.unproven || 0}`,
+    `Weak ${ps.weak || 0}`,
+    `Evidence ${es.total || 0}` + (es.stale ? `（过期 ${es.stale}）` : ""),
+    `Ontology errors ${onto.error_count || 0}`,
+    `Workspace ${ws.verified_revision ? esc(ws.verified_revision) : "—"}`,
+  ].join(" &nbsp;·&nbsp; ");
+
+  // ---- 下一步 + 为什么不能交付
+  const na = cp.next_action || {}, reasons = gate.blocking_reasons || [];
+  $("d-ctl-next").innerHTML =
+    (na.text ? `<div><b>下一步</b> ${esc(na.text)}</div>` : "")
+    + (reasons.length
+        ? `<div class="note" style="margin-top:4px"><b>为什么不能交付</b>：`
+          + reasons.map(r => esc(r)).join("；") + `</div>`
+        : "")
+    + (dec.decision_id
+        ? `<div class="note" style="margin-top:4px">裁决对象 <code>${esc(dec.decision_id)}</code></div>`
+        : "");
+
+  // ---- 证明义务矩阵（§22）
+  const proofs = cp.proofs || [];
+  $("d-proof-card").hidden = proofs.length === 0;
+  if(proofs.length){
+    $("d-proof-note").textContent =
+      `required ${ps.required || 0} · proven ${ps.covered || 0} · failed ${ps.failed || 0} · unproven ${ps.unproven || 0}`;
+    $("d-proof-body").innerHTML =
+      `<table class="kv"><thead><tr><th>PO</th><th>状态</th><th>需求</th><th>声明</th>`
+      + `<th>类型</th><th>任务</th><th>场景</th><th>证据</th><th>Workspace</th></tr></thead><tbody>`
+      + proofs.map(p => `<tr>`
+        + `<td><code>${esc(p.id || "")}</code></td>`
+        + `<td>${cpBadge(p.status)}</td>`
+        + `<td>${esc(p.requirement || "")}</td>`
+        + `<td>${esc(p.claim || "")}</td>`
+        + `<td>${esc(p.kind || "")}</td>`
+        + `<td>${esc(p.task || "")}</td>`
+        + `<td>${esc(p.scenario || "")}</td>`
+        + `<td>${(p.evidence || []).length ? (p.evidence || []).map(e => `<code>${esc(e)}</code>`).join(" ") : "—"}</td>`
+        + `<td>${esc(p.workspace_revision || "")}</td></tr>`).join("")
+      + `</tbody></table>`;
+  }
+
+  // ---- 证据链（§23）：只显示后端已绑定的 target_po，UI 不推理
+  const evs = cp.evidence || [];
+  $("d-evidence-card").hidden = evs.length === 0;
+  if(evs.length){
+    $("d-evidence-note").textContent = `${es.total || 0} 条 · 过期 ${es.stale || 0}`;
+    $("d-evidence-body").innerHTML = evs.map(e =>
+      `<div class="note" style="margin-bottom:6px">`
+      + `<code>${esc(e.id || "")}</code> ${cpBadge(e.status)} ${esc(e.kind || "")}`
+      + ` — 证明 ${(e.target_po || []).length
+          ? (e.target_po || []).map(x => `<code>${esc(x)}</code>`).join(" ")
+          : '<span class="note">（未绑定）</span>'}`
+      + (e.workspace_revision ? ` @ ${esc(e.workspace_revision)}` : "")
+      + (e.command ? `<div class="code" style="margin-top:2px">${esc(e.command)}</div>` : "")
+      + `</div>`).join("");
+  }
+
+  // ---- 语义完整性（§24）：error 一律显示成"阻断发布"，不是警告
+  const errs = onto.errors || [];
+  const showOnto = errs.length > 0 || onto.status === "BLOCKED";
+  $("d-ontology-card").hidden = !showOnto;
+  if(showOnto){
+    $("d-ontology-note").innerHTML =
+      cpBadge(onto.status || "VALID") + ` ${onto.error_count || 0} 处`;
+    $("d-ontology-body").innerHTML = errs.length
+      ? errs.map(e => `<div class="note" style="margin-bottom:4px">`
+          + `<code>${esc(e.code || "")}</code> ${esc(e.object || "")}`
+          + ` — ${esc(e.message || e.detail || "")} <b>阻断发布</b></div>`).join("")
+      : `<div class="note">无 error</div>`;
+  }
+
+  // ---- 工作区版本（§25）
+  const chain = ws.chain || [];
+  const showWs = chain.length > 0 || !!ws.verified_revision;
+  $("d-workspace-card").hidden = !showWs;
+  if(showWs){
+    $("d-workspace-note").textContent = `${ws.verified_revision || "—"} ${ws.status || ""}`;
+    $("d-workspace-body").innerHTML = chain.length
+      ? chain.map(r => `<div class="note"><code>${esc(r.revision || r.id || "")}</code> `
+          + `${esc(r.task || "")} ${esc(r.status || "")}</div>`).join("")
+      : `<div class="note">已验证：<code>${esc(ws.verified_revision || "")}</code></div>`;
+  }
+}
+
 function renderDetail(){
   const d = S.detail, st = d.state || {}, sm = d.summary || {};
   // **产物层**：`state.json` 是整份快照（顶层是 status/cursor/attempt/…，阶段产物在
@@ -1271,6 +1441,9 @@ function renderDetail(){
     d.presence ? badge("外部进程 pid=" + (d.presence.pid||"?"), "warn") : "",
     (st.paused_after ? badge("停在 " + (STAGE_CN[st.paused_after]||st.paused_after) + " 之后", "warn") : "")
   ].join(" ");
+
+  // 交付控制塔：后端已把机械结论聚合好，这里只渲染（不解析 state 内部结构）
+  renderControlPlane(d);
 
   // 续跑按钮：运行中 / 已结束 / 缺 state → 一律置灰；仅暂停态可续跑
   $("btn-resume").disabled = !editable;
