@@ -49,6 +49,37 @@
   .b.bad{color:var(--bad);border-color:#5b2b2b}
   .b.warn{color:var(--warn);border-color:#5b4a1c}
   .b.acc{color:#c3d0ff;border-color:#3d5490;background:#1e2740}
+  /* §34.1 固定控制条：翻很长的日志/产物时不丢上下文（运行 ID / 状态 / 放行结论 / 下一步）。
+     header 本身 sticky top:0（高 56px），这里贴在它下面。 */
+  .sticky-bar{position:sticky;top:56px;z-index:4;margin-bottom:12px;
+    background:linear-gradient(180deg,#1a1f29,#161a22);border:1px solid var(--line);
+    border-radius:10px;padding:7px 12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+    box-shadow:0 6px 14px rgba(0,0,0,.28)}
+  .sticky-bar .sid{font-family:var(--mono);font-size:12.5px}
+  /* §34 固定导航：单页锚点跳转（scrollIntoView），不引入 SPA 框架 */
+  .anchor-nav{display:flex;gap:5px;flex-wrap:wrap}
+  .anchor-nav button{padding:3px 9px;font-size:12px}
+  /* §30 证明链：纯 HTML 链条（不引图形库） */
+  .proof-chain{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px 0}
+  .proof-chain .pn{border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:12px;
+    background:var(--panel2);white-space:nowrap}
+  .proof-chain .pn .n{font-weight:600}
+  .proof-chain .pn.acc{border-color:#245343;color:var(--ok)}
+  .proof-chain .pn.bad{border-color:#5b2b2b;color:var(--bad)}
+  .proof-chain .pn.warn{border-color:#5b4a1c;color:var(--warn)}
+  .proof-chain .pa{color:var(--dim)}
+  /* §35 日志搜索命中（与"警告/错误"着色共存：命中用背景，等级用前景色） */
+  mark.hit{background:#3d5490;color:#fff;border-radius:3px;padding:0 1px}
+  /* §22.1 证明矩阵行可展开 */
+  tr.po-row{cursor:pointer}
+  tr.po-row:hover td{background:#1e2740}
+  tr.po-detail td{background:#121722;border-top:1px dashed var(--line)}
+  .po-cmd{font-family:var(--mono);font-size:11.5px;margin-top:2px;white-space:pre-wrap}
+  /* §29 真值 badge 配色（34.2：VERIFIED=success / DERIVED=neutral / ASSERTED=info） */
+  .b.truth-asserted{color:#c3d0ff;border-color:#3d5490;background:#1e2740}
+  .b.truth-derived{color:var(--dim)}
+  .b.truth-human{color:var(--ok);border-color:#245343}
+  .b.truth-contradicted{color:var(--bad);border-color:#5b2b2b}
   .run{padding:9px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:8px;cursor:pointer;
     background:var(--panel2)}
   .run:hover{border-color:var(--accent)}
@@ -381,6 +412,26 @@
     </div>
 
     <div id="detail" hidden>
+      <!-- §34.1 固定控制条 + §34 固定导航：单页锚点跳转，不引入 SPA 框架。
+           数据全部来自后端 control_plane（前端不解析 state 内部结构、不做语义推理）。 -->
+      <div class="sticky-bar" id="d-sticky">
+        <b class="sid" id="d-sticky-id"></b>
+        <span id="d-sticky-state"></span>
+        <span id="d-sticky-gate"></span>
+        <span class="note" id="d-sticky-next"></span>
+        <span class="grow"></span>
+        <div class="anchor-nav" id="d-anchor-nav">
+          <button data-goto="d-control-card">总览</button>
+          <button data-goto="d-truth-card">真值</button>
+          <button data-goto="d-proof-card">证明</button>
+          <button data-goto="d-testcard">测试</button>
+          <button data-goto="d-plandiff-card">计划</button>
+          <button data-goto="d-graph-card">阶段</button>
+          <button data-goto="d-stages-card">产物</button>
+          <button data-goto="d-issues-card">问题</button>
+          <button data-goto="d-log-card">日志</button>
+        </div>
+      </div>
       <div class="card">
         <div class="row">
           <b id="d-id" style="font-family:var(--mono)"></b>
@@ -437,9 +488,39 @@
         <div id="d-proof-body" style="margin-top:8px"></div>
       </div>
 
+      <!-- §27 测试编译 + P0-13 验证方式：必须区分「LLM 候选命令」与「Compiler 最终命令」，
+           且明确标出哪条义务只能冒烟 / 只能人工（机械不可验 ≠ 忘了测）。 -->
+      <div class="card" id="d-testcard" hidden>
+        <div class="row">
+          <h2 style="margin:0">测试编译</h2><span class="grow"></span>
+          <span class="note" id="d-test-note"></span>
+        </div>
+        <div id="d-test-body" style="margin-top:8px"></div>
+      </div>
+
+      <!-- §29 / §16.3：真值来源 —— 用户事实（ASSERTED）与默认假设（DERIVED）必须分开显示，
+           否则「模型补的默认值」会被读成「用户明确要求」。 -->
+      <div class="card" id="d-truth-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">需求真值</h2><span class="grow"></span>
+          <span class="note" id="d-truth-note"></span>
+        </div>
+        <div id="d-truth-body" style="margin-top:8px"></div>
+      </div>
+
+      <!-- §26：方案 → 编译任务 对照（为什么 3 张架构师图最后变成 1 张执行图） -->
+      <div class="card" id="d-plandiff-card" hidden>
+        <div class="row">
+          <h2 style="margin:0">方案 → 编译任务</h2><span class="grow"></span>
+          <span class="note" id="d-plandiff-note"></span>
+        </div>
+        <div id="d-plandiff-body" style="margin-top:8px"></div>
+      </div>
+
       <div class="card" id="d-evidence-card" hidden>
         <div class="row">
           <h2 style="margin:0">证据链</h2><span class="grow"></span>
+          <span class="note" id="d-evidence-filter"></span>
           <span class="note" id="d-evidence-note"></span>
         </div>
         <div id="d-evidence-body" style="margin-top:8px"></div>
@@ -476,6 +557,9 @@
         <div class="row">
           <h2 style="margin:0">阶段流程图 · 产物与日志</h2>
           <span class="grow"></span>
+          <!-- §30：阶段流程 / 证明链 两视图切换（证明链同样只用 control_plane 数据） -->
+          <button id="btn-view-stage" class="primary">阶段流程</button>
+          <button id="btn-view-proof">证明链</button>
           <span class="note" id="d-graph-note"></span>
         </div>
         <div class="graph-wrap" style="margin-top:9px">
@@ -496,6 +580,9 @@
             <div id="d-graph-detail" hidden></div>
           </div>
         </div>
+        <!-- §30 证明链：Requirement → PO → Task → Scenario → Evidence → Decision
+             （纯 HTML 链条，不引图形库；数据只来自 control_plane） -->
+        <div class="proof-chain" id="d-proof-chain" hidden></div>
         <details style="margin-top:9px">
           <summary>流定义（Mermaid 源码 · 一致性校验）</summary>
 
@@ -653,6 +740,10 @@
           <div class="log-bar">
             <label><input type="checkbox" id="log-follow" checked> 自动跟随</label>
             <label><input type="checkbox" id="log-only-issues"> 只看警告/错误</label>
+            <!-- §35：页面内搜索（PO/EV/T-id/命令）并高亮；复制当前视图 -->
+            <input id="log-search" placeholder="搜索（PO-… / EV-… / T-… / 命令）" style="width:230px">
+            <button id="btn-log-copy">复制</button>
+            <span class="note" id="log-search-note"></span>
           </div>
         </div>
         <pre id="d-log"></pre>
@@ -820,15 +911,46 @@ function mdToHtml(src){
 }
 
 // 运行日志按行着色：警告/错误/机制判定以前全是一个颜色，扫读成本高
-function highlightLog(text, onlyIssues){
+function highlightLog(text, onlyIssues, search){
   const rows = String(text || "").split("\n");
-  const picked = onlyIssues ? rows.filter(l => /警告|错误|Traceback|Error|\[机制\]|机制判定/.test(l)) : rows;
-  return picked.map(l => {
+  const q = String(search || "").trim();
+  let picked = onlyIssues
+    ? rows.filter(l => /警告|错误|Traceback|Error|\[机制\]|机制判定/.test(l))
+    : rows;
+  // §35：搜索 = **过滤 + 高亮**（先按原样过滤，再逐段转义 —— 避免在转义后的
+  // HTML 里做正则，那会让含 `&`/`<` 的查询串匹配错位）
+  let shown = picked;
+  if(q){
+    const lower = q.toLowerCase();
+    shown = picked.filter(l => l.toLowerCase().includes(lower));
+  }
+  const mark = (line, cls) => {
+    let html = "";
+    if(q){
+      const re = new RegExp(escapeRegExp(q), "gi");
+      let last = 0, m;
+      while((m = re.exec(line)) !== null){
+        html += esc(line.slice(last, m.index)) + `<mark class="hit">${esc(m[0])}</mark>`;
+        last = m.index + m[0].length;
+        if(m[0] === "") re.lastIndex++;   // 防空匹配死循环
+      }
+      html += esc(line.slice(last));
+    } else {
+      html = esc(line);
+    }
+    if(!html) html = " ";
+    return cls ? `<span class="${cls}">${html}</span>` : html;
+  };
+  return shown.map(l => {
     const cls = /\[机制\]|机制判定/.test(l) ? "log-note"
       : /警告|Traceback|\[错误\]/.test(l) ? "log-warn"
       : /\bError\b|failed|失败/.test(l) ? "log-bad" : "";
-    return cls ? `<span class="${cls}">${esc(l) || " "}</span>` : esc(l);
+    return mark(l, cls);
   }).join("\n");
+}
+
+function escapeRegExp(s){
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // 把 fetch 的底层报错（Failed to fetch 等）翻译成可操作的提示
@@ -1257,6 +1379,10 @@ async function openRun(runId){
   S.current = runId;
   // 换运行就回到「跟随当前」：新运行的阶段进度与上一个无关，固定住会看到空面板
   S.node = ""; S.nodePin = false; S.graphSel = null;
+  // 换运行必须清掉日志搜索与证据版本过滤：它们是**上一次运行**的上下文，
+  // 留着会让新运行"看起来少了东西"（过滤条件对不上任何 revision ⇒ 空证据链）
+  S.logSearch = ""; S.evidenceRev = "";
+  if($("log-search")) $("log-search").value = "";
   resetAdvice();   // 裁决参谋的问答线程按运行隔离，换运行必须整体作废
   DEMO.run = null;   // 换运行 → 强制重拉沙箱演示数据
   document.querySelectorAll(".run").forEach(el =>
@@ -1331,6 +1457,15 @@ function cpBadge(text){
   const t = String(text || "");
   return badge(t || "—", CP_CLS[t] || "");
 }
+// 场景状态色（§27）：executable/mechanical=可执行证明，weak=弱证据，unproven=缺口。
+const CP_TEST_CLS = {
+  executable: "acc", mechanical: "acc", weak_evidence: "warn", unproven: "bad",
+};
+// 验证方式的人话标签（P0-13）：机械不可验**不等于**忘了测。
+const CP_MODE_LABEL = {
+  mechanical: "机械", unit: "单测/断言", gui_smoke: "GUI 冒烟",
+  resident: "常驻进程", human_only: "只能人工", unclassified: "未分类",
+};
 
 function renderControlPlane(d){
   const cp = d && d.control_plane ? d.control_plane : {};
@@ -1351,21 +1486,40 @@ function renderControlPlane(d){
     "Workspace " + cpBadge(ws.status || "UNVERIFIED"),
   ].join(" &nbsp;·&nbsp; ");
 
-  // ---- 第二行：核心指标（数字可点：跳到对应卡片）
+  // ---- 第二行：核心指标（§21.2 所有数字**可点击** ⇒ 跳到对应卡片）
+  const metric = (text, card) =>
+    `<a class="metric" data-goto="${card}" style="cursor:pointer;text-decoration:none;color:inherit">${text}</a>`;
   $("d-ctl-metrics").innerHTML = [
-    `Required PO <b>${ps.covered || 0} / ${ps.required || 0}</b> PROVEN`,
-    `Failed ${ps.failed || 0}`,
-    `Unproven ${ps.unproven || 0}`,
-    `Weak ${ps.weak || 0}`,
-    `Evidence ${es.total || 0}` + (es.stale ? `（过期 ${es.stale}）` : ""),
-    `Ontology errors ${onto.error_count || 0}`,
-    `Workspace ${ws.verified_revision ? esc(ws.verified_revision) : "—"}`,
+    metric(`Required PO <b>${ps.covered || 0} / ${ps.required || 0}</b> PROVEN`, "d-proof-card"),
+    metric(`Failed ${ps.failed || 0}`, "d-proof-card"),
+    metric(`Unproven ${ps.unproven || 0}`, "d-proof-card"),
+    metric(`Weak ${ps.weak || 0}`, "d-testcard"),
+    metric(`Evidence ${es.total || 0}` + (es.stale ? `（过期 ${es.stale}）` : ""), "d-evidence-card"),
+    metric(`Ontology errors ${onto.error_count || 0}`, "d-ontology-card"),
+    metric(`Workspace ${ws.verified_revision ? esc(ws.verified_revision) : "—"}`, "d-workspace-card"),
   ].join(" &nbsp;·&nbsp; ");
+  $("d-ctl-metrics").querySelectorAll("a.metric").forEach(el => {
+    el.onclick = () => scrollToCard(el.dataset.goto);
+  });
 
-  // ---- 下一步 + 为什么不能交付
+  // ---- §28 最终机器裁决（依据可点）+ §31 下一步 + 为什么不能交付
   const na = cp.next_action || {}, reasons = gate.blocking_reasons || [];
+  const basis = [
+    ...(dec.evidence_ids || []).map(x => `<a class="basis" data-goto="d-evidence-card"><code>${esc(x)}</code></a>`),
+    ...(dec.defect_ids || []).map(x => `<code>${esc(x)}</code>`),
+  ];
   $("d-ctl-next").innerHTML =
-    (na.text ? `<div><b>下一步</b> ${esc(na.text)}</div>` : "")
+    `<div class="note"><b>最终机器裁决</b>：语义评审 `
+      + (gate.semantic_verdict ? badge(esc(gate.semantic_verdict), "warn") : badge("无", ""))
+      + `（候选） · 机械证据 ` + cpBadge(gate.proof_status || "UNPROVEN")
+      + ` · Ontology ` + cpBadge(onto.status || "VALID")
+      + ` · Workspace ` + (ws.verified_revision ? `<code>${esc(ws.verified_revision)}</code>` : "—")
+      + ` ⇒ 判定 <b>${esc(dec.verdict || (gate.can_pass ? "pass" : "—"))}</b></div>`
+    + (basis.length
+        ? `<div class="note" style="margin-top:4px"><b>依据</b> ${basis.join(" ")}`
+          + `（点 Evidence 跳到证据链）</div>`
+        : "")
+    + (na.text ? `<div style="margin-top:4px"><b>下一步</b> ${esc(na.text)}</div>` : "")
     + (reasons.length
         ? `<div class="note" style="margin-top:4px"><b>为什么不能交付</b>：`
           + reasons.map(r => esc(r)).join("；") + `</div>`
@@ -1373,6 +1527,9 @@ function renderControlPlane(d){
     + (dec.decision_id
         ? `<div class="note" style="margin-top:4px">裁决对象 <code>${esc(dec.decision_id)}</code></div>`
         : "");
+  $("d-ctl-next").querySelectorAll("a.basis").forEach(el => {
+    el.onclick = () => scrollToCard(el.dataset.goto);
+  });
 
   // ---- 证明义务矩阵（§22）
   const proofs = cp.proofs || [];
@@ -1381,9 +1538,10 @@ function renderControlPlane(d){
     $("d-proof-note").textContent =
       `required ${ps.required || 0} · proven ${ps.covered || 0} · failed ${ps.failed || 0} · unproven ${ps.unproven || 0}`;
     $("d-proof-body").innerHTML =
-      `<table class="kv"><thead><tr><th>PO</th><th>状态</th><th>需求</th><th>声明</th>`
+      `<div class="note">点任意一行展开<b>该 PO 的完整证据</b>（Claim / Scenario / 命令 / 断言 / 退出码 / stdout-stderr / Evidence / Workspace）——人工不必再翻日志。</div>`
+      + `<table class="kv" style="margin-top:6px"><thead><tr><th>PO</th><th>状态</th><th>需求</th><th>声明</th>`
       + `<th>类型</th><th>任务</th><th>场景</th><th>证据</th><th>Workspace</th></tr></thead><tbody>`
-      + proofs.map(p => `<tr>`
+      + proofs.map(p => `<tr class="po-row" data-po="${esc(p.id || "")}">`
         + `<td><code>${esc(p.id || "")}</code></td>`
         + `<td>${cpBadge(p.status)}</td>`
         + `<td>${esc(p.requirement || "")}</td>`
@@ -1392,16 +1550,96 @@ function renderControlPlane(d){
         + `<td>${esc(p.task || "")}</td>`
         + `<td>${esc(p.scenario || "")}</td>`
         + `<td>${(p.evidence || []).length ? (p.evidence || []).map(e => `<code>${esc(e)}</code>`).join(" ") : "—"}</td>`
-        + `<td>${esc(p.workspace_revision || "")}</td></tr>`).join("")
+        + `<td>${esc(p.workspace_revision || "")}</td></tr>`
+        + `<tr class="po-detail" hidden><td colspan="9">${poDetailHtml(p)}</td></tr>`).join("")
       + `</tbody></table>`;
+    // §22.1 展开：点行开关紧随其后的明细行（用 nextElementSibling，不依赖 id 选择器转义）
+    $("d-proof-body").querySelectorAll("tr.po-row").forEach(tr => {
+      tr.onclick = () => {
+        const det = tr.nextElementSibling;
+        if(det && det.classList.contains("po-detail")) det.hidden = !det.hidden;
+      };
+    });
+  }
+
+  // ---- 测试编译（§27 + P0-13）：覆盖数字 / 验证方式分类 / 场景明细 / 候选命令
+  const tc = cp.test || {};
+  const tcModes = tc.verification_modes || {};
+  const tcScens = tc.scenarios || [];
+  const tcModeKeys = Object.keys(tcModes).filter(k => (tcModes[k] || []).length);
+  const tcCard = $("d-testcard");
+  if(tcCard){
+    tcCard.hidden = !(tcScens.length || tcModeKeys.length || (tc.required || 0));
+    if(!tcCard.hidden){
+      $("d-test-note").textContent =
+        `Required PO ${tc.required || 0} · Covered ${tc.covered || 0} · Weak ${tc.weak || 0}`
+        + ` · Missing ${tc.missing || 0} · Unproven ${tc.unexecutable || 0}`
+        + ` · Unsafe ${(tc.unsafe_commands || []).length}`
+        + ` · Unbound ${(tc.unbound_commands || []).length}`;
+      const modeLine = tcModeKeys.length
+        ? `<div class="note">验证方式：` + tcModeKeys.map(k =>
+            `${badge(CP_MODE_LABEL[k] || k, "")} ${(tcModes[k] || []).length}`
+            + ` <span class="note">${(tcModes[k] || []).slice(0, 5).map(esc).join(" ")}</span>`
+          ).join(" &nbsp;·&nbsp; ") + `</div>`
+        : "";
+      // LLM 候选命令：编译器**不认**（形态/归属不符）⇒ 绝不显示成"已执行"
+      const unbound = tc.unbound_commands || [];
+      const unboundLine = unbound.length
+        ? `<div class="note" style="margin-top:4px"><b>LLM 候选命令（编译器不认，未执行）</b>：`
+          + unbound.map(u =>
+              `<code>${esc(u.command || "")}</code>`
+              + (u.candidate ? ` → <code>${esc(u.candidate)}</code>` : "")
+              + (u.reason ? ` <span class="note">${esc(u.reason)}</span>` : "")
+            ).join("；") + `</div>`
+        : "";
+      const unsafe = tc.unsafe_commands || [];
+      const unsafeLine = unsafe.length
+        ? `<div class="note" style="margin-top:4px"><b>不安全命令（只登记不执行）</b>：`
+          + unsafe.map(u => `<code>${esc(u.command || "")}</code>`
+              + (u.reason ? ` <span class="note">${esc(u.reason)}</span>` : "")).join("；")
+          + `</div>`
+        : "";
+      const tcRows = tcScens.map(s => `<tr>`
+        + `<td><code>${esc(s.id || "")}</code></td>`
+        + `<td><code>${esc(s.target_po || "")}</code></td>`
+        + `<td>${esc(s.kind || "")}</td>`
+        + `<td>${badge(CP_MODE_LABEL[s.verification_mode] || s.verification_mode || "—", "")}`
+        + ((s.mechanical_check || []).length
+            ? ` <span class="note">${esc((s.mechanical_check || []).join("+"))}</span>` : "")
+        + `</td>`
+        + `<td>${badge(s.status || "—", CP_TEST_CLS[s.status] || "")}</td>`
+        + `<td>${(s.commands || []).length
+            ? (s.commands || []).map(c => `<code>${esc(c)}</code>`).join("<br>")
+            : `<span class="note">（无 shell 命令）</span>`}</td>`
+        + `<td>${(s.assertions || []).length ? esc((s.assertions || []).join(", ")) : "—"}</td>`
+        + `<td>${esc(s.gap_reason || "")}</td></tr>`).join("");
+      $("d-test-body").innerHTML = modeLine + unboundLine + unsafeLine
+        + (tcRows
+            ? `<table class="kv" style="margin-top:6px"><thead><tr><th>场景</th><th>目标 PO</th>`
+              + `<th>类型</th><th>验证方式</th><th>状态</th><th>Compiler 命令</th>`
+              + `<th>断言</th><th>缺口原因</th></tr></thead><tbody>${tcRows}</tbody></table>`
+            : "");
+    }
   }
 
   // ---- 证据链（§23）：只显示后端已绑定的 target_po，UI 不推理
-  const evs = cp.evidence || [];
-  $("d-evidence-card").hidden = evs.length === 0;
-  if(evs.length){
-    $("d-evidence-note").textContent = `${es.total || 0} 条 · 过期 ${es.stale || 0}`;
-    $("d-evidence-body").innerHTML = evs.map(e =>
+  // §25：点 Workspace 时间线上的某个 revision ⇒ 这里只显示该版本下的证据
+  // （证据绑定了 workspace_revision，过滤是机械的，不是 UI 猜的）
+  const evsAll = cp.evidence || [];
+  const revFilter = S.evidenceRev || "";
+  const evs = revFilter
+    ? evsAll.filter(e => String(e.workspace_revision || "") === revFilter)
+    : evsAll;
+  $("d-evidence-card").hidden = evsAll.length === 0;
+  if(evsAll.length){
+    $("d-evidence-filter").innerHTML = revFilter
+      ? `只显示 <code>${esc(revFilter)}</code> 下的证据 <button id="btn-ev-clear">清除过滤</button>`
+      : "";
+    if($("btn-ev-clear")) $("btn-ev-clear").onclick = () => setEvidenceFilter("");
+    $("d-evidence-note").textContent =
+      `${es.total || 0} 条 · 过期 ${es.stale || 0}`
+      + (revFilter ? ` · 过滤后 ${evs.length} 条` : "");
+    $("d-evidence-body").innerHTML = evs.length ? evs.map(e =>
       `<div class="note" style="margin-bottom:6px">`
       + `<code>${esc(e.id || "")}</code> ${cpBadge(e.status)} ${esc(e.kind || "")}`
       + ` — 证明 ${(e.target_po || []).length
@@ -1409,7 +1647,8 @@ function renderControlPlane(d){
           : '<span class="note">（未绑定）</span>'}`
       + (e.workspace_revision ? ` @ ${esc(e.workspace_revision)}` : "")
       + (e.command ? `<div class="code" style="margin-top:2px">${esc(e.command)}</div>` : "")
-      + `</div>`).join("");
+      + `</div>`).join("")
+      : `<div class="note">该版本下没有证据（证据只在它绑定的 workspace_revision 下成立）。</div>`;
   }
 
   // ---- 语义完整性（§24）：error 一律显示成"阻断发布"，不是警告
@@ -1433,10 +1672,223 @@ function renderControlPlane(d){
   if(showWs){
     $("d-workspace-note").textContent = `${ws.verified_revision || "—"} ${ws.status || ""}`;
     $("d-workspace-body").innerHTML = chain.length
-      ? chain.map(r => `<div class="note"><code>${esc(r.revision || r.id || "")}</code> `
-          + `${esc(r.task || "")} ${esc(r.status || "")}</div>`).join("")
+      ? `<div class="note">点一个 revision ⇒ <b>证据链只显示该版本下的证据</b>（Workspace 必须对应 Evidence）。</div>`
+        + chain.map(r => {
+            const rev = String(r.revision || r.id || "");
+            return `<div class="note ws-row" data-rev="${esc(rev)}" style="cursor:pointer">`
+              + `<code>${esc(rev)}</code> ${esc(r.task || "")} ${esc(r.status || "")}`
+              + (rev && rev === revFilter ? ` ${badge("已过滤", "acc")}` : "") + `</div>`;
+          }).join("")
       : `<div class="note">已验证：<code>${esc(ws.verified_revision || "")}</code></div>`;
+    // §25 点击过滤：再点同一版本 = 取消过滤
+    $("d-workspace-body").querySelectorAll(".ws-row").forEach(el => {
+      el.onclick = () => setEvidenceFilter(el.dataset.rev === (S.evidenceRev || "") ? "" : el.dataset.rev);
+    });
   }
+
+  // ---- §29 / §16.3 需求真值（用户事实 vs 默认假设 vs 人工裁决 vs 矛盾）
+  renderTruth(cp.truth || {});
+
+  // ---- §26 方案 → 编译任务 对照
+  renderPlanDiff(cp.plan_diff || {});
+}
+
+// §34 单页锚点跳转（导航按钮与"可点数字"共用；隐藏卡片静默跳过，不制造"点了没反应"）
+function scrollToCard(id){
+  const target = $(id);
+  if(!target || target.hidden) return;
+  target.scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+// §25 证据过滤：只改前端过滤条件，重渲证据链（不需要重拉 detail）
+function setEvidenceFilter(rev){
+  S.evidenceRev = rev || "";
+  if(S.detail) renderControlPlane(S.detail);
+}
+
+// §29 真值 badge：四态必须一眼可分（ASSERTED / DERIVED / HUMAN / CONTRADICTED）
+function truthBadge(truth){
+  const t = String(truth || "DERIVED").toUpperCase();
+  const label = {ASSERTED: "用户原文", DERIVED: "默认假设", HUMAN: "人工确认",
+                 CONTRADICTED: "存在矛盾"}[t] || t;
+  const cls = {ASSERTED: "truth-asserted", DERIVED: "truth-derived",
+               HUMAN: "truth-human", CONTRADICTED: "truth-contradicted"}[t] || "";
+  return `<span class="b ${cls}">${esc(label)}</span>`;
+}
+
+function renderTruth(t){
+  const card = $("d-truth-card");
+  if(!card) return;
+  const asserted = t.asserted || [], derived = t.derived || [], human = t.human || [];
+  const bad = t.contradicted || [], gerr = t.grounding_errors || [];
+  card.hidden = !(asserted.length || derived.length || human.length || bad.length || gerr.length);
+  if(card.hidden) return;
+  $("d-truth-note").innerHTML =
+    `${truthBadge("ASSERTED")} ${asserted.length} · ${truthBadge("DERIVED")} ${derived.length}`
+    + ` · ${truthBadge("HUMAN")} ${human.length}`
+    + (bad.length ? ` · ${truthBadge("CONTRADICTED")} ${bad.length}` : "");
+  const sec = (title, rows) => rows.length
+    ? `<div style="margin-top:6px"><b>${esc(title)}</b>${rows}</div>` : "";
+  $("d-truth-body").innerHTML =
+    sec("用户原文声明（ASSERTED —— 下游不得删除/改写/弱化）", asserted.map(a =>
+      `<div class="note" style="margin-top:3px">${truthBadge(a.truth)} <b>${esc(a.label || "")}</b>`
+      + ` ${esc(a.text || "")}`
+      + ((a.mechanical_check || []).length
+          ? ` <span class="note">（机械检查 ${esc((a.mechanical_check || []).join("、"))}）</span>`
+          : (a.bucket === "hard_constraints" ? ` <span class="note">（只能人工确认）</span>` : ""))
+      + (a.source_quote ? `<div class="po-cmd">原文：${esc(a.source_quote)}</div>` : "")
+      + `</div>`).join(""))
+    + sec("默认假设 / 模型补充（DERIVED —— **不是**用户明确要求）", derived.map(d =>
+      `<div class="note" style="margin-top:3px">${truthBadge("DERIVED")} ${esc(d.text || "")}`
+      + (d.source ? ` <span class="note">来源 ${esc(d.source)}</span>` : "") + `</div>`).join(""))
+    + sec("人工裁决（HUMAN CONFIRMED —— 真值高于任何模型推导）", human.map(h =>
+      `<div class="note" style="margin-top:3px">${truthBadge("HUMAN")} `
+      + `<span class="note">${esc(h.scope || "")}</span> ${esc(h.decision || "")} `
+      + `<span class="note">${esc(h.subject || "")}</span></div>`).join(""))
+    + sec("矛盾 / 语义问题（阻断发布）", bad.map(b =>
+      `<div class="note" style="margin-top:3px">${truthBadge("CONTRADICTED")} `
+      + `<code>${esc(b.code || "")}</code> ${esc(b.object || "")} — ${esc(b.message || "")}</div>`).join(""))
+    + sec("无法从原文确证（已记为 grounding_errors，**不作为事实使用**）", gerr.map(g =>
+      `<div class="note" style="margin-top:3px">${esc(g.code || "")} ${esc(g.detail || "")}</div>`).join(""));
+}
+
+// §26 方案 → 编译任务（merged / split / 文件租约 / 口径偏差）
+const PLAN_DIFF_KIND = {merged: "合并", split: "拆分", one_to_one: "一对一", unmapped: "未映射"};
+function renderPlanDiff(pd){
+  const card = $("d-plandiff-card");
+  if(!card) return;
+  const draft = pd.draft || [], compiled = pd.compiled || [], files = pd.files || [];
+  card.hidden = !(draft.length || compiled.length);
+  if(card.hidden) return;
+  $("d-plandiff-note").textContent =
+    `架构师 ${draft.length} 张 → 编译器 ${compiled.length} 张`;
+  const rows = files.map(f => {
+    const kind = String(f.kind || "");
+    const cls = kind === "merged" ? "warn" : (kind === "split" ? "bad" : "acc");
+    return `<tr><td><code>${esc(f.file || "")}</code></td>`
+      + `<td>${(f.draft_ids || []).map(x => `<code>${esc(x)}</code>`).join(" ") || "—"}</td>`
+      + `<td>${(f.compiled_ids || []).map(x => `<code>${esc(x)}</code>`).join(" ") || "—"}</td>`
+      + `<td>${badge(PLAN_DIFF_KIND[kind] || kind || "—", cls)}</td>`
+      + `<td>${f.creates_file ? badge("整份新建", "acc") : badge("定点增补", "")}</td>`
+      + `<td><code>${esc(f.create_owner || "—")}</code></td>`
+      + `<td>${(f.modify_tasks || []).map(x => `<code>${esc(x)}</code>`).join(" ") || "—"}</td></tr>`;
+  }).join("");
+  const reasons = (pd.reasons || []).length
+    ? `<div class="note" style="margin-top:6px"><b>编译器与架构师原图的口径偏差</b>（审计信号，不影响执行）：`
+      + (pd.reasons || []).map(r => `<div class="po-cmd">· ${esc(String(r))}</div>`).join("") + `</div>`
+    : "";
+  $("d-plandiff-body").innerHTML =
+    `<table class="kv"><thead><tr><th>文件</th><th>架构师图</th><th>编译后图</th><th>关系</th>`
+    + `<th>创建方式</th><th>创建 owner</th><th>增补图</th></tr></thead><tbody>${rows}</tbody></table>`
+    + reasons;
+}
+
+// §22.1 证明矩阵展开体（数据全部来自后端已 join 的明细）
+function poDetailHtml(p){
+  const sc = p.scenario_detail || {};
+  const cmds = (p.command_details || []).map(c => {
+    const st = String(c.status || "");
+    const cls = st === "ok" ? "acc" : (st === "fail" ? "bad" : "warn");
+    const code = (c.exit_code === null || c.exit_code === undefined) ? "" : ` 退出码 ${c.exit_code}`;
+    return `<div class="note"><code>${esc(c.command || "")}</code> `
+      + badge(st || "未执行", cls) + esc(code)
+      + (c.stdout_tail ? `<div class="po-cmd">${esc(c.stdout_tail)}</div>` : "")
+      + (c.stderr_tail ? `<div class="po-cmd log-bad">${esc(c.stderr_tail)}</div>` : "")
+      + `</div>`;
+  }).join("");
+  const evs = (p.evidence_detail || []).map(e =>
+    `<div class="note"><code>${esc(e.id || "")}</code> ${cpBadge(e.status)} ${esc(e.kind || "")}`
+    + (e.truth ? ` <span class="note">${esc(e.truth)}</span>` : "")
+    + (e.artifact ? ` artifact=<code>${esc(e.artifact)}</code>` : "") + `</div>`).join("");
+  return `<div class="note"><b>Claim</b> ${esc(p.claim || "")}</div>`
+    + `<div class="note"><b>Scenario</b> <code>${esc(p.scenario || sc.id || "—")}</code>`
+      + (sc.status ? ` ${badge(sc.status, CP_TEST_CLS[sc.status] || "")}` : "")
+      + (sc.verification_mode
+          ? ` ${badge(CP_MODE_LABEL[sc.verification_mode] || sc.verification_mode, "")}` : "")
+      + (sc.gap_reason ? ` <span class="note">${esc(sc.gap_reason)}</span>` : "") + `</div>`
+    + ((sc.assertions || []).length
+        ? `<div class="note"><b>断言</b> ${esc((sc.assertions || []).join("；"))}</div>` : "")
+    + (cmds ? `<div style="margin-top:4px"><b>命令与执行痕迹</b>${cmds}</div>`
+            : `<div class="note">没有编译器认可的可执行命令（机械检查器或有场景无命令）</div>`)
+    + (evs ? `<div style="margin-top:4px"><b>Evidence</b>${evs}</div>`
+           : `<div class="note">暂无绑定证据</div>`)
+    + `<div class="note">Workspace <code>${esc(p.workspace_revision || "—")}</code></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// §34.1 固定控制条：翻很长的日志/产物时上下文不丢。
+// 只消费 control_plane / summary / state 的既有展示字段，不做语义推理。
+// ---------------------------------------------------------------------------
+function renderSticky(d){
+  if(!$("d-sticky")) return;
+  const cp = (d && d.control_plane) || {};
+  const gate = cp.release_gate || {}, na = cp.next_action || {};
+  const st = (d && d.state) || {};
+  const phase = runPhase(d);
+  $("d-sticky-id").textContent = (d && d.run_id) || "";
+  $("d-sticky-state").innerHTML = [
+    phase === "running" ? badge("运行中", "acc")
+      : (phase === "aborted" ? badge("异常中断", "bad") : badge(st.status || "未知")),
+    st.cursor ? badge("→ " + (STAGE_CN[st.cursor] || st.cursor), "acc") : "",
+  ].join(" ");
+  // 交付闸门：UNPROVEN 是**独立**状态，不是 pass/fail 的另一种说法；
+  // 机器放行与语义评审分开显示（这是本 UI 最重要的认知改进）。
+  $("d-sticky-gate").innerHTML =
+    "闸门 " + cpBadge(gate.status || "UNPROVEN")
+    + " 机器放行 " + (gate.can_pass ? badge("允许", "acc") : badge("禁止", "bad"))
+    + (gate.semantic_verdict
+        ? " 语义评审 " + badge(esc(gate.semantic_verdict), "warn")
+        : "");
+  $("d-sticky-next").textContent = na.text ? ("下一步：" + na.text) : "";
+}
+
+// ---------------------------------------------------------------------------
+// §30 证明链视图：Requirement → PO → Task → Scenario → Evidence → Decision
+// 纯 HTML 链条（不引图形库）；计数与状态**全部来自后端 control_plane**。
+// ---------------------------------------------------------------------------
+function renderProofGraph(d){
+  const host = $("d-proof-chain");
+  if(!host) return;
+  const cp = (d && d.control_plane) || {};
+  const ps = cp.proof_summary || {}, es = cp.evidence_summary || {};
+  const tc = cp.test || {}, tasks = cp.tasks || [];
+  const dec = cp.decision || {}, gate = cp.release_gate || {}, onto = cp.ontology || {};
+  const node = (label, n, cls) =>
+    `<span class="pn ${cls || ""}">${esc(label)} <span class="n">${esc(String(n))}</span></span>`;
+  const arrow = `<span class="pa">→</span>`;
+  const proofCls = ps.failed ? "bad" : (ps.unproven ? "warn" : (ps.required ? "acc" : ""));
+  const decCls = gate.can_pass ? "acc" : (dec.verdict === "pass" ? "warn" : "bad");
+  host.innerHTML = [
+    node("需求", onto.requirement_count || 0),
+    arrow,
+    node("证明义务", `${ps.covered || 0}/${ps.required || 0}`, proofCls),
+    arrow,
+    node("任务", tasks.length),
+    arrow,
+    node("测试场景", (tc.scenarios || []).length),
+    arrow,
+    node("证据", es.total || 0, es.stale ? "warn" : ""),
+    arrow,
+    node("裁决", dec.verdict || (gate.can_pass ? "pass" : "—"), decCls),
+  ].join(" ");
+  // 需外部/人工确认的义务单列：机械不可验 ≠ 忘了测
+  const ext = tc.external_required || [];
+  if(ext.length){
+    host.innerHTML += `<div class="note" style="width:100%;margin-top:4px">`
+      + `需外部 / 人工确认 ${ext.length} 条：`
+      + ext.slice(0, 6).map(x => `<code>${esc(x)}</code>`).join(" ") + `</div>`;
+  }
+}
+
+// §30 视图切换：阶段流程 / 证明链（两个按钮的 primary 态即当前视图）
+function setGraphView(view){
+  S.graphView = view === "proof" ? "proof" : "stage";
+  const stageOn = S.graphView === "stage";
+  if($("btn-view-stage")) $("btn-view-stage").className = stageOn ? "primary" : "";
+  if($("btn-view-proof")) $("btn-view-proof").className = stageOn ? "" : "primary";
+  document.querySelectorAll("#d-graph-card .graph-wrap").forEach(el => { el.hidden = !stageOn; });
+  if($("d-proof-chain")) $("d-proof-chain").hidden = stageOn;
+  if(S.detail) renderProofGraph(S.detail);
 }
 
 function renderDetail(){
@@ -1470,6 +1922,9 @@ function renderDetail(){
 
   // 交付控制塔：后端已把机械结论聚合好，这里只渲染（不解析 state 内部结构）
   renderControlPlane(d);
+  // §34.1 固定控制条 + §30 证明链（同样只消费 control_plane）
+  renderSticky(d);
+  setGraphView(S.graphView || "stage");
 
   // 续跑按钮：运行中 / 已结束 / 缺 state → 一律置灰；仅暂停态可续跑
   $("btn-resume").disabled = !editable;
@@ -1719,7 +2174,7 @@ function renderLog(text, source, from){
     ? `<span class="note">该模块没有自己的 console.log（整组模块跑在一个子进程里）；`
       + `以下是所属**作业**的日志${from ? `（${esc(from)}）` : ""}。</span>\n`
     : "";
-  const sig = sigOf([text, $("log-only-issues").checked, source || ""]);
+  const sig = sigOf([text, $("log-only-issues").checked, source || "", S.logSearch || ""]);
   if(box.dataset.sig === sig) return;
   const first = box.dataset.sig == null;
   const stick = $("log-follow").checked
@@ -1732,7 +2187,19 @@ function renderLog(text, source, from){
       + `命令行直接运行的日志只在终端里。</span>`;
     return;
   }
-  box.innerHTML = head + highlightLog(text, $("log-only-issues").checked);
+  box.innerHTML = head + highlightLog(text, $("log-only-issues").checked, S.logSearch || "");
+  // §35：命中行数必须显式说出来（搜索不显示"0 命中"时，人会以为搜索没生效）
+  const note = $("log-search-note");
+  if(note){
+    const q = String(S.logSearch || "").trim();
+    if(!q){
+      note.textContent = "";
+    } else {
+      const all = String(text).split("\n");
+      const n = all.filter(l => l.toLowerCase().includes(q.toLowerCase())).length;
+      note.textContent = `命中 ${n} 行 / 共 ${all.length} 行`;
+    }
+  }
   if(stick) box.scrollTop = box.scrollHeight;
 }
 
@@ -4045,6 +4512,24 @@ document.addEventListener("keydown", e => {
     renderLog((S.detail || {}).log || "");
   });
 });
+// §35 日志搜索（输入即过滤 + 高亮）；复制当前视图（所见即所得）
+if($("log-search")){
+  $("log-search").addEventListener("input", () => {
+    S.logSearch = $("log-search").value;
+    $("d-log").dataset.sig = "";
+    renderLog((S.detail || {}).log || "");
+  });
+}
+if($("btn-log-copy")){
+  $("btn-log-copy").onclick = async () => {
+    const btn = $("btn-log-copy");
+    try {
+      await navigator.clipboard.writeText($("d-log").innerText || "");
+      btn.textContent = "已复制";
+    } catch(e){ btn.textContent = "复制失败"; }
+    setTimeout(() => { btn.textContent = "复制"; }, 1500);
+  };
+}
 
 $("btn-hrev-submit").onclick = submitHumanReview;
 $("btn-demo-run").onclick = runDemo;
@@ -4106,6 +4591,14 @@ function bindCopy(btnId, sourceId){
 bindCopy("btn-copy-req", "d-req");
 bindCopy("btn-copy-prd", "d-prd");
 bindCopy("btn-copy-flow", "d-flow-mermaid");
+// §30 阶段流程 / 证明链 切换
+if($("btn-view-stage")) $("btn-view-stage").onclick = () => setGraphView("stage");
+if($("btn-view-proof")) $("btn-view-proof").onclick = () => setGraphView("proof");
+// §34 固定导航：单页锚点跳转（scrollIntoView），不引入 SPA 框架
+document.querySelectorAll("#d-anchor-nav button").forEach(btn => {
+  // 目标卡片可能因无数据被隐藏（hidden）——那就静默跳过，而不是跳到一个空位置
+  btn.onclick = () => scrollToCard(btn.dataset.goto);
+});
 $("btn-report-close").onclick = () => {
   $("report-view").hidden = true;
   if(S.current) $("detail").hidden = false; else $("empty").hidden = false;

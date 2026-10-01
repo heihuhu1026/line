@@ -30,10 +30,59 @@ from .verify import (  # noqa: PLC2701
     reject_reason,
 )
 
-#: 场景状态：可执行且断言充分 / 仅 rc=0 的弱证据 / 没有任何可执行命令
+#: 场景状态：可执行且断言充分 / 仅 rc=0 的弱证据 / 没有任何可执行命令 / 由就地机械检查器证明
 STATUS_EXECUTABLE = "executable"
 STATUS_WEAK = "weak_evidence"
 STATUS_UNPROVEN = "unproven"
+#: 编译器机械生成、由编排器**就地**跑的机械检查器证明（无 shell 命令，见 §12.5）：
+#: contract → ``verify.contract_check``；interface_freeze → ``contract_check`` +
+#: ``skeleton_conformance``；materialization → 补丁物化。它们**不是**可执行命令，
+#: 因此既不能进 ``automated_commands``，也不能被 verify 当命令执行。
+STATUS_MECHANICAL = "mechanical"
+
+#: P0-10 §12.5：权威 verifier 是「编排器就地机械检查器」的 PO 类别 —— 由 TestCompiler
+#: 自己生成证明场景，**不交给 Test LLM**（LLM 无从产出一条能证明它们的命令）。
+#: 值为给人看的 check_id 名单；真正的证据仍由 verify/编排器机械产出。
+_INPROCESS_MECHANICAL_VERIFIERS: dict[str, tuple[str, ...]] = {
+    ontology.PO_KIND_CONTRACT: ("contract_check",),
+    ontology.PO_KIND_INTERFACE_FREEZE: ("contract_check", "skeleton_conformance"),
+    ontology.PO_KIND_MATERIALIZATION: ("patch_apply",),
+}
+
+# ------------------------------------------------------------------ 验证方式分类（P0-13）
+#: 每条 required PO 必须被机械归入**一档验证方式**；归不了档的显式暴露（`unclassified`），
+#: 不许"看起来已被覆盖"。分类纯字面 + PO kind，**不引 LLM**：真机里 GUI / 常驻 / 人工三类
+#: 义务被当成"应该有单测"，于是要么逼模型编造断言、要么被记成说不清的缺口。
+MODE_MECHANICAL = "mechanical"        # 就地机械检查器（py_compile / import / 契约 / 冻结 / 物化）
+MODE_UNIT = "unit"                    # 进程内断言（python -c / unittest）即可机械判定
+MODE_GUI_SMOKE = "gui_smoke"          # 需要图形界面 / 显示器：本沙箱只能冒烟（跑起来）
+MODE_RESIDENT = "resident"            # 常驻进程 / 主循环：只能短超时跑起来
+MODE_HUMAN = "human_only"             # 机械不可验（主观 / 无可观测口径）：必须人工确认
+MODE_UNCLASSIFIED = "unclassified"    # 归不了档：显式暴露，绝不猜成"已覆盖"
+
+#: 正则→分类用的小写字面证据。刻意用**较长**的 token：`ui` / `gui` 这类两字母会命中
+#: `build` / `guide` 之类的无关词，从而把可单测的义务误降为"只能冒烟"。
+_GUI_HINTS = (
+    "界面", "窗口", "渲染", "绘制", "画布", "颜色", "字体", "按钮", "鼠标", "显示",
+    "标题栏", "tkinter", "pygame", "canvas", "window", "render", "color", "font",
+    "display", "sprite",
+)
+_RESIDENT_HINTS = (
+    "主循环", "事件循环", "常驻", "持续运行", "每帧", "帧率", "循环刷新", "游戏循环",
+    "mainloop", "event loop", "game loop", "while true",
+)
+_HUMAN_HINTS = (
+    "美观", "好看", "视觉", "手感", "体验", "主观", "人工确认", "无可观测", "无客观",
+)
+
+#: 归入"进程内断言 / 入口命令"两类的 PO kind（其余 kind 由机械检查器承担）。
+_ASSERTABLE_KINDS = frozenset({
+    ontology.PO_KIND_BEHAVIOR,
+    ontology.PO_KIND_COMMAND,
+    ontology.PO_KIND_REGRESSION,
+    ontology.PO_KIND_INVARIANT,
+    ontology.PO_KIND_INTERFACE,
+})
 
 #: 仅凭退出码 0 不能证明行为的 PO 类别（syntax 的职责本来就是"能解析"；import 另有 stdout 标记）
 _BEHAVIOR_KINDS = frozenset({
@@ -89,6 +138,11 @@ class TestScenario:
     derived_from: list[str] = field(default_factory=list)  # 可信源 id（po/claim/contract/...）
     status: str = STATUS_UNPROVEN
     gap_reason: str = ""
+    #: STATUS_MECHANICAL 专用：证明该 PO 的就地机械检查器（check_id 列表，供前端/评审显示）。
+    mechanical_check: list[str] = field(default_factory=list)
+    #: P0-13：该义务的**验证方式**（mechanical / unit / command / gui_smoke / resident /
+    #: human_only / unclassified）。用于把"机械不可验"与"忘了测"分开，不逼模型编造断言。
+    verification_mode: str = MODE_UNCLASSIFIED
 
     @property
     def automated_commands(self) -> list[str]:
@@ -108,6 +162,8 @@ class TestScenario:
             "cleanup": list(self.cleanup),
             "derived_from": list(self.derived_from),
             "automated_commands": self.automated_commands,
+            "mechanical_check": list(self.mechanical_check),
+            "verification_mode": self.verification_mode,
         }
 
 
@@ -128,6 +184,56 @@ def _as_po(item: Any) -> dict:
 
 def _norm(path: Any) -> str:
     return str(path or "").replace("\\", "/").strip()
+
+
+def classify_obligation(obligation: Any) -> str:
+    """把一条 ProofObligation 归入一种**验证方式**（P0-13，纯函数，确定性，不引 LLM）。
+
+    为什么需要：真机里 GUI / 常驻 / 人工三类义务被当成"应该有单测"，于是要么逼模型
+    编造断言、要么被记成说不清的缺口。分类把"机械不可验"与"忘了测"分开。
+
+    判定顺序（先强后弱；判不准时倾向"可机械验"，只有明确凭证才降档）：
+
+      ① PO kind 自带机械 verifier（syntax / import / materialization / delivery /
+         contract / interface_freeze）→ ``mechanical``；
+      ② 字面命中"只能人工"证据（美观 / 手感 / 主观 …）→ ``human_only``；
+      ③ 字面命中图形界面证据（窗口 / 绘制 / tkinter / pygame …）→ ``gui_smoke``；
+      ④ 字面命中常驻进程证据（主循环 / 每帧 / mainloop …）→ ``resident``；
+      ⑤ 可断言 kind（behavior / command / regression / invariant / interface）→ ``unit``；
+      ⑥ 其余 → ``unclassified``（**显式暴露**，绝不猜成"已覆盖"）。
+    """
+    item = _as_po(obligation)
+    kind = str(item.get("kind") or "")
+    if kind in _INPROCESS_MECHANICAL_VERIFIERS or kind in (
+        ontology.PO_KIND_SYNTAX,
+        ontology.PO_KIND_IMPORT,
+        ontology.PO_KIND_MATERIALIZATION,
+        ontology.PO_KIND_DELIVERY,
+    ):
+        return MODE_MECHANICAL
+    text = f"{item.get('name') or ''} {item.get('claim') or ''}".lower()
+    if any(h in text for h in _HUMAN_HINTS):
+        return MODE_HUMAN
+    if any(h in text for h in _GUI_HINTS):
+        return MODE_GUI_SMOKE
+    if any(h in text for h in _RESIDENT_HINTS):
+        return MODE_RESIDENT
+    if kind in _ASSERTABLE_KINDS:
+        return MODE_UNIT
+    return MODE_UNCLASSIFIED
+
+
+def mode_summary(obligations: Any) -> dict[str, list[str]]:
+    """``{验证方式: [PO id, …]}`` 汇总（P0-13）：供审计 / 控制塔显示"哪些只能冒烟/人工"。"""
+    out: dict[str, list[str]] = {}
+    for item in obligations or ():
+        po = _as_po(item)
+        if not po["id"]:
+            continue
+        out.setdefault(classify_obligation(po), []).append(po["id"])
+    for ids in out.values():
+        ids.sort()
+    return out
 
 
 def _py_modules(files: list[str]) -> list[str]:
@@ -186,6 +292,13 @@ def _scenario_id(po_id: str, actions: list[TestAction]) -> str:
     )
 
 
+def _mechanical_scenario_id(po_id: str, checks: tuple[str, ...]) -> str:
+    """就地机械证明的场景身份：只取决于 PO 与其机械检查器名单（确定性、可复现）。"""
+    return "tscn:" + ontology.stable_hash(
+        ontology.canonical_json([po_id, "mechanical", list(checks)]), length=12
+    )
+
+
 def compile_scenarios(
     *,
     obligations: Any,
@@ -209,7 +322,12 @@ def compile_scenarios(
     返回
     ----
     ``{"scenarios", "coverage_gap", "weak_evidence", "unsafe_commands",
-       "unclaimed_commands", "automated_commands_empty"}``
+       "unclaimed_commands", "unbound_commands", "automated_commands_empty",
+       "verification_modes", "external_required"}``
+
+    后两项是 P0-13 的**验证方式分类**：``verification_modes`` 为 ``{方式: [PO id]}``，
+    ``external_required`` 是只有本沙箱之外（人工确认 / 显示器 / 常驻交互）才能定的义务 ——
+    单列出来，免得被当成"忘测"反复重问。
     """
     pos = [_as_po(p) for p in (obligations or []) if _as_po(p)["id"]]
     required = [p for p in pos if p["required"]]
@@ -220,8 +338,13 @@ def compile_scenarios(
     unsafe: list[dict[str, str]] = []
     covered: set[str] = set()
     weak: list[str] = []
+    #: P0-13：只有本沙箱之外的验证手段才能定的义务（人工确认 / 显示器 / 常驻交互）
+    external_required: list[str] = []
 
-    # ① 机械场景：syntax / import（命令由本模块从规划文件机械生成，不来自 LLM）
+    # ① 机械场景（P0-10 §12.5，命令由本模块机械生成，不来自 LLM）：
+    #    · syntax / import → 真实 shell 命令（py_compile / import 检查），STATUS_EXECUTABLE；
+    #    · contract / interface_freeze / materialization → 编排器**就地**机械检查器，
+    #      无 shell 命令，STATUS_MECHANICAL（不进 automated_commands / verify 绑定）。
     syntax_actions = _syntax_actions(py_files)
     import_actions = _import_actions(modules)
     for po in required:
@@ -247,6 +370,24 @@ def compile_scenarios(
             )
             scenarios.append(sc)
             covered.add(po["id"])
+        elif po["kind"] in _INPROCESS_MECHANICAL_VERIFIERS:
+            # 权威 verifier 是编排器就地机械检查器 ⇒ 编译器自己生成证明，不交给 Test LLM。
+            # 刻意 actions=[]：不是 shell 命令，执行器不得消费（证据来自 verify/编排器的机械结论）。
+            checks = _INPROCESS_MECHANICAL_VERIFIERS[po["kind"]]
+            sc = TestScenario(
+                id=_mechanical_scenario_id(po["id"], checks),
+                target_po=po["id"], kind=po["kind"],
+                title=po["name"] or po["claim"][:80] or "机械检查",
+                derived_from=[po["id"], *[f"mechanical:{c}" for c in checks]],
+                status=STATUS_MECHANICAL,
+                mechanical_check=list(checks),
+            )
+            scenarios.append(sc)
+            covered.add(po["id"])
+
+    # ① 产出的都是**机械证明**（syntax/import 是真命令；contract/freeze/物化走就地检查器）
+    for sc in scenarios:
+        sc.verification_mode = MODE_MECHANICAL
 
     # ② 可信源命令：安全筛 → 按 target_po 显式归档；无显式归属的只归 delivery PO
     #    （"工作区被真实验证"的语义本就由任意真实入口运行承担），其余一律不猜。
@@ -277,6 +418,18 @@ def compile_scenarios(
         # 也不静默塞给 delivery PO（那会让一条无关命令"证明"了交付）。
         target = str(item.get("target_po_candidate") or item.get("target_po") or "")
         if target:
+            declared = next((p for p in required if p["id"] == target), None)
+            if declared and declared["kind"] in _INPROCESS_MECHANICAL_VERIFIERS:
+                # §12.5：这类 PO 的权威 verifier 是就地机械检查器，**命令不是它的证据**。
+                # 登记成 UNBOUND（含原因），既不静默丢弃也不把它塞给别的 PO。
+                unbound.append({
+                    "command": command,
+                    "candidate": target,
+                    "reason": "该 PO 由就地机械检查器证明（"
+                              + "、".join(_INPROCESS_MECHANICAL_VERIFIERS[declared["kind"]])
+                              + "），命令不能作为它的证据 → UNBOUND（不猜）",
+                })
+                continue
             bound = bind_target_po(target, command, action.assertions, required)
             if bound:
                 by_po.setdefault(bound, []).append(action)
@@ -295,13 +448,25 @@ def compile_scenarios(
         if po["id"] in covered:
             continue
         actions = by_po.get(po["id"], [])
+        mode = classify_obligation(po)
         if not actions:
+            # P0-13：把"机械不可验"（人工 / GUI / 常驻）与"忘了测"分开措辞，并单列
+            # `external_required` —— 后者不该被当成失败重问的素材（重问也修不出来）。
+            if mode == MODE_HUMAN:
+                reason = "只能人工确认（P0-13 归类 human_only：机械不可验）"
+            elif mode in (MODE_GUI_SMOKE, MODE_RESIDENT):
+                reason = ("没有任何可执行命令（P0-13 归类 " + mode
+                          + "：本沙箱只能冒烟 / 短超时跑起来，画面与手感不可断言）")
+            else:
+                reason = "没有任何来自可信源的可执行命令"
             scenarios.append(TestScenario(
                 id=_scenario_id(po["id"], []), target_po=po["id"], kind=po["kind"],
                 title=po["name"] or po["claim"][:80],
                 derived_from=[po["id"]], status=STATUS_UNPROVEN,
-                gap_reason="没有任何来自可信源的可执行命令",
+                verification_mode=mode, gap_reason=reason,
             ))
+            if mode in (MODE_HUMAN, MODE_GUI_SMOKE, MODE_RESIDENT):
+                external_required.append(po["id"])
             continue
         # 行为类：只有 exit_code==0、没有任何输出/行为断言 ⇒ 弱证据，按未覆盖计。
         # （syntax/import 不会走到这里：它们由机械生成器覆盖）
@@ -309,13 +474,16 @@ def compile_scenarios(
             x and x != "exit_code==0" for x in a.assertions
         )]
         if po["kind"] in _BEHAVIOR_KINDS and not strong:
+            gap = "仅 exit_code==0 而无行为断言（rc=0 不证明任何需求行为）"
+            if mode in (MODE_GUI_SMOKE, MODE_RESIDENT):
+                gap += f"；该义务归类 {mode}，启动命令已是本沙箱的最佳可得证据"
             sc = TestScenario(
                 id=_scenario_id(po["id"], actions),
                 target_po=po["id"], kind=po["kind"],
                 title=po["name"] or po["claim"][:80], actions=actions,
                 derived_from=[po["id"], "planned_commands"],
-                status=STATUS_WEAK,
-                gap_reason="仅 exit_code==0 而无行为断言（rc=0 不证明任何需求行为）",
+                status=STATUS_WEAK, verification_mode=mode,
+                gap_reason=gap,
             )
             scenarios.append(sc)
             weak.append(sc.id)
@@ -329,7 +497,7 @@ def compile_scenarios(
                 target_po=po["id"], kind=po["kind"],
                 title=po["name"] or po["claim"][:80], actions=actions,
                 derived_from=[po["id"], "planned_commands"],
-                status=STATUS_EXECUTABLE,
+                status=STATUS_EXECUTABLE, verification_mode=mode,
             )
             scenarios.append(sc)
             covered.add(po["id"])
@@ -347,13 +515,17 @@ def compile_scenarios(
         "unbound_commands": unbound,
         # 规格§三十一：一条安全的 planned 命令都没有 ⇒ 行为证据为空，只能 UNPROVEN
         "automated_commands_empty": safe_planned_count == 0,
+        # P0-13：验证方式分类 —— "机械不可验"（人工 / GUI / 常驻）单列，别当"忘了测"
+        "verification_modes": mode_summary(required),
+        "external_required": sorted(external_required),
     }
 
 
 def audit_po_test_coverage(compiled: Any) -> dict[str, list[str]]:
     """方案§八：required PO 的测试覆盖三分类（纯函数，直接消费 compile_scenarios 产物）。
 
-    * ``covered`` —— 存在 **executable** 场景（含有效断言的真实命令）；
+    * ``covered`` —— 存在 **executable** 场景（含有效断言的真实命令）或 **mechanical**
+      场景（§12.5：由编排器就地机械检查器证明，如 contract/interface_freeze/materialization）；
     * ``weak``    —— 有场景但只有 rc=0（weak_evidence），按未覆盖处理；
     * ``missing`` —— 没有任何可执行场景（coverage_gap 扣除 weak）。
 
@@ -368,7 +540,8 @@ def audit_po_test_coverage(compiled: Any) -> dict[str, list[str]]:
     covered = sorted({
         str(s.get("target_po") or "")
         for s in scenarios
-        if str(s.get("status") or "") == STATUS_EXECUTABLE and str(s.get("target_po") or "")
+        if str(s.get("status") or "") in (STATUS_EXECUTABLE, STATUS_MECHANICAL)
+        and str(s.get("target_po") or "")
     })
     gap = [str(x) for x in (compiled.get("coverage_gap") or [])]
     missing = sorted(p for p in gap if p not in set(weak_pos))
@@ -417,7 +590,8 @@ def proof_coverage_gate(required: Any, compiled: Any) -> dict:
 
     返回 ``{required, covered, missing, weak, unexecutable}``：
 
-      * ``covered``      —— 有 executable 场景且带有效断言；
+      * ``covered``      —— 有 executable 场景且带有效断言，或 mechanical 场景
+        （§12.5：就地机械检查器证明；证据仍由 verify/编排器产出，见 ``can_release``）；
       * ``weak``         —— 有场景但只有 rc=0 ⇒ **等于没证明**（§13.2）；
       * ``missing``      —— required PO 根本没有场景（§13.1）；
       * ``unexecutable`` —— 场景存在但不可执行（无命令 / 不安全 / 需外部）⇒ 不能伪装成 PASS。
@@ -437,7 +611,7 @@ def proof_coverage_gate(required: Any, compiled: Any) -> dict:
         if not target:
             continue
         status = str(sc.get("status") or "")
-        if status == STATUS_EXECUTABLE:
+        if status in (STATUS_EXECUTABLE, STATUS_MECHANICAL):
             strong_covered.add(target)
         elif status == STATUS_WEAK:
             weak.add(target)
@@ -447,6 +621,11 @@ def proof_coverage_gate(required: Any, compiled: Any) -> dict:
     covered_ids = [p for p in needed_ids if p in strong_covered]
     missing = [p for p in needed_ids
                if p not in strong_covered and p not in weak and p not in unexecutable]
+    # P0-13：机械不可验（人工确认 / 图形界面 / 常驻进程）的义务单列 —— 它们不该被
+    # 当成"忘测"反复重问（重问也修不出来），人工与评审据此判"该走外部验证"。
+    external = sorted(
+        str(x) for x in (compiled.get("external_required") or []) if str(x) in set(needed_ids)
+    )
     return {
         "required": len(needed_ids),
         "covered": len(covered_ids),
@@ -457,4 +636,5 @@ def proof_coverage_gate(required: Any, compiled: Any) -> dict:
         "weak_ids": sorted(p for p in needed_ids if p in weak),
         "unexecutable_ids": sorted(p for p in needed_ids if p in unexecutable),
         "covered_ids": sorted(covered_ids),
+        "external_required": external,
     }

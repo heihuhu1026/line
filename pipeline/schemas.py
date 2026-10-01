@@ -17,7 +17,11 @@ from typing import Any
 SEVERITY = ["high", "medium", "low"]
 RISK = ["high", "medium", "low"]
 VERDICT = ["pass", "rework_dev", "rework_architect"]
-CASE_TYPE = ["new", "regression", "compat"]
+# 测试用例类别（P0-12）：前三类是既有口径；`contract` / `interface` 是为**方案返工轮**
+# 补的聚焦类别（接口/契约一致性）。类别不再"每轮三类缺一不可"，**必需集合**由
+# `tasktype.expected_test_types(round_kind)` 按本轮任务性质给出（见 `tasktype.TEST_CASE_TYPES`，
+# 与本表同源）。
+CASE_TYPE = ["new", "regression", "compat", "contract", "interface"]
 CHANGE_TYPE = ["add", "modify", "delete"]
 PATCH_MODE = ["insert_after", "replace_span", "full_symbol"]
 

@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import lsp, patches
@@ -418,6 +418,71 @@ def import_symbol_problems(work: Path, written: list[str]) -> list[str]:
                     f"但 `{target.name}` 里没有定义 `{alias.name}` —— import 时必然 ImportError。"
                 )
     return out
+
+
+def forbidden_import_problems(
+    work: Path, written: list[str], forbidden: Any = (),
+) -> list[str]:
+    """产物是否 import 了**用户硬约束禁止的模块**（§7 禁止约束完整性，纯 AST、零执行）。
+
+    为什么必须有这条：约束只写在提示词里＝等于没有。`tkinter` 是**标准库**，
+    导入探针、pyright、`validate_architect_plan` 的内置名单都不会判它有问题 ——
+    只有把契约里"禁止依赖"的模块名喂进来，才可能在 DEV 刚产出时就机械抓住。
+    """
+    # 归一成 {模块: 作用域文件}（空 = 全项目）。作用域是必需的：真机贪吃蛇需求写的是
+    # 「game_logic.py 中不得出现 import tkinter」，而 ui.py **必须**用 tkinter ——
+    # 全局禁用会把正确实现判负，让 verify 永久 FAILED（死循环）。
+    if isinstance(forbidden, dict):
+        # 整份映射形态（{模块: [作用域文件]}）—— 传映射时若按"逐个模块名"迭代，
+        # 拿到的是键，作用域会被静默丢掉并退化成全局禁用（那就是误伤）。
+        forbidden = [{"module": k, "files": v} for k, v in forbidden.items()]
+    scopes: dict[str, list[str]] = {}
+    for entry in forbidden or ():
+        if isinstance(entry, dict):
+            module = str(entry.get("module") or "").strip()
+            files = [str(f).replace("\\", "/") for f in (entry.get("files") or []) if str(f)]
+        else:
+            module, files = str(entry or "").strip(), []
+        if not module:
+            continue
+        if module not in scopes or not files:
+            scopes[module] = files        # 任一条是全项目 ⇒ 取最严
+        elif scopes[module]:
+            scopes[module] = sorted(set(scopes[module]) | set(files))
+    if not scopes:
+        return []
+    out: list[str] = []
+    for rel in written:
+        rel = str(rel).replace("\\", "/")
+        if not rel.endswith(".py"):
+            continue
+        path = work / rel
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue  # 语法坏掉由 py_compile 档报，这里不重复
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                # 相对导入（from . import x）没有 module，不是外部依赖
+                modules = [str(node.module).split(".")[0]] if node.module and not node.level else []
+            else:
+                continue
+            for module in modules:
+                scope = scopes.get(module)
+                if scope is None:
+                    continue
+                if scope and rel not in scope and PurePosixPath(rel).name not in {
+                    PurePosixPath(f).name for f in scope
+                }:
+                    continue              # 不在约束作用域内的文件不受此约束
+                where = f"（作用域：{'、'.join(scope)}）" if scope else ""
+                out.append(
+                    f"`{rel}` 里 import 了 `{module}`，"
+                    f"但用户硬约束明确禁止依赖它{where} —— 请改用允许的实现方式。"
+                )
+    return sorted(set(out))
 
 
 def plan_commands(
@@ -2086,11 +2151,15 @@ def verify(
     mock: bool = False,
     project_type: str = "secondary",
     command_meta: dict | None = None,
+    forbidden_modules: tuple[str, ...] = (),
 ) -> dict:
     """物化 → 计划 → 执行 → 汇总结论。返回可直接落盘/进 prompt 的 verify_report。
 
     ``command_meta`` 为 TestCompiler 绑定（命令→PO/断言/期望退出码），由 plan_commands
     盖到对应执行 spec，run_command 判定后随执行结果原样返回（证据绑定继承，方案§十）。
+
+    ``forbidden_modules`` 是用户硬约束点名的模块（``semantics.forbidden_modules``）——
+    它让"不得依赖某某"从提示词变成**机械检查**（§7 禁止约束完整性）。
     """
     report: dict[str, Any] = {
         "verdict": "skipped",
@@ -2238,6 +2307,10 @@ def verify(
     # 「from X import Y 而 Y 根本不存在」/「产出文件与标准库同名会遮蔽标准库」：
     # 纯 AST 判定，不受执行路径影响 —— 导入探针只覆盖"这一条真的被执行到时"的错。
     static_problems += import_symbol_problems(work, list(mat["written"]))
+    # §7 禁止约束完整性：用户硬约束禁止的模块（tkinter 这类标准库模块**只有这条**能抓）
+    static_problems += forbidden_import_problems(
+        work, list(mat["written"]), forbidden_modules
+    )
     # 「产物到底跑起来过没有」：只有 rc=0 但零输出/无入口 ⇒ 视为没有可运行的证据。
     # **单独留一份**：它既可能是产物真有问题，也可能只是**测试命令质量差**（命令写错 ⇒
     # 一条都没真跑起来）。归因要靠"有没有真正的产物失败"来定，见下方的 test_defects / impl_fail。

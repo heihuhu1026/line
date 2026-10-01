@@ -272,14 +272,16 @@ SYSTEM: dict[str, str] = {
         "⑤ 未实现的任务都进 not_implemented 了吗？⑥ 输出是纯 JSON 吗？\n" + _TAIL
     ),
     "test": (
-        "你是专业测试工程师，针对本次代码变更产出新功能（new）/ 回归（regression）/ 兼容（compat）三类测试方案。\n"
+        "你是专业测试工程师，针对本次代码变更产出测试方案；"
+        "用例**类别口径见【本轮测试聚焦】**（按本轮任务类型聚焦，不要每轮都硬凑三类）。\n"
         "绝对红线（违反即不合格）：\n"
         "  1. 严禁编造不存在的文件路径、函数名、命令、工具或测试数据；automated_commands 必须真实可执行；\n"
         "  2. 严禁隐瞒覆盖缺口：覆盖不到的场景必须逐条写进 coverage_gaps，不得假装全覆盖；\n"
         "  3. 严禁模糊表述：expected 必须可观测、可比对，禁止「验证正常」「功能可用」这类说法；\n"
         "  4. 严禁省略 steps 与 expected。\n"
         "用例规范：\n"
-        "  · 三类**缺一不可**（new / regression / compat），每类至少一条；总数控制在 15 条以内，只测本次变更相关；\n"
+        "  · 按【本轮测试聚焦】给出的**必需类别**逐类写全（每类至少一条）；总数控制在 15 条以内，"
+        "只测本次变更相关；**不要**为了凑类别写与本次变更无关的用例；\n"
         "  · id 按类型编号：new 用 NEW-01…，regression 用 REG-01…，compat 用 COMP-01…；\n"
         "  · target **必须写到符号级**（被验证的函数 / 类名，必要时带文件名如 `game_logic.py::Snake.move`）；"
         "只写文件名（如 `game_logic.py`）不合格 —— 编排器要用它和补丁的 target_symbol 机械核对覆盖，"
@@ -316,14 +318,14 @@ SYSTEM: dict[str, str] = {
         "执行步骤：① 梳理本次变更的功能点、受影响的存量模块、需兼容的接口；"
         "② 设计 new 用例（覆盖正常 / 边界 / 异常场景）；③ 设计 regression 用例（受影响的存量核心功能）；"
         "④ 设计 compat 用例（接口、数据格式、依赖版本）；⑤ 整理可执行命令与覆盖缺口；⑥ 对照下方自检后输出 JSON。\n"
-        "输出前自检：① new / regression / compat 三类都覆盖了吗？② 每条 steps 都可复现吗？"
+        "输出前自检：① 【本轮测试聚焦】的必需类别都写全了吗？② 每条 steps 都可复现吗？"
         "③ expected 具体可验证吗（有没有「正常」「没问题」「功能可用」）？④ 命令都真实可执行吗？"
         "⑤ 覆盖不到的场景都进 coverage_gaps 了吗？⑥ 输出是纯 JSON 吗？\n" + _TAIL
     ),
     "review": (
         "你是评审人（架构师视角），判定本次交付是否可以被接受。\n"
         "判定标准：① 改动是否落在白名单内、是否保持最小侵入；② 是否满足 PM 的验收标准；"
-        "③ 测试是否覆盖 new/regression/compat 三类且有可执行命令；④ 是否引入未声明的兼容性风险；"
+        "③ 测试是否覆盖【测试覆盖审计】列出的**本轮必需类别**且有可执行命令；④ 是否引入未声明的兼容性风险；"
         "⑤ 实现是否**真的覆盖了方案的任务清单**（见【实现覆盖审计】），补丁粒度是否足以落地。\n"
         "verdict 取值：pass / rework_dev（方案对但实现有问题）/ rework_architect（方案本身有问题）。\n"
         "返工项必须逐条声明作用域 required_fixes_detail[].scope，**它决定下一轮回哪个阶段**：\n"
@@ -966,12 +968,29 @@ def grounded_contract_block(contract: Any) -> str:
             "  若你认为其中某个文件不需要实现，必须显式写 plan_exception 说明原因，"
             "**不得静默删除**——静默删除会被机械闸门判为 PLAN_MISSING_DECLARED_FILE。"
         )
+    entries = [e for e in (contract.get("entry_files") or []) if isinstance(e, dict)]
+    if entries:
+        lines.append("")
+        lines.append("用户指定的运行入口（**方案的 changes 必须包含**）：")
+        for item in entries[:6]:
+            lines.append(f"  - `{item.get('path')}`（用户原文：{item.get('source_quote')}）")
+        lines.append(
+            "  入口文件不在方案里 ⇒ 运行验证必然判「没有可执行入口」，"
+            "且会被闸门判为 PLAN_MISSING_ENTRY。"
+        )
     cons = [c for c in (contract.get("hard_constraints") or []) if isinstance(c, dict)]
     if cons:
         lines.append("")
-        lines.append("硬性约束：")
+        lines.append("硬性约束（括号内是**已绑定**的机械检查与作用域；标「人工确认」的没有机械检查）：")
         for item in cons[:12]:
-            lines.append(f"  - {item.get('text')}")
+            checks = item.get("mechanical_check")
+            scope = item.get("mechanical_scope")
+            tag = "、".join(str(c) for c in checks) if checks else "人工确认"
+            if checks and isinstance(scope, list) and scope:
+                # 作用域必须一起写出来：`game_logic.py` 禁 tkinter，而 `ui.py` 必须用 tkinter；
+                # 漏掉作用域会让架构师把 ui.py 也避开 tkinter（那就画不出界面了）
+                tag += "，仅限 " + "、".join(f"`{s}`" for s in scope)
+            lines.append(f"  - {item.get('text')}（{tag}）")
     excl = [e for e in (contract.get("explicit_exclusions") or []) if isinstance(e, dict)]
     if excl:
         lines.append("")
@@ -1698,14 +1717,32 @@ def test_audit_block(audit: dict) -> str:
         "与上方材料不一致时以本结果为准）】"
     ]
     by_type = audit.get("by_type") or {}
-    lines.append(
-        f"- 用例总数 {audit.get('case_count', 0)}：new={by_type.get('new', 0)}、"
-        f"regression={by_type.get('regression', 0)}、compat={by_type.get('compat', 0)}"
-    )
+    # P0-12：类别口径按**任务类型**聚焦（必需 / 建议两档），与 `_audit_test` 同源。
+    expected_types = [str(t) for t in (audit.get("expected_types") or [])]
+    suggested_types = [str(t) for t in (audit.get("suggested_types") or [])]
+    shown = [
+        *expected_types,
+        *[t for t in suggested_types if t not in expected_types],
+        *[k for k in sorted(by_type) if k not in expected_types and k not in suggested_types],
+    ]
+    if shown:
+        lines.append(
+            f"- 用例总数 {audit.get('case_count', 0)}："
+            + "、".join(f"{t}={by_type.get(t, 0)}" for t in shown)
+        )
+    if expected_types:
+        lines.append(
+            f"- 本轮**必需**用例类别（按任务类型聚焦）：{' / '.join(expected_types)}"
+        )
     if audit.get("missing_types"):
         lines.append(
-            f"- **缺少的用例类型**：{', '.join(audit['missing_types'])}"
-            "（三类缺一不可，缺失即视为测试不完整）"
+            f"- **缺少的必需用例类型**：{', '.join(audit['missing_types'])}"
+            "（本轮必需类别缺失即视为测试不完整）"
+        )
+    if audit.get("suggested_missing"):
+        lines.append(
+            "- 建议补充的类别（**提示级，不判负**，不要为凑类别编造无关用例）："
+            + ", ".join(str(t) for t in audit["suggested_missing"])
         )
     if audit.get("vague_expected"):
         lines.append(
@@ -2961,6 +2998,25 @@ def test_view_block(view: Any) -> str:
     return "\n".join(lines)
 
 
+def test_focus_block(test_focus: str) -> str:
+    """本轮测试聚焦口径块（P0-12）：内容由 tasktype 的测试聚焦口径提供。
+
+    内容为空（旧调用）时返回空串，调用方回退旧的「三类」措辞 —— 老复跑脚本不受影响。
+    """
+    text = str(test_focus or "").strip()
+    if not text:
+        return ""
+    return (
+        "【本轮测试聚焦（编排器按任务类型给定；机械审计**按它**核对必需类别，"
+        "不要为凑类别写与本次变更无关的用例）】\n" + text
+    )
+
+
+#: 有 test_focus 时的任务段（类别口径见上方聚焦块）；无 test_focus 时回退旧措辞。
+_TEST_TASK_LINE = "【任务】按上方的**本轮测试聚焦**产出用例，并给出可执行命令（必需类别必须齐全）。"
+_TEST_TASK_LINE_LEGACY = "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。"
+
+
 def parts_test(
     requirement: str,
     scope: Any,
@@ -2973,6 +3029,7 @@ def parts_test(
     *,
     test_view: dict | None = None,
     code_on_demand: str = "",
+    test_focus: str = "",
 ) -> list[str]:
     """组装测试阶段 prompt。
 
@@ -2980,6 +3037,9 @@ def parts_test(
     只给行为/验收/接口/变更符号/契约视图；``code_on_demand`` 非空时（命令自检重问通道）
     才把相关函数正文作为「按需拉取的代码」补进来。不传 ``test_view`` 时保留旧通道
     （兼容手工复跑脚本）。
+
+    ``test_focus``（P0-12）：由 tasktype 的测试聚焦口径按本轮任务类型生成，
+    与编排器 `_audit_test` 的必需类别同源。为空（旧调用）时回退旧的「三类」措辞。
     """
     if test_view is not None:
         blocks = [
@@ -2999,10 +3059,12 @@ def parts_test(
                 "这些是机制按问题定位到的最小相关代码；仍不要索要无关文件）】\n"
                 + code_on_demand
             )
+        focus_block = test_focus_block(test_focus)
         blocks += [
             _feedback_block("评审要求补测项", fixes),
             _test_repair_block(repair),
-            "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。",
+            *([focus_block] if focus_block else []),
+            _TEST_TASK_LINE if focus_block else _TEST_TASK_LINE_LEGACY,
             # 二级覆盖模型（优化建议§十七）：一级是**业务行为覆盖** —— 上方每个 FR /
             # 验收口径至少有一条用例以「可观察行为 + 期望值」验证（正常路径优先，
             # 坏路径/边界按验收需要补）；二级才是实现符号，内部 helper 没有单独用例
@@ -3030,7 +3092,8 @@ def parts_test(
         _code_block(excerpts_text),
         _feedback_block("评审要求补测项", fixes),
         _test_repair_block(repair),
-        "【任务】产出新功能/回归/兼容三类测试用例，并给出可执行命令。",
+        *([test_focus_block(test_focus)] if test_focus_block(test_focus) else []),
+        _TEST_TASK_LINE if test_focus_block(test_focus) else _TEST_TASK_LINE_LEGACY,
     ]
 
 
@@ -3292,6 +3355,73 @@ def falsify_block() -> str:
     )
 
 
+def mechanical_summary_block(summary: Any) -> str:
+    """评审上下文的**第一屏**：已成立的机器事实（建议§36）。
+
+    渲染顺序即阅读顺序 —— 先回答"机器证明了什么"，再让语义材料回答"机器证明不了什么"。
+    调用方把它放在 prompt 的**最前**：``fit_prompt`` 从**末尾**截断，只有这样这批事实
+    才必然存活（真机里它排在后面时被整段吃掉，语义层只能凭措辞猜放行与否）。
+    缺字段（老 run / 尚未建图）一律省略该行，**不臆造**。
+    """
+    s = summary if isinstance(summary, dict) else {}
+    if not s:
+        # 完全没有机械事实（老 run / 尚未建图）⇒ 不渲染空壳标题，避免占预算
+        return ""
+    lines: list[str] = []
+    verify = s.get("verify") if isinstance(s.get("verify"), dict) else {}
+    if verify:
+        lines.append(
+            f"- 运行验证：{verify.get('verdict') or 'skipped'}"
+            f"（执行 {verify.get('commands', 0)} 条命令，失败 {verify.get('failed', 0)} 条）"
+        )
+    proof = s.get("proof") if isinstance(s.get("proof"), dict) else {}
+    if proof:
+        lines.append(
+            f"- 证明义务：{proof.get('obligations', 0)} 条 / 证据 {proof.get('evidence', 0)} 条"
+            + (f" —— 门 {proof.get('status')}" if proof.get("status") else "")
+        )
+    patch = s.get("patch") if isinstance(s.get("patch"), dict) else {}
+    if patch:
+        lines.append(
+            f"- 补丁物化：套用 {patch.get('applied', 0)} 条 / 机械问题 {patch.get('problems', 0)} 条"
+        )
+    test = s.get("test") if isinstance(s.get("test"), dict) else {}
+    if test:
+        seg = (f"- 测试覆盖：符号已覆盖 {test.get('covered_symbols', 0)} / "
+               f"未解释漏测 {test.get('missing_symbols', 0)}")
+        if test.get("expected_types"):
+            seg += "；本轮必需类别 " + "/".join(str(t) for t in test["expected_types"])
+            if test.get("missing_types"):
+                seg += "（缺 " + "/".join(str(t) for t in test["missing_types"]) + "）"
+        if test.get("external_required"):
+            seg += f"；需外部/人工确认 {len(test['external_required'])} 条"
+        lines.append(seg)
+    if s.get("ontology_errors") is not None:
+        lines.append(f"- 语义完整性：{s.get('ontology_errors', 0)} 个 error")
+    ws = s.get("workspace") if isinstance(s.get("workspace"), dict) else {}
+    if ws:
+        lines.append(
+            f"- 工作区：{ws.get('revision') or '（未验证）'}"
+            + (f" {ws.get('status')}" if ws.get("status") else "")
+        )
+    defects = s.get("defects") if isinstance(s.get("defects"), dict) else {}
+    if defects:
+        lines.append(
+            f"- 逐项验收：转绿 {defects.get('green', 0)} / 仍失败 {defects.get('red', 0)} / "
+            f"无从核对 {defects.get('unverifiable', 0)}"
+        )
+    blockers = [str(b) for b in (s.get("blockers") or []) if str(b).strip()]
+    lines.append(f"- 机械阻断项：{len(blockers)} 条")
+    for item in blockers[:6]:
+        lines.append(f"    · {item[:200]}")
+    if not lines:
+        return ""
+    return (
+        "【机械摘要（评审第一屏：机器**已经证明**的事实；下方语义材料只用来回答"
+        "机器证明不了的问题，不要重复主张，也不要凭措辞翻案）】\n" + "\n".join(lines)
+    )
+
+
 def parts_review(
     requirement: str,
     scope: Any,
@@ -3302,6 +3432,8 @@ def parts_review(
     verify: Any = None,
     rules_block: str = "",
     defect_block: str = "",
+    *,
+    summary_block: str = "",
 ) -> list[str]:
     # 评审阶段上下文最紧（8K），实现产物只保留结构：文件清单 + 自检项 + 偏差，丢掉代码正文
     impl_view = None
@@ -3322,6 +3454,8 @@ def parts_review(
             "deviations": impl.get("deviations", []),
         }
     return [
+        # §36：机械摘要在**最前** —— fit_prompt 从末尾截断，放后面会被整段吃掉。
+        *([summary_block] if summary_block else []),
         _requirement_block(requirement),
         _upstream("产品经理验收依据（范围与验收标准）", _scope_review_view(scope), str_tokens=90, list_items=6),
         pm_assumptions_block(scope),
@@ -3525,17 +3659,18 @@ SYSTEM_NEW: dict[str, str] = {
         "运行时要有实际输出（不能 import 完就退出）。写不出可运行入口，就说明这轮交付不完整。\n" + _TAIL
     ),
     "test": (
-        "你是专业测试工程师，针对**全新项目**的交付产出新功能（new）/ 回归（regression）/ "
-        "兼容（compat）三类测试方案。\n"
+        "你是专业测试工程师，针对**全新项目**的交付产出测试方案；"
+        "用例**类别口径见【本轮测试聚焦】**（按本轮任务类型聚焦，不要每轮都硬凑三类）。\n"
         "绝对红线（违反即不合格）：\n"
         "  1. 严禁编造不存在的文件路径、函数名、命令、工具或测试数据；automated_commands 必须真实可执行；\n"
         "  2. 严禁隐瞒覆盖缺口：覆盖不到的场景必须逐条写进 coverage_gaps，不得假装全覆盖；\n"
         "  3. 严禁模糊表述：expected 必须可观测、可比对，禁止「验证正常」「功能可用」这类说法；\n"
         "  4. 严禁省略 steps 与 expected。\n"
         "用例规范：\n"
-        "  · 三类**缺一不可**，每类至少一条；总数控制在 15 条以内，只测本次交付相关；\n"
+        "  · 按【本轮测试聚焦】给出的**必需类别**逐类写全（每类至少一条）；总数控制在 15 条以内，"
+        "只测本次交付相关；**不要**为了凑类别写与本次交付无关的用例；\n"
         "      new＝本次新增功能（覆盖正常 / 边界 / 异常）；regression＝已交付模块的既有能力不被破坏；"
-        "compat＝模块间接口、数据格式与统一约定；\n"
+        "compat＝模块间接口、数据格式与统一约定；contract / interface＝方案返工轮看重的契约与接口一致性；\n"
         "  · id 按类型编号：new 用 NEW-01…，regression 用 REG-01…，compat 用 COMP-01…；\n"
         "  · target **必须写到符号级**（被验证的函数 / 类名，必要时带文件名如 `game_logic.py::Snake.move`）；"
         "只写文件名（如 `game_logic.py`）不合格 —— 编排器要用它和补丁的 target_symbol 机械核对覆盖，"
@@ -3569,7 +3704,7 @@ SYSTEM_NEW: dict[str, str] = {
         "执行步骤：① 梳理本次交付的功能点、模块与接口约定；② 设计 new 用例；"
         "③ 设计 regression 用例（已交付模块的既有能力）；④ 设计 compat 用例（接口、数据格式、依赖版本）；"
         "⑤ 整理可执行命令与覆盖缺口；⑥ 自检后输出 JSON。\n"
-        "输出前自检：① 三类都覆盖了吗？② 每条 steps 都可复现吗？"
+        "输出前自检：① 【本轮测试聚焦】的必需类别都写全了吗？② 每条 steps 都可复现吗？"
         "③ expected 具体可验证吗（有没有「正常」「没问题」「功能可用」）？④ 命令都真实可执行吗？"
         "⑤ 覆盖不到的场景都进 coverage_gaps 了吗？⑥ 输出是纯 JSON 吗？\n" + _TAIL
     ),
@@ -3578,7 +3713,7 @@ SYSTEM_NEW: dict[str, str] = {
         "客观判定**全新项目**的交付是否可接受。\n"
         "判定标准：① 交付是否符合方案定义的模块划分与接口约定"
         "（新建项目不存在「白名单外的存量文件」之说，但不得擅自偏离方案结构）；"
-        "② 是否满足 PM 的验收标准；③ 测试是否覆盖 new/regression/compat 三类且有可执行命令；"
+        "② 是否满足 PM 的验收标准；③ 测试是否覆盖【测试覆盖审计】列出的**本轮必需类别**且有可执行命令；"
         "④ 是否引入未声明的兼容性风险；"
         "⑤ 实现是否**真的覆盖了方案的任务清单**（见【实现覆盖审计】）。\n"
         "verdict 取值：pass / rework_dev（方案对但实现有问题）/ rework_architect（方案本身有问题）。\n"
@@ -3634,8 +3769,12 @@ PROMPT_VERSIONS: dict[str, str] = {
     # 所以两个变体共用同一个版本号（避免"同一阶段两套口径却共用一个版本"更难归因）。
     "architect_plan": "v2",
     "dev": "v1",
-    "test": "v1",
-    "review": "v1",
+    # v2（P0-12）：测试用例类别不再"每轮 new/regression/compat 三类缺一不可"，
+    # 改为按 `round_kind` 聚焦（必需集合见 `tasktype.expected_test_types`）；
+    # 两个变体（二开 / 新建）同步改口径，共用同一版本号。
+    "test": "v2",
+    # v2：评审的判据③改为「覆盖【测试覆盖审计】列出的本轮必需类别」，与 P0-12 对齐。
+    "review": "v2",
     "advice": "v1",
 }
 

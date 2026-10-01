@@ -27,6 +27,8 @@ import re
 import sys
 from typing import Any
 
+from .schemas import CASE_TYPE as TEST_CASE_TYPES
+
 #: 标准库 + 内置模块名（用于把"外部依赖"从"产物文件"里摘出来）
 _EXTERNAL_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()) or ()) | frozenset(
     sys.builtin_module_names
@@ -58,6 +60,76 @@ def round_kind_label(kind: Any) -> str:
     """任务类型的人话标签（日志/页面用；未登记的原样返回，不抛异常）。"""
     text = str(kind or "")
     return _ROUND_KIND_LABELS.get(text, text)
+
+
+# --------------------------------------------------------------------- 测试口径（P0-12）
+#: 测试用例的**全部合法类别** = ``schemas.CASE_TYPE``（顶部导入，避免两处漂移）。
+def expected_test_types(round_kind: Any, *, has_existing_surface: bool = False) -> tuple[str, ...]:
+    """本轮**必需**的用例类别（P0-12：不再"每轮 new/regression/compat 三类缺一不可"）。
+
+    为什么改：真机里为凑类别，7B 会写一大堆与本次变更无关的用例 —— token 白烧，
+    真正的缺口反而被淹。口径按任务性质聚焦，且**只放宽不收紧**（必需集合恒为旧三类的子集，
+    因此不可能凭空多出模型产不出的类别）：
+
+      * ``bugfix``      —— 缺陷修复：``regression``（修前失败、修后通过）；
+      * ``plan_rework`` —— 方案返工后施工：``new``（方案新增/变更的行为），
+        接口/契约一致性作为**建议**类别（``suggested_test_types``）；
+      * ``feature``     —— 首次开发：首轮只要 ``new``；已有交付面（第二轮起 / 仓库已有代码）
+        才追加 ``regression``。
+    """
+    kind = str(round_kind or "").strip()
+    if kind == BUGFIX:
+        return ("regression",)
+    if kind == PLAN_REWORK:
+        return ("new",)
+    return ("new", "regression") if has_existing_surface else ("new",)
+
+
+def suggested_test_types(round_kind: Any) -> tuple[str, ...]:
+    """本轮**建议补充**的类别（提示级：缺了只记 info，不判负、不逼模型编造用例）。"""
+    kind = str(round_kind or "").strip()
+    if kind == PLAN_REWORK:
+        return ("contract", "interface")
+    if kind == BUGFIX:
+        return ("compat",)
+    return ("compat",)
+
+
+def test_focus_guidance(round_kind: Any, *, has_existing_surface: bool = False) -> str:
+    """测试阶段的**聚焦口径**（P0-12）：提示词与机械审计共用这一份真源。
+
+    返回可直接拼进 user 提示词的一段话（含必需/建议类别），保证「提示词要求什么」
+    与「审计核对什么」永远一致。
+    """
+    kind = str(round_kind or "").strip()
+    required = expected_test_types(kind, has_existing_surface=has_existing_surface)
+    suggested = suggested_test_types(kind)
+    if kind == BUGFIX:
+        focus = (
+            "本轮是**缺陷修复**：以 regression 为主 —— 被修缺陷的复现用例，"
+            "要求「修前失败、修后通过」；再补受影响的 compat（接口 / 数据格式没被打断）。"
+            "**不要**重写整套产品测试。"
+        )
+    elif kind == PLAN_REWORK:
+        focus = (
+            "本轮是**方案返工后的施工**：聚焦本次方案**新增/变更**的行为（type=new）"
+            "与模块间**接口 / 契约**一致性（type=contract / interface）。"
+            "**不要**重新产出整套完整产品测试 —— 那是 token 与时间的双重浪费。"
+        )
+    elif has_existing_surface:
+        focus = (
+            "本轮是**首次开发的延续**：以 new（本次交付的新功能）为主，"
+            "必须带 regression（已交付能力不被破坏）；有接口 / 格式约定时补 compat。"
+        )
+    else:
+        focus = (
+            "本轮是**全新项目首轮**：以 new（本次交付的新功能，覆盖正常 / 边界 / 异常路径）为主；"
+            "有模块间接口 / 数据格式约定时补 compat；此时尚无可回归面，**不要求** regression。"
+        )
+    tail = "必需类别：" + " / ".join(required)
+    if suggested:
+        tail += "；建议补充（不判负）：" + " / ".join(suggested)
+    return focus + "\n    " + tail
 
 #: 返工项里形如「[文件 cli.py]」的前缀（orchestrator 拼 fixes 时加的）
 _FILE_PREFIX = re.compile(r"^\s*\[\s*文件\s*([^\]]+?)\s*\]")

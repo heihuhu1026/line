@@ -6,6 +6,8 @@ C. 覆盖：required PO 必须有 executable scenario，否则 coverage_gap
 D. 弱证据：行为类场景仅 rc=0 无断言 ⇒ weak_evidence，按缺口处理
 E. 空 automated_commands ⇒ automated_commands_empty=True（语义=UNPROVEN）
 F. 身份稳定：同输入 scenario id 稳定；target_po 显式归档；无主命令只归 delivery
+G. §12.5：contract / interface_freeze / materialization 由编译器机械生成（就地检查器，
+   无 shell 命令）；命令不能作为它们的证据 ⇒ UNBOUND
 """
 from __future__ import annotations
 
@@ -175,6 +177,82 @@ def main() -> int:
     )
     check(_by_target(r_d)["po:f"]["id"] != _by_target(r_a)["po:f"]["id"],
           "断言口径变化 ⇒ scenario 身份变化（测试不是同一个证明）")
+
+    # ---- G：§12.5 就地机械检查器场景（contract / interface_freeze / materialization）----
+    print("== G. contract / interface_freeze / materialization 由编译器机械生成 ==")
+    resg = TC.compile_scenarios(
+        obligations=[
+            _po("po:ctr", O.PO_KIND_CONTRACT),
+            _po("po:ifz", O.PO_KIND_INTERFACE_FREEZE),
+            _po("po:mat", O.PO_KIND_MATERIALIZATION),
+            _po("po:behg", O.PO_KIND_BEHAVIOR),
+        ],
+        files=["main.py"],
+        planned_commands=[
+            # LLM 声称能证明 contract PO 的命令：命令不是它的证据 ⇒ UNBOUND（不静默丢）
+            {"command": "python main.py", "target_po": "po:ctr",
+             "assertions": ["stdout_contains:OK"]},
+        ],
+    )
+    byg = _by_target(resg)
+    check(byg["po:ctr"]["status"] == TC.STATUS_MECHANICAL
+          and byg["po:ctr"]["mechanical_check"] == ["contract_check"]
+          and byg["po:ctr"]["automated_commands"] == [],
+          "contract PO：编译器生成 mechanical 场景（无 shell 命令，不进执行器）")
+    check(byg["po:ifz"]["status"] == TC.STATUS_MECHANICAL
+          and byg["po:ifz"]["mechanical_check"] == ["contract_check", "skeleton_conformance"],
+          "interface_freeze PO：双就地检查器（contract_check + skeleton_conformance）")
+    check(byg["po:mat"]["status"] == TC.STATUS_MECHANICAL
+          and byg["po:mat"]["mechanical_check"] == ["patch_apply"],
+          "materialization PO：patch_apply 就地检查器")
+    check(all(p not in resg["coverage_gap"] for p in ("po:ctr", "po:ifz", "po:mat"))
+          and "po:behg" in resg["coverage_gap"],
+          "三类机械 PO 不再落 coverage_gap；无命令的行为 PO 仍落缺口")
+    check(len(resg["unbound_commands"]) == 1
+          and resg["unbound_commands"][0]["candidate"] == "po:ctr"
+          and "就地机械检查器" in resg["unbound_commands"][0]["reason"],
+          "指向机械 PO 的命令记为 UNBOUND（具名原因，不静默丢弃也不塞给别人）")
+    check(byg["po:ctr"]["id"] == TC.compile_scenarios(
+        obligations=[_po("po:ctr", O.PO_KIND_CONTRACT)], files=["main.py"],
+    )["scenarios"][0]["id"],
+          "mechanical 场景 id 稳定（同 PO 同检查器 ⇒ 同身份）")
+    gate_g = TC.proof_coverage_gate(
+        [_po("po:ctr", O.PO_KIND_CONTRACT), _po("po:behg", O.PO_KIND_BEHAVIOR)],
+        resg,
+    )
+    check(gate_g["covered"] == 1 and "po:ctr" in gate_g["covered_ids"]
+          and gate_g["unexecutable"] == 1 and "po:behg" in gate_g["unexecutable_ids"],
+          "Proof Gate：机械场景计入 covered；无命令行为 PO 计 unexecutable（不伪装成 PASS）")
+
+    # ---- H：P0-13 验证方式机械分类
+    print("== H. 行为项 → 验证方式机械分类（mechanical / unit / gui_smoke / resident / human） ==")
+    check(TC.classify_obligation(_po("po:s", O.PO_KIND_SYNTAX)) == TC.MODE_MECHANICAL
+          and TC.classify_obligation(_po("po:c", O.PO_KIND_CONTRACT)) == TC.MODE_MECHANICAL,
+          "机械 verifier 类 PO 归 mechanical")
+    check(TC.classify_obligation(_po("po:g", O.PO_KIND_BEHAVIOR, claim="窗口渲染蛇身颜色"))
+          == TC.MODE_GUI_SMOKE,
+          "图形界面字面证据归 gui_smoke（本沙箱只能冒烟）")
+    check(TC.classify_obligation(_po("po:r", O.PO_KIND_BEHAVIOR, claim="游戏主循环持续运行"))
+          == TC.MODE_RESIDENT,
+          "常驻进程字面证据归 resident（只能短超时跑起来）")
+    check(TC.classify_obligation(_po("po:h", O.PO_KIND_BEHAVIOR, claim="配色美观需人工确认"))
+          == TC.MODE_HUMAN,
+          "明确的主观/人工口径归 human_only")
+    check(TC.classify_obligation(_po("po:b", O.PO_KIND_BEHAVIOR, claim="build guide 生成文档"))
+          == TC.MODE_UNIT,
+          "两字母 token 不误伤（build / guide 不该被判成界面义务）")
+    res_h = TC.compile_scenarios(
+        obligations=[_po("po:g", O.PO_KIND_BEHAVIOR, claim="窗口渲染蛇身颜色"),
+                     _po("po:u", O.PO_KIND_BEHAVIOR, claim="吃到食物得分 +10")],
+        files=["main.py"],
+    )
+    check(res_h["external_required"] == ["po:g"]
+          and res_h["verification_modes"].get(TC.MODE_GUI_SMOKE) == ["po:g"],
+          "机械不可验的义务单列 external_required（不与\"忘了测\"混在一起）")
+    gate_h = TC.proof_coverage_gate(
+        [_po("po:g", O.PO_KIND_BEHAVIOR, claim="窗口渲染蛇身颜色")], res_h)
+    check(gate_h["external_required"] == ["po:g"] and gate_h["covered"] == 0,
+          "Proof Gate 单列 external_required，但仍不把 GUI 义务当成 PASS")
 
     print()
     print(f"通过 {PASS} 项，失败 {FAIL} 项")

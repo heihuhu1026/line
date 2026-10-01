@@ -541,6 +541,9 @@ class Orchestrator:
                         task_semantic_id = str(t.get("semantic_task_id") or "")
                         break
             ont_desc = self.state.get("ontology_revision")
+            # §37 语义上下文：这一轮模型面对的语义图规模（取"当前已知"的快照，
+            # 首轮尚未建图时为 0 —— 不臆造）。
+            scale = self._semantic_scale()
             record = runstore.normalize_call_record(
                 {
                     "at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage,
@@ -548,6 +551,8 @@ class Orchestrator:
                     "ontology_revision": (
                         ont_desc.get("revision_id") if isinstance(ont_desc, dict) else ""),
                     "task_semantic_id": task_semantic_id,
+                    "proof_obligation_count": scale["obligations"],
+                    "evidence_count": scale["evidence"],
                     **meta,
                 }
             )
@@ -1551,6 +1556,18 @@ class Orchestrator:
         # ---- Normalize：raw_plan → compiler_ir（**编译器的唯一稳定输入**）
         # 合并 / 清洗 / 冲突解决 / 推导全部在这里做完，Compiler 之后只读 IR。
         plan_obj0 = self.state.get("plan")
+        # §8.3 机械清洗：**生产文件不得依赖测试文件**（方向不可能）。放在编译链最前，
+        # 于是 Plan IR 与方案 lint 看到的是**同一份清洗后的方案**，两处口径不会漂。
+        # 真机 20260930-132625：模型连续 3 次把 `game_logic_test.py:TestSnake.test_move`
+        # 写进生产任务的 contracts.uses，闸门每次都判负、2 次自纠必然耗尽 ⇒ 卡死在方案阶段。
+        pruned_refs = planir.strip_test_dependencies(plan_obj0)
+        if pruned_refs:
+            self.state["plan_contract_pruned"] = pruned_refs
+            self.log(
+                f"        [机械清洗] 剔除 {len(pruned_refs)} 条「生产文件依赖测试文件」的契约引用"
+                "（方向不可能，已留痕）："
+                + "；".join(f"{x['task']}→{x['ref']}" for x in pruned_refs[:3])
+            )
         file_imports = self._plan_file_imports(plan_obj0)
         # 规格§三十四：人工裁决并回后再取 intake 条目，默认假设 DERIVED、裁决 ASSERTED
         intake_merged = prompts.apply_intake_decisions(
@@ -1752,33 +1769,43 @@ class Orchestrator:
         # 注意：任务 uses 自己 target_files 里的模块**不阻断** —— 一张施工图合法地可以
         # 同时覆盖多个文件（cli.py 用 database.py 是两文件间的正常导入）。dev 侧提示层
         # 会自行避免"文件 import 自己"那一种（见 task_focus_block 的 own_modules 丢弃）。
-        # ⑥ ``plan_missing_declared_file`` —— 用户原文声明的交付文件，方案 changes 没覆盖。
+        # ⑥ Plan Completeness Gate（P0-5 §7）—— 用户事实是否进了方案，**一次判全**：
+        #    · plan_missing_declared_file（用户声明的交付文件，方案没覆盖）
+        #    · plan_missing_test_file（用户点名的测试文件消失——真机最难发现的一类）
+        #    · plan_missing_entry（用户写了 `python main.py`，方案没有该入口）
+        #    · plan_constraint_unbound（硬约束点名禁止的模块，方案一字未提 → 仅提示）
         # 问题 A 的机械兜底：把契约喂给架构师还不够（它仍可能静默删文件），
-        # 必须在闸门里**确定性**判一次缺失 → rework_architect，
+        # 必须在闸门里**确定性**判一次 → rework_architect，
         # 而不是等 DEV / Test / Review 才发现「测试文件从计划里消失了」。
         # 契约缺失（老 run 没有该字段）时判据返回空 —— 向后兼容，不误伤旧运行。
-        missing_declared = semantics.plan_missing_declared_files(
-            self.state.get("requirement_contract"), self.state.get("plan")
-        )
-        if missing_declared:
-            blockers.append(
-                {
-                    "kind": "plan_missing_declared_file",
-                    "files": missing_declared,
-                    "detail": (
-                        "用户原文明确声明的交付文件未出现在方案 changes 中："
-                        + "、".join(missing_declared)
-                        + " —— 这些是用户事实，方案无权静默删除；"
-                        "请补进 changes，或显式写 plan_exception 说明为何不实现"
-                    ),
-                }
-            )
+        contract = self.state.get("requirement_contract")
+        completeness = semantics.validate_plan_completeness(contract, self.state.get("plan"))
+        for item in completeness:
+            if str(item.get("severity") or "") != "block":
+                continue
+            blockers.append(dict(item))
+        # 警告级只留痕 + 打日志（不阻断交付，避免"约束没写进 constraints"变成新的死循环）
+        completeness_warnings = [
+            item for item in completeness if str(item.get("severity") or "") != "block"
+        ]
+        if completeness_warnings:
+            self.state["plan_completeness_warnings"] = completeness_warnings
+            for item in completeness_warnings:
+                self.log(f"        [方案完整性] {item.get('code')}：{item.get('detail')}")
+        # §7/§29：每条硬约束的**机械检查绑定**落 state —— 前端据此显示
+        # 「这条约束由机械检查兜底」vs「只能人工确认」，而不是笼统说"已传达"。
+        checks = semantics.constraint_checks(contract)
+        if checks:
+            self.state["constraint_checks"] = checks
         # ⑦ 方案静态 lint（P0-6）：symbols / interface / contracts 三者互证。
         # 目的就是**不再等 DEV 发现接口明显错误** —— `Game().start()` 没定义 start、
         # `uses` 了不存在的常量、冒出 pygame，这些纯机械可判，进开发前就该拦下。
         # 只把 severity=block 的当阻断；warn（如 math/time 未必被要求）只记录不阻断。
+        # `forbidden_modules` 把**用户硬约束**接进 lint（§7）：tkinter 是标准库，
+        # 内置名单永远抓不到它，只有契约喂进来才能前置阻断。
         plan_lint = planir.validate_architect_plan(
-            self.state.get("plan"), self.state.get("skeleton")
+            self.state.get("plan"), self.state.get("skeleton"),
+            forbidden_modules=semantics.forbidden_module_scopes(contract),
         )
         warnings_only = [f for f in plan_lint if f.get("severity") != "block"]
         if warnings_only:
@@ -3173,7 +3200,11 @@ class Orchestrator:
                     "在制文件已存在，只能用 modify / full_symbol 对你负责的符号做定点增补"
                 )
                 self.state.setdefault("file_lease_violations", []).append(
-                    {"task": tid, "path": path, "owner": owner, "round": self.attempt}
+                    {
+                        # P0-4 §6.3：与编译期同名的具名判据（`_lease_blockers` 据此阻断）。
+                        "code": "SAME_FILE_MULTI_ADD",
+                        "task": tid, "path": path, "owner": owner, "round": self.attempt,
+                    }
                 )
                 continue
             kept.append(e)
@@ -4032,12 +4063,37 @@ class Orchestrator:
         ascii_hit = any(t.isascii() and len(t) >= 3 for t in shared)
         return ascii_hit and cjk_hit >= self._BEHAVIOR_MIN_SHARED
 
+    def _has_existing_surface(self) -> bool:
+        """测试口径里的「已有交付面」：有过上一轮，或仓库本身已有代码（P0-12）。
+
+        便宜判据（只探一层目录），因为它会在测试阶段的提示词与审计里各用一次。
+        属性一律 `getattr` 取值：`_audit_test` 会被测试用的轻量外壳（只替 state/client、
+        靠继承复用方法）调用，不该因为多一个辅助属性就 AttributeError。
+        """
+        if int(getattr(self, "attempt", 0) or 0) > 1:
+            return True
+        repo_path = getattr(self, "repo", None)
+        if not repo_path:
+            return False
+        repo = Path(repo_path)
+        if not repo.is_dir():
+            return False
+        try:
+            return next(
+                (p for p in repo.iterdir() if not p.name.startswith(".")), None
+            ) is not None
+        except OSError:
+            return False
+
     def _audit_test(self) -> dict:
-        """确定性核对测试产物：三类用例是否齐全、expected 是否笼统、有没有可执行命令。
+        """确定性核对测试产物：**本轮必需**用例类别是否齐全、expected 是否笼统、命令是否可执行。
 
         test 曾是唯一没有机械审计的阶段（PM / 架构师 / 开发 / 评审都有各自的确定性核对），
-        「三类都要覆盖」只写在提示词里，模型漏掉 compat 时没有任何东西会拦。
-        措辞可以绕开提示词纪律，但绕不开「cases[].type 里到底有没有 compat」。
+        「类别要覆盖」只写在提示词里，模型漏掉时没有任何东西会拦。措辞可以绕开提示词纪律，
+        但绕不开「cases[].type 里到底有没有这一类」。
+
+        P0-12：必需类别按 ``round_kind`` 聚焦（``tasktype.expected_test_types``），
+        与提示词**共用同一份真源**；建议类别只记 info，绝不逼模型为凑类别编造用例。
         """
         report = self.state.get("test_report") or {}
         cases = [c for c in (report.get("cases") or []) if isinstance(c, dict)]
@@ -4046,7 +4102,12 @@ class Orchestrator:
             kind = str(case.get("type") or "")
             if kind:
                 by_type[kind] = by_type.get(kind, 0) + 1
-        missing_types = [t for t in ("new", "regression", "compat") if not by_type.get(t)]
+        expected_types = tasktype.expected_test_types(
+            self.round_kind, has_existing_surface=self._has_existing_surface()
+        )
+        suggested_types = tasktype.suggested_test_types(self.round_kind)
+        missing_types = [t for t in expected_types if not by_type.get(t)]
+        suggested_missing = [t for t in suggested_types if not by_type.get(t)]
         vague: list[str] = []
         for case in cases:
             text = str(case.get("expected") or "").strip()
@@ -4167,6 +4228,10 @@ class Orchestrator:
             "case_count": len(cases),
             "by_type": by_type,
             "missing_types": missing_types,
+            # P0-12：本轮必需/建议类别（提示词与审计同源，供评审与页面显示口径）
+            "expected_types": list(expected_types),
+            "suggested_types": list(suggested_types),
+            "suggested_missing": suggested_missing,
             "vague_expected": vague[:6],
             "vague_count": len(vague),
             "command_count": len(commands),
@@ -4315,6 +4380,11 @@ class Orchestrator:
         # 测试视图：行为/验收/接口/变更符号/契约，**不含 implementation 全文**（P1-1）。
         view = self._build_test_view(digest)
         self.state["test_view"] = view
+        # P0-12：本轮必需的用例类别按任务性质聚焦；提示词与 `_audit_test` 共用同一份真源，
+        # 避免"提示词要三类、审计查别的"这种口径漂移。
+        focus = tasktype.test_focus_guidance(
+            self.round_kind, has_existing_surface=self._has_existing_surface()
+        )
 
         def _send(repair: list[str] | None, note: str | None) -> None:
             self.state["test_report"] = self._grounded_call(
@@ -4327,13 +4397,14 @@ class Orchestrator:
                     fixes=fixes,
                     repair=repair,
                     test_view=view,
+                    test_focus=focus,
                     # 按需拉代码：只有命令自检发现「光凭接口写不出可执行命令」时，
                     # 重问通道才把相关函数正文补进来（首轮默认无代码正文）。
                     code_on_demand=self._code_text("test") if repair else "",
                 ),
                 note=note,
             )
-            # 机械审计测试产物，结论会 pin 进评审（评审 prompt 要求核对三类是否齐全）
+            # 机械审计测试产物，结论会 pin 进评审（评审 prompt 要求核对本轮必需类别是否齐全）
             self.state["test_audit"] = self._audit_test()
 
         _send(None, None)
@@ -4395,6 +4466,11 @@ class Orchestrator:
             # TestCompiler 编译出的「命令→PO/断言」绑定：执行结果证据原样继承（方案§十）
             command_meta=self.state.get("verify_command_bindings") if isinstance(
                 self.state.get("verify_command_bindings"), dict) else None,
+            # §7 禁止约束完整性：用户硬约束点名的模块进**机械检查**（tkinter 这类
+            # 标准库模块只有这条能抓 —— 导入探针与内置名单都不会判它有问题）。
+            # 必须带**作用域**：`game_logic.py` 禁 tkinter，而 `ui.py` 必须用它。
+            forbidden_modules=semantics.forbidden_module_scopes(
+                self.state.get("requirement_contract")),
         )
         # new 项目无仓库时，verify 内部建了 verify/base 空基线并按新增文件重新审计；
         # 回写 patch_audit，让下游契约核对/评审看到的审计与物化用的同一份。
@@ -4566,6 +4642,10 @@ class Orchestrator:
             # 逐项验收：本轮每条修复项的机械核对结果（只列仍失败 / 无从核对的）
             defect_block=tasktype.render_defect_verdicts(
                 self.state.get("defect_verdicts") or []
+            ),
+            # §36：机械摘要放**第一屏**（fit_prompt 从末尾截断，放后面会被整段吃掉）
+            summary_block=prompts.mechanical_summary_block(
+                self._review_mechanical_summary()
             ),
         )
         audit = self.state.get("implementation_audit") or self._audit_implementation()
@@ -5729,10 +5809,10 @@ class Orchestrator:
         return rules.blocker_fixes(self.state.get("rule_findings") or [])
 
     def _mechanical_blockers(self) -> list[str]:
-        """机制判定的阻断项 = 补丁机械问题 + 运行验证失败 + 测试漏测 + 工程红线。
+        """机制判定的阻断项 = 补丁机械问题 + 运行验证失败 + 测试漏测 + 工程红线 + 租约越权。
 
-        四类都不依赖模型自觉：只要机器能证明「贴不回去」「跑不起来」「改的东西一个没测」
-        或「触了工程红线」，即便评审给了 pass 也要改判 rework_dev。
+        五类都不依赖模型自觉：只要机器能证明「贴不回去」「跑不起来」「改的东西一个没测」
+        「触了工程红线」或「提交的正文被机械丢弃」，即便评审给了 pass 也要改判 rework_dev。
         """
         return [
             *self._patch_blockers(),
@@ -5741,7 +5821,36 @@ class Orchestrator:
             *self._rule_blockers(),
             *self._bugfix_scope_blockers(),
             *self._contract_blockers(),
+            *self._lease_blockers(),
         ]
+
+    def _lease_blockers(self) -> list[str]:
+        """文件创建租约越权（P0-4 §6.3，DEV 侧具名阻断）。
+
+        补丁层已把「非 owner 提交的整份 add」机械丢弃（``_enforce_file_lease``），但
+        **丢弃本身不能静默**：模型提交的正文没落盘意味着交付内容 ≠ 模型产出，必须具名上报，
+        即便评审给 pass 也要改判 rework_dev。与编译期同码 ``SAME_FILE_MULTI_ADD``。
+
+        只认**本轮**记录：上一轮的越权随轮次结束失效，否则会永久阻塞（每轮 dev 都被
+        一条陈旧记录判负 → 空转返工）。去重按 (task, path, owner)，避免同一任务
+        首版 + 重问两次执法留下两条等价记录。
+        """
+        seen: set[tuple[str, str, str]] = set()
+        out: list[str] = []
+        for item in self.state.get("file_lease_violations") or []:
+            if not isinstance(item, dict) or int(item.get("round") or 0) != self.attempt:
+                continue
+            key = (str(item.get("task") or ""), str(item.get("path") or ""),
+                   str(item.get("owner") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                f"SAME_FILE_MULTI_ADD：{key[1]} 的创建租约属于 {key[2]}，"
+                f"但任务 {key[0]} 提交了 change_type=add 整份重写，已被机械丢弃"
+                "（该文件此轮缺少这部分内容）"
+            )
+        return out
 
     def _contract_blockers(self) -> list[str]:
         """跨文件契约不符（聚合验证）：方案声明的接口与产物对不上。
@@ -5914,6 +6023,83 @@ class Orchestrator:
             "missing_entry": self._plan_missing_entry(),
             "evidence_clean": clean,
             "evidence_clean_reason": clean_reason,
+        }
+
+    def _semantic_scale(self) -> dict[str, int]:
+        """当前语义图规模（§37 telemetry）：义务数 / 证据数。纯读 state，不建图、不调模型。"""
+        obligations = 0
+        gate = self.state.get("proof_gate")
+        if isinstance(gate, dict):
+            obligations = len([o for o in (gate.get("obligations") or []) if o])
+        evidence = 0
+        onto = self.state.get("ontology")
+        if isinstance(onto, dict):
+            for obj in onto.get("objects") or []:
+                if not isinstance(obj, dict):
+                    continue
+                kind = str(obj.get("type") or "")
+                if kind == ontology.TYPE_EVIDENCE:
+                    evidence += 1
+                elif kind == ontology.TYPE_PROOF_OBLIGATION and not obligations:
+                    obligations += 1
+        return {"obligations": obligations, "evidence": evidence}
+
+    def _review_mechanical_summary(self) -> dict:
+        """评审第一屏的**机械摘要**（§36）：机器已经证明了什么，一句一条。
+
+        为什么单独取一份集中在最前：`fit_prompt` 从**末尾**截断，而评审是上下文最紧的
+        阶段（8K）。真机里机械结论排在后面时会被整段吃掉，语义层于是只能凭措辞猜
+        "该不该放行"。把"已成立的机器事实"放最前，语义材料排在它之后。
+
+        只读 state 与既有纯机械方法，不调用模型、不建图。
+        """
+        verify = self.state.get("verify_report")
+        verify = verify if isinstance(verify, dict) else {}
+        commands = [c for c in (verify.get("commands") or []) if isinstance(c, dict)]
+        audit = self.state.get("test_audit")
+        audit = audit if isinstance(audit, dict) else {}
+        patch = self.state.get("patch_audit")
+        patch = patch if isinstance(patch, dict) else {}
+        rows = [r for r in (patch.get("edits") or []) if isinstance(r, dict)]
+        gate = self.state.get("release_gate")
+        gate = gate if isinstance(gate, dict) else {}
+        verdicts = [v for v in (self.state.get("defect_verdicts") or []) if isinstance(v, dict)]
+        defects = {"green": 0, "red": 0, "unverifiable": 0}
+        for row in verdicts:
+            key = str(row.get("status") or "")
+            defects[key] = defects.get(key, 0) + 1
+        scale = self._semantic_scale()
+        compiled = self.state.get("test_scenarios")
+        compiled = compiled if isinstance(compiled, dict) else {}
+        return {
+            "verify": {
+                "verdict": str(verify.get("verdict") or "skipped"),
+                "commands": len(commands),
+                "failed": len([c for c in commands if str(c.get("status") or "") == "fail"]),
+            },
+            "patch": {
+                "applied": len([r for r in rows if str(r.get("status") or "") == "ok"]),
+                "problems": len([r for r in rows
+                                 if str(r.get("status") or "") not in ("", "ok")]),
+            },
+            "test": {
+                "covered_symbols": len(audit.get("covered_symbols") or []),
+                "missing_symbols": len(audit.get("missing_unexplained") or []),
+                "expected_types": [str(t) for t in (audit.get("expected_types") or [])],
+                "missing_types": [str(t) for t in (audit.get("missing_types") or [])],
+                "external_required": [
+                    str(x) for x in (compiled.get("external_required") or [])
+                ],
+            },
+            "proof": {"obligations": scale["obligations"], "evidence": scale["evidence"],
+                      "status": str(gate.get("proof_status") or "")},
+            "ontology_errors": len(self.state.get("ontology_problems_structured") or []),
+            "workspace": {
+                "revision": str(gate.get("verified_revision") or ""),
+                "status": str(gate.get("workspace_status") or ""),
+            },
+            "defects": defects,
+            "blockers": self._mechanical_blockers(),
         }
 
     def _persist_ontology(self, graph: ontology.OntologyGraph, stage: str) -> None:

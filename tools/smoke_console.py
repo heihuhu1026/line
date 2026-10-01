@@ -186,8 +186,13 @@ def check_control_plane(port: int, run_id: str) -> None:
         return
     for key in ("release_gate", "proof_summary", "proofs", "evidence_summary",
                 "evidence", "ontology", "workspace", "tasks", "test",
-                "decision", "issues", "next_action"):
+                "decision", "issues", "next_action", "truth", "plan_diff"):
         check(key in cp, f"control_plane 含 {key}")
+    # §29 真值四态 / §26 方案对照的**结构**必须在（老 run 也要给中性值，不崩）
+    for key in ("asserted", "derived", "human", "contradicted", "constraint_checks"):
+        check(key in (cp.get("truth") or {}), f"control_plane.truth 含 {key}")
+    for key in ("draft", "compiled", "files", "reasons"):
+        check(key in (cp.get("plan_diff") or {}), f"control_plane.plan_diff 含 {key}")
     check("can_pass" in (cp.get("release_gate") or {}),
           "release_gate 含 can_pass（机器放行结论）")
     # 最重要的一条认知：LLM 评审 PASS ≠ 放行
@@ -203,12 +208,80 @@ def check_control_plane(port: int, run_id: str) -> None:
             check(key in live, f"live 含 {key}")
         check("proofs" not in live and "evidence" not in live,
               "live 不得携带整份证明/证据明细（轻量轮询）")
+    # ---- §27 / P0-13：测试编译视图（验证方式分类 + 候选命令分离）
+    test_view = cp.get("test") or {}
+    for key in ("verification_modes", "external_required", "scenarios", "coverage_gap",
+                "unbound_commands", "unsafe_commands"):
+        check(key in test_view, f"control_plane.test 含 {key}")
     # ---- 前端卡片存在（脚本语法由 check_frontend_syntax 的 node --check 保证）
     html = (Path(server.__file__).resolve().parent / "console.html").read_text(encoding="utf-8")
     for cid in ("d-control-card", "d-proof-card", "d-evidence-card",
-                "d-ontology-card", "d-workspace-card"):
+                "d-ontology-card", "d-workspace-card", "d-testcard",
+                "d-truth-card", "d-plandiff-card"):
         check(f'id="{cid}"' in html, f"前端存在卡片 {cid}")
     check("renderControlPlane(d)" in html, "renderDetail 会调用 renderControlPlane")
+    # P0-13：UI 必须把"机械不可验"与"忘了测"分开，且不得把候选命令显示成已执行
+    check("CP_MODE_LABEL" in html and "human_only" in html,
+          "前端显示验证方式分类（含 human_only：机械不可验 ≠ 忘了测）")
+    check("LLM 候选命令（编译器不认，未执行）" in html,
+          "前端把 LLM 候选命令与 Compiler 最终命令分开显示")
+    check("verification_modes" in html and "tc.scenarios" in html,
+          "前端消费 control_plane.test 的验证方式与场景明细")
+    # ---- §43 前端 smoke 的其余条目（逐条对应建议书 §43 的 16 项）
+    check("function renderProofGraph(" in html and "setGraphView" in html,
+          "§30 阶段图 / 证明图可切换")
+    check("function poDetailHtml(" in html and '"po-row"' in html and '"po-detail"' in html,
+          "§22.1 证明矩阵行可展开（Claim/Scenario/命令/断言/退出码/Evidence）")
+    check("command_details" in html and "stdout_tail" in html,
+          "§22.1 展开体消费后端 join 好的执行痕迹（退出码 + stdout/stderr）")
+    check("function setEvidenceFilter(" in html and ".ws-row" in html
+          and "data-rev" in html and "d-evidence-filter" in html,
+          "§25 点 Workspace revision 过滤证据链")
+    check("function renderPlanDiff(" in html and "PLAN_DIFF_KIND" in html
+          and "create_owner" in html,
+          "§26 方案 → 编译任务 对照（merged/split/创建 owner）")
+    check("function renderTruth(" in html and "function truthBadge(" in html
+          and "默认假设" in html and '"HUMAN"' in html,
+          "§29 真值 badge：用户原文 / 默认假设 / 人工确认 / 存在矛盾")
+    check('id="log-search"' in html and "mark.hit" in html
+          and "highlightLog(text, $(\"log-only-issues\").checked, S.logSearch || \"\")" in html,
+          "§35 日志页面内搜索 + 命中高亮")
+    check('id="btn-log-copy"' in html and "已复制" in html,
+          "§35 日志复制当前视图")
+    check("function scrollToCard(" in html and "a.metric" in html
+          and "a.basis" in html,
+          "§21.2/§28 指标数字与裁决依据可点击跳转")
+    check("最终机器裁决" in html and "依据" in html,
+          "§28 最终机器裁决块（语义评审 vs 机械证据 vs 判定 + 依据）")
+    check('id="log-follow"' in html, "§35 日志自动跟随 / 暂停跟随")
+    # §43.15：不得引入前端框架（我们的页面必须只靠自己）
+    lowered = html.lower()
+    check(not re.search(r'(react|vue\.js|jquery|angular|svelte|cdn\.)', lowered),
+          "§43.15 不依赖 React/Vue 等第三方框架或 CDN")
+    check(not re.search(r'<script[^>]+src=', lowered),
+          "§43.15 页面没有外链脚本（离线可用）")
+    # ---- §34.1 固定控制条 + §34 固定导航 + §30 阶段图/证明链切换
+    for cid in ("d-sticky", "d-anchor-nav", "d-proof-chain"):
+        check(f'id="{cid}"' in html, f"前端存在 {cid}")
+    check(".sticky-bar{position:sticky" in html,
+          "控制条 fixed/sticky（翻长日志时不丢上下文）")
+    check("renderSticky(d)" in html and "function renderSticky(" in html,
+          "renderDetail 会渲染固定控制条")
+    check("btn-view-stage" in html and "btn-view-proof" in html
+          and "function setGraphView(" in html,
+          "阶段流程图有「阶段流程 / 证明链」切换")
+    check("function renderProofGraph(" in html
+          and "证明义务" in html and "测试场景" in html,
+          "证明链视图渲染 Requirement→PO→Task→Scenario→Evidence→Decision")
+    # 只看**导航容器**里的静态 data-goto（JS 模板里的 `${card}` 是动态占位，不算锚点）
+    nav = re.search(r'(?s)id="d-anchor-nav".*?</div>', html)
+    goto_targets = re.findall(r'data-goto="([^"$]+)"', nav.group(0)) if nav else []
+    check(len(goto_targets) >= 7
+          and all(f'id="{g}"' in html for g in goto_targets),
+          "固定导航的锚点目标都真实存在（不会点了没反应）", str(goto_targets))
+    # 后端：证明链首节点需要的需求条数
+    check("requirement_count" in (cp.get("ontology") or {}),
+          "control_plane.ontology 暴露 requirement_count（证明链首节点）")
     # P1 §33：运行中轮询走 /live，不再每 2.5s 拉整份 detail
     check("/live" in html, "前端轮询改走 /live（仅在状态变化时重拉整份详情）")
 

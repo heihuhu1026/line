@@ -412,6 +412,29 @@ def _hard_constraints(text: str) -> tuple[list[dict], list[dict]]:
     return out, errors
 
 
+def _entry_file_facts(text: str) -> list[dict]:
+    """用户原文里写明的**入口文件**（`python main.py`）。
+
+    为什么单列：§7「入口完整性」—— 用户说了怎么跑，方案就必须规划那个文件。
+    它同时也是"用户事实"，所以 truth=ASSERTED 且带 source_quote（可逐字回查）。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in _ENTRY_FILE_RE.finditer(text):
+        raw = m.group(1)
+        path = _norm_path(raw)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append({
+            "id": f"entry:{len(out) + 1:02d}",
+            "path": path,
+            "truth": _ASSERTED,
+            "source_quote": m.group(0).strip(),
+        })
+    return out
+
+
 def _acceptance_items(text: str) -> list[dict]:
     """「验收依据」章节的编号条目 —— 用户自己写的验收条件，不靠 Intake/PM 重新生成。"""
     body = _section_tail(text, *_ACCEPT_MARKERS)
@@ -573,17 +596,30 @@ def build_requirement_contract(
         "explicit_exclusions": _exclusions(text),
         "acceptance_items": _acceptance_items(text),
         "behavior_claims": _behavior_claims(text),
+        # §7 入口完整性：用户写了 `python main.py` ⇒ main.py 是用户事实（ASSERTED）
+        "entry_files": _entry_file_facts(text),
         "source_facts": _source_facts(text),
         "derived_facts": _derived_from_intake(intake),
         "grounding_errors": [],
     }
+
+    # §7：每条硬约束**在建立契约时**就绑好机械检查 + **作用域** —— "约束只写在提示词里
+    # ＝等于没有"；空列表是"只能人工确认"的显式表达（下游/UI 据此区分，不再笼统说"已传达"）。
+    # 作用域必须一起绑：`game_logic.py` 禁 tkinter 而 `ui.py` 必须用 tkinter，
+    # 全局禁用会把正确方案判成违规（真机贪吃蛇需求正是这种写法）。
+    for item in constraints:
+        item["mechanical_check"] = []
+        item["mechanical_scope"] = []
+    for item, modules, scope in _forbidden_scan(constraints):
+        item["mechanical_check"] = sorted({f"forbidden_import:{m}" for m in modules})
+        item["mechanical_scope"] = list(scope)
 
     errors: list[dict] = list(file_errors) + list(con_errors)
     if not text.strip():
         errors.append({"code": "EMPTY_REQUIREMENT", "detail": "需求原文为空，无法建立契约"})
     # 自查：凡是标了 ASSERTED 的，source_quote 必须逐字可查；查不到就撤销 ASSERTED
     for bucket in ("declared_files", "hard_constraints", "explicit_exclusions",
-                   "acceptance_items", "behavior_claims", "source_facts"):
+                   "acceptance_items", "behavior_claims", "entry_files", "source_facts"):
         rows = contract[bucket]  # type: ignore[index]
         assert isinstance(rows, list)
         for row in rows:
@@ -648,6 +684,288 @@ def plan_missing_declared_files(contract: dict | None, plan: Any) -> list[str]:
         if path not in planned and path.rsplit("/", 1)[-1] not in planned:
             missing.append(path)
     return missing
+
+
+#: 用户原文里的入口命令：`python main.py` / `python3 ./app/main.py`
+_ENTRY_FILE_RE = re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+(?:-m\s+)?([A-Za-z_][\w./-]*\.py)\b")
+#: 硬约束里的「禁止」标记词
+_FORBID_MARK_RE = re.compile(r"(?:不得|禁止|严禁|不允许|不能|不要)")
+#: 标记词与模块名之间的噪声（依赖动词、连词、修饰语）—— 真机写法五花八门：
+#: `不得出现 import tkinter` / `禁止 pygame、numpy 以及任何需要 pip install 的第三方库`
+_FORBID_LEAD_JUNK_RE = re.compile(
+    r"^(?:[ \t、,，/：:]*(?:出现|依赖|使用|引入|导入|引用|任何|需要|第三方|库|包|的"
+    r"|import|from|pip|install))*[ \t、,，/：:]*"
+)
+#: 模块名候选：ascii 标识符，且**后面不是文件扩展名**（`aaa.py` 是路径不是模块）
+_MODULE_TOKEN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?!\s*\.\s*[A-Za-z])")
+#: 模块名出现在导入词**之前**的写法：`出现 tkinter 导入即视为不合格`
+_MODULE_BEFORE_IMPORT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:导入|import)")
+#: 这些词永远不是模块名
+_MODULE_STOPWORDS = frozenset({
+    "import", "from", "pip", "install", "and", "or", "the", "if", "else", "py",
+})
+#: 「模块名在前」那种写法要靠同行出现这些标记才能确认它是在讲不合格
+_DISQUALIFY_MARKS = ("不合格", "违规", "禁止", "不得", "不允许")
+
+
+def _forbidden_module_names(text: str) -> list[str]:
+    """从一段约束文本里机械提取**被禁止的模块名**（§7 禁止约束完整性）。
+
+    覆盖真机出现的三种写法：
+
+      · `禁止 pygame、numpy 以及任何需要 pip install 的第三方库`（裸名单）
+      · `game_logic.py 中不得出现 import tkinter`（标记词 + import + 模块）
+      · `出现 tkinter 导入即视为不合格`（模块在导入词**之前**）
+
+    刻意防误伤：
+      · `aaa.py` 这类**带扩展名**的路径不算模块（负向断言排除）——"不要改 aaa.py"
+        不是"禁止 aaa"；
+      · `不允许 180 度反向` 不会被当成模块（标记词后必须跟 ascii 标识符）；
+      · "模块名在前"的写法要求**同一行**出现不合格/违规类标记，否则不认。
+    """
+    text = str(text or "")
+    names: list[str] = []
+
+    def _add(name: str) -> None:
+        name = str(name).split(".")[0].strip()
+        if name and name.lower() not in _MODULE_STOPWORDS and name not in names:
+            names.append(name)
+
+    # **逐行**扫描：`\s` 会跨行 —— 曾把下一行的文件名 `game_logic.py` 当成"被禁止的模块"
+    # （契约里 text 与 source_quote 会拼在一起，行边界必须显式挡住）。
+    for line in (str(text or "").splitlines() or [""]):
+        for m in _FORBID_MARK_RE.finditer(line):
+            window = _FORBID_LEAD_JUNK_RE.sub("", line[m.end(): m.end() + 60])
+            run = re.match(r"[A-Za-z0-9_ \t、,，/]*", window)
+            if not run:
+                continue
+            for token in _MODULE_TOKEN_RE.findall(run.group(0)):
+                _add(token)
+        # 模块名在前的写法：同一行还要有"不合格/违规"类标记才认
+        if not any(k in line for k in _DISQUALIFY_MARKS):
+            continue
+        for m2 in _MODULE_BEFORE_IMPORT_RE.finditer(line):
+            _add(m2.group(1))
+    return names
+
+
+def entry_files(contract: dict | None) -> list[str]:
+    """契约里的**入口文件**（用户原文写了 `python main.py` ⇒ main.py 必须存在，§7）。"""
+    out: list[str] = []
+    for item in (contract or {}).get("entry_files") or []:
+        if isinstance(item, dict) and item.get("path"):
+            path = _norm_path(item["path"])
+            if path and path not in out:
+                out.append(path)
+    return out
+
+
+def _mentioned_files(text: str) -> list[str]:
+    """约束文本里点名的 ``*.py`` 文件（作用域用）。``game_logic.py`` → ``['game_logic.py']``。"""
+    out: list[str] = []
+    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_./\\-]*\.py\b", str(text or "")):
+        name = raw.replace("\\", "/").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _forbidden_scan(constraints: Any) -> list[tuple[dict, list[str], list[str]]]:
+    """按约束**顺序**扫一遍，返回 ``[(约束对象, 模块名, 作用域文件)]``（文件空 = 全项目）。
+
+    作用域继承规则（真机必需）：一条约束点了模块但**没点文件** ⇒ 继承上一条"点了模块又
+    点了文件"的作用域。依据是真机需求原文：
+
+        **分层是硬性要求**：`game_logic.py` 中**不得出现 `import tkinter`**，…
+        **出现 tkinter 导入即视为不合格。**
+
+    后半句是前半句的补述。若按"没点文件 = 全项目"处理，就会去禁 `ui.py` 的 tkinter ——
+    而 `ui.py` **必须**用 tkinter 画 Canvas（需求明写）。那会把正确的方案判成
+    `PLAN_FORBIDDEN_DEPENDENCY`，并让 verify 永久判负 → 死循环。
+    """
+    out: list[tuple[dict, list[str], list[str]]] = []
+    last_files: list[str] = []
+    for item in constraints or ():
+        if not isinstance(item, dict):
+            continue
+        text = f"{item.get('text') or ''}\n{item.get('source_quote') or ''}"
+        modules = _forbidden_module_names(text)
+        if not modules:
+            continue
+        files = _mentioned_files(text)
+        scope = files or last_files
+        out.append((item, modules, list(scope)))
+        if files:
+            last_files = files
+    return out
+
+
+def forbidden_module_scopes(contract: dict | None) -> list[dict]:
+    """``[{"module": "tkinter", "files": ["game_logic.py"]}, …]``（``files`` 空 = 全项目）。
+
+    同一模块被多条约束提到时取**最严**：只要有一条是全项目，结果就是全项目。
+    """
+    merged: dict[str, list[str]] = {}
+    for _item, modules, scope in _forbidden_scan((contract or {}).get("hard_constraints")):
+        for module in modules:
+            if module not in merged:
+                merged[module] = list(scope)
+            elif not scope:
+                merged[module] = []
+            elif merged[module]:
+                merged[module] = sorted(set(merged[module]) | set(scope))
+    return [{"module": m, "files": list(f)} for m, f in sorted(merged.items())]
+
+
+def _mechanical_checks_for(text: str) -> list[str]:
+    """一条约束文本能绑定哪些**机械检查**（§7）。
+
+    目前只认"禁止依赖某模块"这一类（可机械判）。其余约束（"代码要清晰"）返回空 ——
+    它们**只能人工确认**，本函数不假装能查。空列表就是"没有机械检查"的显式表达。
+    """
+    checks: list[str] = []
+    for mod in _forbidden_module_names(text):
+        checks.append(f"forbidden_import:{mod}")
+    return sorted(set(checks))
+
+
+def forbidden_modules(contract: dict | None) -> list[str]:
+    """从硬约束里机械提取「用户禁止依赖的模块」（§7 禁止约束完整性 / §8.4）。
+
+    只认**明确写出模块名**的约束（`game_logic.py不得依赖tkinter`）—— 这是可机械检查的
+    那一类。像"代码要清晰"这类无法机械化的约束**不在此列**（本函数不假装能查它）。
+    """
+    names: list[str] = []
+    for _item, modules, _scope in _forbidden_scan((contract or {}).get("hard_constraints")):
+        for mod in modules:
+            if mod not in names:
+                names.append(mod)
+    return names
+
+
+def constraint_checks(contract: dict | None) -> list[dict]:
+    """每条硬约束的**机械检查绑定**（§7 末条 / §29 真值显示）。
+
+    为什么必须显式绑定：约束只写在提示词里＝等于没有。这里把"可机械检查"与
+    "只能人工确认"分开，供闸门、评审与 UI 看到 —— 而不是笼统地说"约束已传达"。
+
+    绑定在 `build_requirement_contract` 时就写进约束对象（`mechanical_check`）；
+    老 run 的约束没有该字段，则在这里按同一规则现算（**同源**，不两套口径）。
+    """
+    out: list[dict] = []
+    for item in (contract or {}).get("hard_constraints") or []:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or "")
+        text = str(item.get("text") or item.get("source_quote") or "")
+        stored = item.get("mechanical_check")
+        checks: list[str] = [str(x) for x in stored] if isinstance(stored, list) \
+            else _mechanical_checks_for(text)
+        scope = item.get("mechanical_scope")
+        out.append({
+            "id": cid,
+            "text": text[:200],
+            "truth": str(item.get("truth") or ""),
+            "severity": str(item.get("severity") or "hard"),
+            "mechanical_check": sorted(set(checks)),
+            # 作用域：空 = 全项目；非空 = 只在这些文件里查（`game_logic.py` 禁 tkinter，
+            # 而 `ui.py` 必须用 tkinter —— 全局禁用会把正确方案判负）
+            "mechanical_scope": [str(x) for x in scope] if isinstance(scope, list) else [],
+            # 没有机械检查 ⇒ 只能人工确认（**不伪装**成"已核对"）
+            "human_only": not checks,
+        })
+    return out
+
+
+def validate_plan_completeness(contract: dict | None, plan: Any) -> list[dict]:
+    """§7 Plan Completeness Gate：把「用户事实是否进了方案」一次判全（**纯函数**）。
+
+    返回问题列表，每项 ``{code, severity, ...}``；``severity == "block"`` 的由 Design Gate
+    直接 ``rework_architect`` —— 不等 DEV / Test / Review 才发现。四类各自独立、可单测：
+
+      ① ``plan_missing_declared_file`` —— ``declared_files ⊄ plan.changes``（含测试文件）
+      ② ``plan_missing_test_file``     —— 用户声明的 ``*_test.py`` 没进方案（①的子集，
+         单列只为**定位更准**：真机上"测试文件从计划里消失"是最难发现的一类）
+      ③ ``plan_missing_entry``         —— 用户写了 ``python main.py``，方案没有该入口文件
+      ④ ``plan_constraint_unbound``    —— 硬约束点名禁止的模块，方案**一个字都没提**
+         （severity=warn：机械检查已兜底，这里只提示架构师漏读了约束，不误伤阻断）
+
+    契约缺失（老 run 没有该字段）时返回空 —— 向后兼容，不误伤旧运行。
+    """
+    if not isinstance(contract, dict):
+        return []
+    findings: list[dict] = []
+    missing = plan_missing_declared_files(contract, plan)
+    if missing:
+        findings.append({
+            "code": "plan_missing_declared_file",
+            "severity": "block",
+            "files": missing,
+            "detail": (
+                "用户原文明确声明的交付文件未出现在方案 changes 中："
+                + "、".join(missing)
+                + " —— 这些是用户事实，方案无权静默删除；"
+                "请补进 changes，或显式写 plan_exception 说明为何不实现"
+            ),
+        })
+        tests = [p for p in missing if p.rsplit("/", 1)[-1].endswith("_test.py")
+                 or p.rsplit("/", 1)[-1].startswith("test_")]
+        if tests:
+            findings.append({
+                "code": "plan_missing_test_file",
+                "severity": "block",
+                "files": tests,
+                "detail": (
+                    "用户明确要求的测试文件没进入方案：" + "、".join(tests)
+                    + " —— 测试文件缺失会让下游的验证证据整体缺位"
+                ),
+            })
+    entries = entry_files(contract)
+    if entries:
+        planned = _planned_paths(plan)
+        if planned:  # 方案还没产出（无 changes）时不判，避免误报中间态
+            absent = [p for p in entries if p not in planned
+                      and p.rsplit("/", 1)[-1] not in planned]
+            if absent:
+                findings.append({
+                    "code": "plan_missing_entry",
+                    "severity": "block",
+                    "files": absent,
+                    "detail": (
+                        "用户明确用 `python " + absent[0] + "` 运行，但方案 changes 里没有该入口"
+                        " —— 没有入口，运行验证必然判「没有可执行入口」"
+                    ),
+                })
+    # ④ 约束是否被方案承认（只提示：机械检查已兜底，不因"没写进 constraints"阻断交付）
+    forbidden = forbidden_modules(contract)
+    if forbidden and _planned_paths(plan):
+        blob = json.dumps(plan, ensure_ascii=False)
+        unmentioned = [m for m in forbidden if m not in blob]
+        if unmentioned:
+            findings.append({
+                "code": "plan_constraint_unbound",
+                "severity": "warn",
+                "modules": unmentioned,
+                "detail": (
+                    "用户硬约束禁止依赖 " + "、".join(unmentioned)
+                    + "，但方案的 constraints / deps 里一个字都没提 ——"
+                    " 机械检查（forbidden_import）仍会兜底，此处仅提示架构师可能漏读约束"
+                ),
+            })
+    return findings
+
+
+def _planned_paths(plan: Any) -> set[str]:
+    """方案 changes 覆盖的路径集合（含 basename，便于目录形式比对）。"""
+    planned: set[str] = set()
+    for change in (plan or {}).get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        path = _norm_path(change.get("path"))
+        if path:
+            planned.add(path)
+            planned.add(path.rsplit("/", 1)[-1])
+    return planned
 
 
 def _selftest() -> int:

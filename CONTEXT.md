@@ -805,7 +805,7 @@ dev 给的是 **5 条小补丁（161~409 字符）**，全部 `insert_after` 挂
 
 反馈：裁决页同一批问题出现 3 遍，且混着「数据库表结构」「浮点数精度处理」等业务方回答不了的技术问题。根因：提示词曾**强制** unknowns / clarifying_questions 与 open_questions「一一对应」，三列又被闸门分别计数、分别裁决。
 
-- **两层防御**：提示词（二开/新建两版 PM 段）改为「只准业务方拍板的问题；技术实现类禁问；两列只填未覆盖点、允许空数组」；确定性归一兜底在 `prompts.py:668 normalize_pm_questions`（open_questions 行内去重、技术词表 `PM_TECHNICAL_HINTS` 剔除、两列对 open_questions 折叠）。
+- **两层防御**：提示词（二开/新建两版 PM 段）改为「只准业务方拍板的问题；技术实现类禁问；两列只填未覆盖点、允许空数组」；确定性归一兜底在 `prompts.py:675 normalize_pm_questions`（open_questions 行内去重、技术词表 `PM_TECHNICAL_HINTS` 剔除、两列对 open_questions 折叠）。
 - **三个接入点同口径**：`_stage_pm` 落库前（主入口，带日志留痕）、`pm_unresolved_items` 判据读取时（兜旧 run 与 gateway 作业层）、console.html `renderPmQuestions` 内 JS 版（旧 run 页面也干净，页面顶部显示折叠/忽略条数）。
 - **判重算法**：归一（小写/剥疑问前缀/去标点）后 全等→子串→字符级 LCS 占比 ≥0.75（`_pm_q_similar`，阈值刻意高：「金额格式校验/金额上限校验」LCS 0.67 是两个业务问题，不能折叠；词序交错改写宁可漏判）。**Python 词表/阈值与 JS 各一份，改时两处同步**。
 - 真机 172150 实测：18 条 → 7（业务 4 问 + 3 条字面不相似改写残余）；断言在 smoke_prompts 第 6 段。
@@ -1379,36 +1379,36 @@ global_architecture_analysis: qwen3-14b-arch-8k, num_ctx=8192, prompt=3800, num_
 - 续跑/打回：`POST /api/runs/20260924-185507/resume`（body 可选 `from`/`feedback`/`max_rework`/`pause_after`），
   或直接命令行 `cd D:\AI\line && python -m pipeline.cli --resume 20260924-185507`。
 - 关键位置（**2026-09-27 已核对；行号会漂移，优先按符号名找**）：
-  评审提示词 `prompts.py:3295 parts_review`；fix 列表拼装 `orchestrator.py:6587 self.fixes = fixes`；
+  评审提示词 `prompts.py:3420 parts_review`；fix 列表拼装 `orchestrator.py:273 self.fixes = fixes`；
   运行态相位 `console.html:842 runPhase`、续跑按钮 `console.html:1262 btn-resume`；
-  入口探测 `verify.py:538 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
-  跨文件契约比对 `verify.py:1119 contract_check`；跨轮合并 `orchestrator.py:2618 _merge_impl_across_rounds`；
-  缺陷单 `tasktype.py:367 bug_report_from_state`；施工图字段强制 `orchestrator.py:2175 _plan_contract_gaps`；
-  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:4893 _task_drawing_is_thin`；
+  入口探测 `verify.py:603 entry_script_problems`；导入自检 `verify.py:357 import_symbol_problems`；
+  跨文件契约比对 `verify.py:1184 contract_check`；跨轮合并 `orchestrator.py:2645 _merge_impl_across_rounds`；
+  缺陷单 `tasktype.py:439 bug_report_from_state`；施工图字段强制 `orchestrator.py:2202 _plan_contract_gaps`；
+  施工图厚度判定（太薄则兜底给整份方案）`orchestrator.py:4973 _task_drawing_is_thin`；
   确定性拆任务 `taskcompiler.py:49 compile_plan`（容量错误通道；施工图包装 `taskcompiler.py:95 compile_tasks`；
   执行 DAG 装配/环校验 `taskcompiler.py:626 _assemble_dependency_dag`）/ 编译审计 `taskcompiler.py:850 plan_needs_compile`；
-  **编译层**：Plan IR 归一 `planir.py:274 normalize_plan`、二开现存 import 边 `planir.py:152 existing_import_edges`、
+  **编译层**：Plan IR 归一 `planir.py:281 normalize_plan`、二开现存 import 边 `planir.py:159 existing_import_edges`、
   最长匹配 `planir.py:117 drop_parent_symbols`、
-  相对名剥离 `planir.py:226 _relative_name`、编译器指纹 `planir.py:728 fingerprint`；
+  相对名剥离 `planir.py:233 _relative_name`、编译器指纹 `planir.py:728 fingerprint`；
   符号解析 `symbols.py:246 resolve`、调用写法归一 `symbols.py:206 clean_symbol`、
   文件限定切分 `symbols.py:231 _split_file_hint`、索引 `symbols.py:119 build_index`、
-  摘要解析 `symbols.py:70 digest_symbols`；单张施工图 `prompts.py:2376 task_focus_block`；
+  摘要解析 `symbols.py:70 digest_symbols`；单张施工图 `prompts.py:2408 task_focus_block`；
   定位失败补丁裁剪 `patches.py:1263 prune_unappliable`；符号逐字原文 `patches.py:843 symbol_excerpt`；
-  **修复项与归因** `tasktype.py:648 defect_items`（方案漏项判据 `tasktype.py:614 plan_gap_files`、
-  逐项验收 `tasktype.py:856 defect_verdicts`、分组视图 `tasktype.py:966 by_task_attribution`、
-  渲染 `tasktype.py:1040 format_bug_report`、路径收敛 `tasktype.py:584 _match_known`、
-  缺陷单入口 `tasktype.py:367 bug_report_from_state`）；
+  **修复项与归因** `tasktype.py:720 defect_items`（方案漏项判据 `tasktype.py:686 plan_gap_files`、
+  逐项验收 `tasktype.py:928 defect_verdicts`、分组视图 `tasktype.py:1038 by_task_attribution`、
+  渲染 `tasktype.py:1112 format_bug_report`、路径收敛 `tasktype.py:656 _match_known`、
+  缺陷单入口 `tasktype.py:439 bug_report_from_state`）；
   **机械失败归因** `diagnose.py:348 classify`（补丁责任主体三分类 `diagnose.py:188 patch_owner_class`：
   dev_patch / compiler_target / patch_runtime；内建 Recovery Policy：同缺陷+同证据连失 2 轮且
   交付指纹无变化 → escalate_plan / escalate_human；阈值 `diagnose.py RECOVERY_STREAK_AFTER=2`）、
   缺陷身份 v2 `diagnose.py:634 defect_key`（类型+check_id+文件+符号，line/what 仅证据）、
   跨轮台账 `diagnose.py:668 ledger`（含 evidence_streak）；
-  当前代码取源 `orchestrator.py:2797 _current_candidates`（按文件 `orchestrator.py:2852 _current_sources`）；
-  方案漏项回流 `orchestrator.py:5607 _plan_uncovered_defects`；
-  判负补丁结构化投影 `orchestrator.py:5506 _patch_failures`（classify 三分类的输入）；
+  当前代码取源 `orchestrator.py:2824 _current_candidates`（按文件 `orchestrator.py:2879 _current_sources`）；
+  方案漏项回流 `orchestrator.py:5687 _plan_uncovered_defects`；
+  判负补丁结构化投影 `orchestrator.py:5586 _patch_failures`（classify 三分类的输入）；
   **输出截断处理**：抬高上限一次数 `ollama_client.py:40 _MAX_ESCALATIONS`、
-  逐张调用组装 `orchestrator.py:4917 _dev_task_call`、
-  截断自动拆半 `orchestrator.py:4993 _dev_split_retry`。
+  逐张调用组装 `orchestrator.py:5030 _dev_task_call`、
+  截断自动拆半 `orchestrator.py:5073 _dev_split_retry`。
   复检脚本：`python tools/check_refs.py`（抽 CONTEXT.md 里所有 `文件:行号` 并比对当前代码；
   含"该行附近是否还有文档声称的符号名"这一层，能抓出"行号还在但内容已换"的漂移）。
 - 测试：mock 端到端 `tools/smoke_mock.py`、控制台 `tools/smoke_console.py`（增量编辑 CONTEXT.md，勿整份覆盖）。
@@ -2954,3 +2954,456 @@ python tools/check_refs.py           # 引用一致性
 - 前端**不得**自行推理语义（"这条证据证明了什么"必须由后端绑定后给出）。
 - 断言只在能逐字校验时成立（`source_quote` 必须可在原文找到）。
 - 拿不准一律 `UNBOUND` / `grounding_errors`，**绝不猜**。
+
+## §36 对照《优化建议》逐条核对 + §35 遗留清单收尾（2026-09-30 晚）
+
+> 起因：用户给出建议书（六类断点 + 四十五个编号条目 + Phase A–H 实施顺序），要求
+> 「读项目日志与代码 → 对照完成情况 → 把遗留未完成的任务跑完」。§35 已记录 Phase A–G
+> 的落地，本节记录**逐条核对结论**、**本轮补完的 6 项**、以及**第 7 项"测量后判定不该改"**。
+
+### 一、逐条核对（建议书 → 现仓状态）
+
+| 建议书条目 | 落点（符号名） | 状态 |
+|---|---|---|
+| 三 P0-1 Grounded Requirement Contract | `semantics.build_requirement_contract` | §35 已落 |
+| 四 P0-2 契约传 PM/Architect + 缺失即阻断 | `prompts.grounded_contract_block` / `plan_missing_declared_files` | §35 已落 |
+| 五 P0-3 TaskCompiler facet 绑定 | `taskcompiler.bind_task_requirements` / `_bind_requirements_by_facet` | §35 已落 |
+| 六 P0-4 同文件禁止连续 add | `taskcompiler.file_owner_map` / `same_file_add_violations` | §35 已落；**DEV 侧本轮补完** |
+| 七 P0-5 Plan Completeness Gate | `semantics.plan_missing_declared_files`（Design Gate ⑥） | §35 已落 |
+| 八 P0-6 方案静态 lint | `planir.validate_architect_plan`（Design Gate ⑦） | §35 已落 |
+| 九 P0-7 Skeleton 只做 materialize | `planir.skeleton_overreach`（Design Gate ④′） | §35 已落 |
+| 十 P0-8 Symbol Manifest | `symbols.build_symbol_manifest` / `planned_vs_actual` | §35 已落 |
+| 十一 P0-9 符号/成员冲突前置 | `symbols.validate_symbol_collisions` | §35 已落 |
+| 十二 P0-10 TestCompiler 去 LLM 化 | `testcompiler.bind_target_po` / `unbound_commands` | §35 已落 |
+| **十二.5 机械测试自动生成** | `testcompiler` ① 原仅 syntax/import | **本轮补完** |
+| 十三 P0-11 Proof 覆盖硬指标 | `testcompiler.proof_coverage_gate` | §35 已落 |
+| **十四 P0-12 测试分类不硬性三类** | `tasktype.expected_test_types` + 两套 test 提示词 | **本轮补完** |
+| **十五 P0-13 行为项机械分类** | `testcompiler.classify_obligation` / `mode_summary` | **本轮补完** |
+| 十六 P0-14 矛盾/默认值前置 | `ontology.project_conflict_claims`；`prompts.normalize_pm_questions` | §28/§32 已落（未另做） |
+| 十七–十九 P1 Defect/Recovery、Review 瘦身、Release 单一入口 | `ontology.release_proof_status` / `build_release_decision` | §35 已落 |
+| 二十–三十一 P1 前端控制塔 | `console.html`：`d-control-card` / `d-proof-card` / `d-evidence-card` / `d-ontology-card` / `d-workspace-card` | §35 已落 |
+| **二十七 P1 TestCompiler 面板** | `controlplane._scenario_rows` + `#d-testcard` | **本轮补完** |
+| **三十 P1 阶段图/证明链切换** | `setGraphView` / `renderProofGraph` / `#d-proof-chain` | **本轮补完** |
+| **三十四 P1 固定导航 + sticky bar** | `#d-sticky` / `#d-anchor-nav` | **本轮补完** |
+| 三十二 P1 `control_plane` API | `pipeline/controlplane.py` | §35 已落 |
+| 三十三 P1 `/live` 轮询 | `server` + `console` | §35 已落 |
+| **三十六 P2 review context 压缩** | `prompts.mechanical_summary_block` | **本轮补完** |
+| **三十七 P2 telemetry** | `runstore.CALL_FIELDS`（`proof_obligation_count` / `evidence_count`） | **本轮补完** |
+| 三十八 tests/ 9 个文件 | `tests/test_*.py` | 已落（+ `test_mechanical_scenarios` / `test_test_focus` / `test_verification_modes` / `test_review_context`） |
+| 三十九 fixtures 017–024 | `tools/_repro/fixture_017..024` | §35 已落 |
+| 四十 真机 run 固化为回归 | `tests/test_replay_fixtures.py` | §35 已落 |
+| 四十一/四十二 现有 smoke 不回归 | `tools/smoke_all.py` | 19 套全绿 |
+| 四十四「不要本轮做」的 16 条 | 逐条自检 | 无违背（未新增 Agent/模型/框架/DB） |
+
+### 二、本轮补完的 6 项（每项都有单测 + 冒烟）
+
+**① §12.5 机械测试自动生成（P0 尾项）** —— `testcompiler.compile_scenarios` 的 ① 分支
+从「只有 syntax/import」扩到 **contract / interface_freeze / materialization**：新增常量
+`_INPROCESS_MECHANICAL_VERIFIERS` 与场景状态 `STATUS_MECHANICAL`。要点：
+- 这三类的权威 verifier 是**编排器就地跑的**机械检查器（`contract_check` /
+  `skeleton_conformance` / 补丁物化），**不是 shell 命令** ⇒ 场景 `actions=[]`
+  （不进 `automated_commands`、不进 verify 绑定），并带 `mechanical_check` 字段供 UI 显示。
+- 字段 `TestScenario.verification_mode` / `mechanical_check`；场景 id 用
+  `_mechanical_scenario_id`（只取决于 PO + 检查器名单，确定性）。
+- 安全：LLM 若声称某条运行命令能证明这类 PO ⇒ 记 `unbound_commands`（具名原因），
+  **既不静默丢也不塞给别人**。
+- `audit_po_test_coverage` / `proof_coverage_gate` 把 `mechanical` 计入 covered；
+  ⚠ 但 PROVEN 仍只认真实机械证据（`can_release` 那一层没放松）。
+
+**② §14 P0-12 测试分类按任务类型聚焦** —— 新增 `tasktype.expected_test_types()` /
+`suggested_test_types()` / `test_focus_guidance()`（**唯一真源**），
+`schemas.CASE_TYPE` 扩到 `[new, regression, compat, contract, interface]`，
+`tasktype.TEST_CASE_TYPES` 反向导入避免两处漂移。要点：
+- 口径：`bugfix`→`regression`；`plan_rework`→`new`（接口/契约为**建议**）；
+  `feature`→首轮只要 `new`，**已有交付面**（`_has_existing_surface()`）才追加 `regression`。
+- **只放宽不收紧**：必需集合恒为旧三类的子集 ⇒ 不可能凭空多出模型产不出的类别。
+- 提示词与审计共源：`prompts.parts_test(test_focus=...)` 打【本轮测试聚焦】块；
+  `_audit_test` 用同一函数算 `missing_types`（必需）与 `suggested_missing`（提示级、
+  `issues` 里只记 info）；两套 test 系统提示词删掉「三类缺一不可」，
+  `test_audit_block` 改为渲染必需/建议两档。`PROMPT_VERSIONS` test/review → `v2`。
+
+**③ §15 P0-13 行为项 → 验证方式机械分类** —— `testcompiler.classify_obligation()`（纯函数）：
+`mechanical` / `unit` / `gui_smoke` / `resident` / `human_only` / `unclassified`。
+- 字面证据表刻意用**较长** token（`ui`/`gui` 会命中 `build`/`guide`，故不用）。
+- `compile_scenarios` 产出 `verification_modes`（`{方式: [PO id]}`）与
+  `external_required`（本沙箱之外才能定的义务单列）；`proof_coverage_gate` 透出
+  `external_required`。要点：**GUI/常驻/人工 ≠ 忘了测** —— 单列后不再被当成重问素材。
+- ⚠ 分类**不放松**任何判定：GUI 义务仍是「未证明」，只是缺口原因写得准确。
+
+**④ §28/§31 G2 尾项（前端）** —— `console.html`：
+- `#d-testcard`（§27 测试编译）：覆盖数字 + **验证方式分类** + 场景明细
+  （Compiler 认可的命令/断言/缺口原因）+ **LLM 候选命令单列**（明写"编译器不认，未执行"）
+  + 不安全命令单列。后端 `controlplane._scenario_rows()` 供给；
+  `runstore` 白名单**登记** `test_scenarios` / `test_scenario_audit`（不登记则页面一片干净）。
+- `#d-proof-chain` + `#btn-view-stage` / `#btn-view-proof` + `setGraphView()`（§30）：
+  证明链 Requirement → PO → Task → Scenario → Evidence → Decision（**纯 HTML**，
+  无图形库）；需求条数由 `controlplane` 新增的 `ontology.requirement_count` 提供。
+- `#d-sticky`（§34.1 sticky 控制条：运行 ID / 状态 / 闸门 / 机器放行 / 语义评审候选 /
+  下一步）+ `#d-anchor-nav`（§34 固定导航，`scrollIntoView` 单页跳转，目标全部真实存在）。
+
+**⑤ §36 P2 review context 压缩** —— 新增 `prompts.mechanical_summary_block()`：把
+运行验证 / 证明义务 / 补丁物化 / 测试覆盖（含本轮必需类别与需外部条数）/ 语义 error /
+工作区 / 逐项验收 / 机械阻断项渲染成**第一屏**，由 `orchestrator._review_mechanical_summary()`
+供数、作为 `parts_review` 的**第 0 段**。
+- 为什么必须最前：`budget.fit_prompt` 从**末尾**截断，评审是 8K 最紧的阶段 ——
+  真机里机械结论排后面会被整段吃掉，语义层只能凭措辞猜放行。
+- 缺数据时省略该行（`{}`/`None` 不渲染空壳），**不臆造**。
+
+**⑥ §37 P2 telemetry** —— `runstore.CALL_FIELDS` 增 `proof_obligation_count` /
+`evidence_count`；`orchestrator._semantic_scale()` 从 `proof_gate` / `ontology` 纯读计数，
+在 `_record` 里随每条 `llm-calls.jsonl` 落盘。于是「这轮 review 为什么 context 这么大」
+不必再翻 state.json。
+
+### 三、DEV 侧 `SAME_FILE_MULTI_ADD` 具名阻断（§35 遗留第 6 项）
+
+`orchestrator._enforce_file_lease` 记录里补 `code="SAME_FILE_MULTI_ADD"`；新增
+`_lease_blockers()` 接进 `_mechanical_blockers()`（第五类）：被机械丢弃的整份 add
+**不再静默** —— 交付内容 ≠ 模型产出，即便评审 pass 也改判 rework_dev。
+- **只认本轮**（`round == self.attempt`）：否则上一轮的记录会永久阻塞每轮 dev。
+- 按 `(task, path, owner)` 去重：首版 + 重问两次执法不会报两条。
+- 判据仍收窄（`change_type=add` 且 `target_symbol` 为空或等于模块名）：owner 自己的
+  add、非 owner 的**定点**符号 add 一律放行（有单测钉住）。
+
+### 四、第 7 项「facet 需求匹配阈值」——**测量后判定不该改**（结论 + 证据）
+
+新增 `tools/check_facet_links.py`（纯读、不调模型）：在真实 run 上同时量**文件级**与
+**facet 级**两种粒度，并扫 `min_shared ∈ {1,2,3} × ratio ∈ {0.20,0.35,0.50}` 网格
+（指标：命中图数 / 过绑定(≥3) / 连接数 / 落入候选 / 漏挂需求）。
+
+真实读数（run `20260930-000332`，`scope` 34 条 claim / 5 张图）：
+
+```
+当前阈值 (≥2, ≥0.35)   命中图 4/5  过绑定 0  连接 4 | 文件级 过绑定 1 连接 4 | 漏挂 5 落入候选 6
+min_shared=1 ratio=0.20  命中 5  过绑定 2  连接 13   ← 唯一"命中更多"的格点，但过绑定翻倍
+其余 7 个格点             命中 4  过绑定 0  连接 4    （与当前**完全等价**）
+```
+
+**结论：全局阈值无可动空间。** 唯一提升命中的格点（`1 / 0.20`）把连接从 4 涨到 13、
+过绑定从 0 涨到 2 —— 正是 P0-3 刚修掉的"同文件每张图拿到同一批 FR"。其余格点等价 ⇒
+改阈值要么有害、要么无操作。**顺带纠正 §35 的一处旧描述**：当时记「T-02 的 FR-04 落入候选、
+未命中」，实测 T-02 **已命中 FR-04**（候选是 FR-01/FR-05）—— 该描述是更早状态的残留。
+⇒ 若要真正提升 facet 命中率，需要的是**新机制**（如"符号名 ↔ 需求关键词"的确定性词典，
+或让架构师显式写 `requirement_ids`），**不是**调阈值。工具留在仓库供后续用数字决策。
+
+### 五、本轮验证（全绿）
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python -m pytest tests -q            # 186 passed（本轮 +30）
+python -X utf8 tools/smoke_all.py    # 19 套全绿
+python tools/fix_refs.py             # 改了行数必须跑（否则 check_refs 红）
+```
+- 断言增量：`smoke_testcompiler` 17→24（+G/H 两节）、`smoke_prompts` 64→81、
+  `smoke_console` 195→204；`smoke_mock` / `smoke_ontology` 的 freeze PO 数量断言未受影响。
+- 新增单测：`test_mechanical_scenarios`（5）、`test_test_focus`（8）、
+  `test_verification_modes`（6）、`test_review_context`（4），并扩写
+  `test_same_file_owner`（+5）、`test_control_plane`（+2）。
+- 踩坑记录：`check_contracts`（Schema Guardian）把提示词里出现的**标识符**当成声明的
+  字段 —— 在 `prompts.py` 的注释/文档串里写 `tasktype.test_focus_guidance` 会被判
+  HARD 矛盾；改写成"由 tasktype 的测试聚焦口径"即通过。**新符号别写进 prompts.py 的散文里**。
+
+### 六、仍未做（不属本轮建议书范围，或按"不做"清单明确不做）
+
+1. **真机跑一轮**见证本轮 6 项（尤其 §12.5 机械场景与 P0-12 类别聚焦的 token 收益）——
+   需要 ollama + 目标仓库，本轮只做离线回归（`smoke_mock` 是 mock 路径，占位产物）。
+2. **facet 命中率的新机制**（见上：确定性词典或架构师显式 `requirement_ids`）。
+3. 建议书 §16「Intake 不得拍板」的**完整**形状（`DERIVED DEFAULT` 在 UI 显式标成
+   "默认假设"而非用户要求）—— 现有 `pm_assumptions_block` 已分区，但前端 badge 未做。
+4. 建议书 §35「Pipeline / Recovery 修复只测 recovery/routing/proof」这一档：
+   我们的 `round_kind` 只有 feature/plan_rework/bugfix，**没有** recovery 档；
+   若将来开该档需同时进 `tasktype.ROUND_KINDS` 与 `expected_test_types`。
+
+## §37 按建议书再审计一轮：又补出 8 项 + 抓到一个真 bug（2026-09-30 夜）
+
+> 起因：用户要求「按优化建议的文件内容去完成」。§36 只做了"遗留项收尾"，这一轮把
+> **建议书四十五个条目逐条拿代码对照**（不是看自己写的总结），又找出 8 处没落地的地方。
+
+### 一、审计方法（可复用）
+
+对每条要求**搜符号名**而不是读自己的笔记：`def build_requirement_contract` /
+`validate_plan_completeness` / `SKELETON_DESIGN_DRIFT` / `truth badge` / `方案 → 编译任务` …
+搜不到就是没做或换了名。这一轮据此发现：
+
+| 建议书条目 | 审计结果 |
+|---|---|
+| §7 `validate_plan_completeness`（**函数名**被点名） | ✗ 缺失（只有分散的 `plan_missing_declared_files` + 内联入口检查） |
+| §7 末条「禁止约束完整性：必须进入 Constraint **并绑定 mechanical check**」 | ✗ 缺失（约束只进提示词，`tkinter` 是标准库 → 内置名单永远抓不到） |
+| §8.4 未声明依赖 | ⚠ 有 `PLAN_UNDECLARED_DEPENDENCY`，但**接不上用户硬约束** |
+| §9 `SKELETON_DESIGN_DRIFT` | ⚠ 功能已由 `planir.skeleton_overreach`（`skeleton_overreach_file/symbol`）覆盖，**只是没叫这个名字** —— 记为等价实现，不改名（改名会破坏既有 fixture） |
+| §16 `reconcile_requirement_claims` | ⚠ 已由 `ontology.reconcile_claims` 覆盖（等价） |
+| §16.3 DERIVED DEFAULT + UI 必须显示「默认假设」 | ✗ 后端有 `contract.derived_facts`，**前端一个字都没显示** |
+| §22.1 证明矩阵**行可展开** | ✗ 缺失（表格是静态的） |
+| §25 Workspace timeline **点 revision 过滤证据** | ✗ 缺失 |
+| §26 **方案 → 编译任务** 对照（merged/split/owner） | ✗ 缺失（`state` 里连 `plan_draft_tasks` 都没登记） |
+| §28 Decision Basis（依据 EV/PO/DEF 可点） | ✗ 只显示了 `decision_id` |
+| §29 Requirements 真值 badge | ✗ 缺失 |
+| §35 日志**搜索 + 高亮**（PO/EV/T-id） | ✗ 只有"自动跟随/只看警告" |
+| §21.2 指标数字**可点击** | ✗ 缺失 |
+| §43.smoke_console 16 项 | ⚠ 只覆盖了一部分 |
+
+### 二、本轮补的 8 项
+
+**① §7 Plan Completeness Gate（统一入口）** —— 新增 `semantics.validate_plan_completeness()`
+（纯函数，四类发现）：`plan_missing_declared_file` / `plan_missing_test_file` /
+`plan_missing_entry` / `plan_constraint_unbound`（warn）。
+- 新增契约字段 `entry_files`：用 `_ENTRY_FILE_RE` 从原文抓 `python main.py`（ASSERTED +
+  `source_quote`），`_planned_paths()` 比对方案 changes。
+- **测试文件单列**（`*_test.py`）：真机上"测试文件从计划里消失"是最难发现的一类，
+  单列后阻断理由直接点名。
+- Design Gate ⑥ 改为消费这个聚合（`kind` 保持 `plan_missing_declared_file` 不变，
+  既有单测与 fixture 无需改）。
+
+**② §7/§8.4 硬约束绑定机械检查**（本轮最有价值的一条）：
+- `semantics._forbidden_module_names()` 机械抽取"禁止依赖的模块"。真机写法三种全认：
+  `禁止 pygame、numpy …`（裸名单）/ `不得出现 import tkinter` / `出现 tkinter 导入即视为不合格`。
+  **防误伤**：`aaa.py` 这类带扩展名的路径不算模块（负向断言 `(?!\s*\.\s*[A-Za-z])`）、
+  `不允许 180 度反向` 不误判、**逐行扫描**（`\s` 会跨行把下一行的文件名当成模块 —— 踩过）。
+- `build_requirement_contract` 在建立时就把 `mechanical_check` 写进每条约束；
+  `constraint_checks()` 供 UI/评审区分「机械检查兜底」vs「只能人工确认」；
+  PM/Architect 提示词里每条约束后面直接标出绑定了什么检查。
+- 三道机械关：`planir.validate_architect_plan(..., forbidden_modules=...)` →
+  `PLAN_FORBIDDEN_DEPENDENCY`（**DEV 之前**就拦）；`verify.forbidden_import_problems()`
+  扫真产物（`tkinter` 这类标准库模块**只有这条**能抓）；`semantics.forbidden_modules()` 供两处共用。
+
+**③ §26 方案 → 编译任务** —— `controlplane._plan_diff_view()`：按**符号集合**确定性对账
+`draft → compiled`，标出 `merged` / `split` / `one_to_one` / `unmapped`，并带文件租约
+（`create_owner` / `modify_tasks`）与 `plan_compiled_reasons`。前端新卡片 `#d-plandiff-card`。
+`runstore` 白名单补登记 `plan_draft_tasks` / `plan_compiled_reasons`。
+
+**④ §22.1 证明矩阵行展开** —— `controlplane._attach_proof_details()` 在**后端**把
+`PO → scenario → 命令 → 退出码/stdout/stderr → Evidence` join 好（前端按 id 自行拼装
+就等于"UI 猜语义"，违反 §32 硬边界）；前端点行展开 `tr.po-detail`。
+
+**⑤ §29 真值 + §16.3 默认假设** —— `controlplane._truth_view()`：`asserted`（逐字来自用户
+原文 + source_quote + mechanical_check）/ `derived`（**默认假设**，来自 Intake，恒 DERIVED）/
+`human`（人工裁决）/ `contradicted`（语义 error）/ `grounding_errors`。前端 `#d-truth-card` +
+`truthBadge()`（四态配色见 §34.2）。**这是"默认假设不得显示成用户要求"的落地**（§44.16 禁止项）。
+
+**⑥ §25 Workspace revision 过滤证据** —— `setEvidenceFilter(rev)`；证据行本就带
+`workspace_revision`，所以过滤是机械的（不是 UI 推理）。点同一版本 = 取消过滤；换运行清空。
+
+**⑦ §28 Decision Basis + §21.2 指标可点** —— 控制塔第一屏增「最终机器裁决」行
+（语义评审**候选** / 机械证据 / Ontology / Workspace ⇒ 判定）+「依据 EV/DEF」可点；
+核心指标数字包成 `a.metric` 点击跳卡片。新增 `scrollToCard()`（导航与数字共用）。
+
+**⑧ §35 日志搜索 + 复制** —— `highlightLog(text, onlyIssues, search)`：搜索 = **过滤 + 高亮**
+（先按原样过滤、再逐段转义后包 `<mark class="hit">` —— 在转义后的 HTML 上做正则会因
+`&`/`<` 错位）；`#log-search` 输入即生效并显示「命中 N 行 / 共 M 行」；`#btn-log-copy` 复制
+当前视图。日志工具栏原有「自动跟随 / 只看警告」保留。
+
+### 三、抓到的**真 bug**：`run_detail` 视图白名单「只摊平一小撮固定键」
+
+症状与危害：`_snapshot()` 把整份 state 嵌在 `"artifacts"` 下；`run_detail` 里**摊平循环只写了
+7 个固定键**，而视图白名单有 50 多个键 —— 于是凡是"只存在于 artifacts 层"的白名单键
+（`requirement_contract` / `test_scenarios` / `plan_draft_tasks` / `constraint_checks` /
+`plan_compiled_reasons` …）**页面与 `/api/runs/<id>` 永远读到空**。
+
+为什么以前没暴露：`implementation_audit` / `patch_audit` / `verify_report` / `rule_findings`
+恰好在那一小撮里，肉眼可见的都是它们；**只有真机 UI 实测**（这次用真实 run 打开页面、
+发现真值卡片一直不显示）才把它照出来。这与 §36 记的"渲染真源错层"是同一类坑的第二次。
+
+修法（治本，不做补丁式列举）：
+- 白名单抽成模块级常量 `runstore._STATE_VIEW_KEYS`（53 键），**摊平与视图共用同一份**
+  ⇒ 新增键登记一次即两处生效，不会再漂移；
+- 摊平改成 `for key in _STATE_VIEW_KEYS: if state.get(key) is None and artifacts.get(key) is not None`。
+
+⚠ 注意：**没有**把 `plan` / `scope` 加进白名单 —— 它们体量大且页面用不到
+（`/api/runs/<id>` 现在已 ~30KB，再加会更糟）。演示脚本要它们时直接读原始 `state.json`。
+
+### 四、实测证据（真机 run `20260930-000332` + 真机需求夹具）
+
+```
+【契约】declared_files = game_logic.py / game_logic_test.py / main.py / ui.py / ui_test.py
+        entry_files    = main.py        forbidden_modules = pygame / numpy / tkinter
+        constraint:02 禁止 pygame、numpy → 机械检查 ['forbidden_import:numpy','forbidden_import:pygame']
+        constraint:03/04 不得（出现）import tkinter → ['forbidden_import:tkinter']
+        constraint:01/05/06 → 机械检查空 = **只能人工确认**（不假装能查）
+
+【Plan Completeness（喂该 run 真实方案 changes=['game_logic.py','ui.py','main.py']）】
+        [block] plan_missing_declared_file: game_logic_test.py、ui_test.py
+        [block] plan_missing_test_file    : game_logic_test.py、ui_test.py
+        [warn ] plan_constraint_unbound   : pygame、numpy（机械检查仍兜底，只提示）
+        ⇒ 阻断 2 条 —— 这正是 §47 要回答的「用户声明的 5 个文件是否全保留」：**否，且被前置拦下**
+
+【TaskCompiler 需求绑定 前→后（同一份 draft，只换口径）】
+        T-01 Snake,Food           旧: FR-01 FR-04 FR-05 → 新: FR-01
+        T-02 Game.score,Game.speed 旧: FR-01 FR-04 FR-05 → 新: FR-04
+        T-03 Game.is_game_over    旧: FR-01 FR-04 FR-05 → 新: FR-05
+        T-04 GameUI               旧: AC-4ece5d FR-01    → 新: AC-4ece5d
+        ⇒ 「同一文件每张图拿到同一批 FR」被彻底消掉
+
+【方案 lint（把用户硬约束接进去）】PLAN_FORBIDDEN_DEPENDENCY 命中（13 block / 0 warn）
+        —— `tkinter` 是标准库，此前**没有任何一条**能抓到它
+
+【same-file owner】机械 blocker（同文件多个整份新建）：无（租约已生效）
+【控制塔】tops 19 键；plan_diff 5 draft → 5 compiled / 3 文件；truth human 2 / contradicted 17
+```
+
+### 五、验证（全绿）
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python -m pytest tests -q          # 204 passed（本轮 +18）
+python -X utf8 tools/smoke_all.py  # 19 套全绿（smoke_console 228 断言）
+node tools/smoke_ui.mjs            # 51/51（真实 Edge headless + CDP，含合成数据渲染路径）
+python -X utf8 tools/check_preflight.py  # 开跑前五步自检（本机当前全 [OK]）
+python tools/check_refs.py         # 81 条引用一致
+python tools/check_lint.py         # 阻断类 0 条
+```
+- 新增单测：`tests/test_constraint_binding.py`（15 条：三种抽取写法 + 五类防误伤 + **作用域**
+  （含 ui.py 不得连坐、传映射不得丢作用域）+ 闸门四类 + lint + verify 检查）、
+  `test_control_plane` +3（详情 join / 真值四态 / 方案对照）。
+- `smoke_ui` 新增 22 条：§34.1 控制条 / §34 导航滚动 / §30 切换 / §22.1 行展开 / §29 四态 /
+  §26 合并 / §27 候选命令分离 / §28 裁决依据 / §35 搜索高亮。
+  **教训**：现有真机 run 全部早于 Phase A–F（没有 `requirement_contract` / PO），
+  所以"有数据时怎么渲染"必须用**合成数据**在浏览器里验一遍 —— 否则要等下一次真机运行才发现面板是空的。
+- `smoke_console` 新增 13 条：卡片存在性 / `.sticky-bar{position:sticky` / 锚点目标真实存在 /
+  指标可点 / 裁决依据 / 无外链脚本（`<script src=` 与 react/vue/jquery/cdn 全不得出现）。
+
+### 六、开跑前拦下的**致命误伤**：禁止模块必须带作用域
+
+准备真机验证时用真实需求做了一遍回归，发现本轮刚加的"禁止模块"检查会**把这次需求判成永久失败**：
+
+需求原文（§2 文件与分层）：
+```
+图形界面用 tkinter（标准库自带，本机已确认可用）。     ← ui.py **必须**用 tkinter 画 Canvas
+**分层是硬性要求**：game_logic.py 中**不得出现 import tkinter**，…。出现 tkinter 导入即视为不合格。
+```
+而 `forbidden_modules()` 返回的是**全局**禁用列表 ⇒ `PLAN_FORBIDDEN_DEPENDENCY` 会连
+`ui.py` / `main.py` 一起判负，`verify.forbidden_import_problems()` 同理 ⇒ 架构师**永远改不对**
+（改对的方式就是用 tkinter），verify 永久 FAILED → 死循环。这正是"机械检查误伤"的典型形态。
+
+修法（三处一起）：
+1. `semantics.forbidden_module_scopes()`：返回 `[{"module","files"}]`（`files` 空 = 全项目），
+   并实现**作用域继承** —— 一条约束点了模块但没点文件时，继承**上一条"点了模块又点了文件"**
+   的作用域（「出现 tkinter 导入即视为不合格」是前一句的补述）。绑定在建立契约时就写进约束
+   （`mechanical_scope`），提示词里渲染成「forbidden_import:tkinter，仅限 `game_logic.py`」
+   —— **不写作用域，架构师会把 ui.py 也避开 tkinter，那就画不出界面**。
+2. `planir.validate_architect_plan(..., forbidden_modules=)`：归一成 `{模块: [文件]}`，
+   只查**作用域内**文件；任务没有文件信息时不判（宁漏不误伤，真产物还有 verify 兜底）。
+   同时**显式支持传映射**（`{模块: 文件}`）—— 传映射时若按"逐个模块名"迭代，拿到的是键，
+   作用域被静默丢掉 ⇒ 退化成全局，正好制造这种误伤（写这条时自己踩了一次）。
+3. `verify.forbidden_import_problems(work, written, forbidden)`：同样按作用域，按 basename 比对。
+
+实测（真实方案的 5 张图，假设每张图都用 tkinter）：
+```
+作用域 = {'numpy': [], 'pygame': [], 'tkinter': ['game_logic.py']}
+判负文件 = ['game_logic.py']      ← 只有它；ui.py / main.py 放行
+```
+新增 4 条单测钉住（含"传映射不得丢作用域"与"pygame 全项目禁止、任何文件碰都判负"）。
+
+**开跑前自检工具** `tools/check_preflight.py`（新增）：五步 —— ①作用域回归探针、
+②在场运行（单驻留）、③配置是否全 qwen + 闸门值、④ollama 可达与三个 tag、
+⑤需求文件与目标目录是否为空（`--project-type new` 会把残留文件当存量代码）。
+当前读数：全部 [OK] —— 无在场运行 / 全 qwen / 三 tag 齐 / `D:\AI\tcs` 为空。
+
+### 七、真机 20260930-132625：**设计闸门被自己的判据 bug 卡死**
+
+这轮真机跑暴露的问题不在模型，而在**闸门判据自己出错**——它把"自己判据的产物"当成方案缺陷，
+于是架构师**无论怎么改都消不掉**，2 次自纠必然耗尽 → 停人工。症状即"重跑一轮又一轮还是不过"。
+
+**先解决的那次**（同 run，13:40）：architect_plan 请求被客户端 600s 超时掐断。ollama 服务端日志
+给出实锤——同一 llama-server 进程内 **prefill 累积退化**：
+
+```
+task 0  prompt eval 532 tok @ 241 t/s          ← 刚加载完，正常
+task 6  progress 0.46 →  40.05s / 38.35 t/s    ← 之后逐档塌陷
+        progress 0.61 →  99.87s / 20.51 t/s
+        progress 0.76 → 183.64s / 13.94 t/s
+        progress 0.91 → 290.58s / 10.57 t/s    （基线 BASELINE_PREFILL=150）
+之后 14B 以 ~16 t/s 生成，2400+ token 时被 REQUEST_TIMEOUT=600 掐断
+```
+本机 14B 在 Vulkan 上可用显存 8.8 GiB / 模型 buffer 8423 MiB，几乎贴边 ⇒ 退化会反复出现。
+处置：重启 ollama（`models\start_ollama.ps1`）+ 抬 `runtime.request_timeout`（600→1800）。
+⚠ 目前 `ollama_client` **只对 500 repeat-abort 重试**，transport 超时**一次都不重试**就中止
+整个阶段；超时恰恰是"重试一次就好"的典型（模型已加载）。**待办：加有界重试**。
+
+**真正卡死的那次**（14:50，Design Gate，18 条阻断）——审计后 13 条是判据 bug：
+
+| 判据 | 条数 | 性质 |
+|---|---|---|
+| `PLAN_INTERFACE_UNKNOWN` | 10 | **8 条误报**：把 **参数名**（`Board(width, height)` 的 width/height、`GameUI.handle_input(event)` 的 event、`Food.generate(board)` 的 board）与**通配前缀**（`TestUI.test_*` 抽出的 `test_`）当成"方案该声明的符号"。2 条真问题（`generate`/`render` 未在 symbols 声明） |
+| `skeleton_overreach_symbol` | 4 | **全误报**：`_skeleton_member_names` 用 `strip()` 把 `class Snake`（缩进 0）与 `    def move()`（缩进 4）混为一谈 ⇒ **类的方法**被当成"骨架私自扩大方案边界"。而方案 symbols 写的是类名，成员名**必然**不在其中 ⇒ **永远消不掉** |
+| `PLAN_CONTRACT_UNKNOWN` | 3 | 2 条 **bug**：`game_logic.py:Game` 被按点号切 ⇒ `py:Game`（"方案里没有定义 py:Game"），而 `Game` 明明在 changes 里；1 条真问题（`ui.py` 的任务引用 `ui_test.py:TestUI.test_render_board`——生产依赖测试，方向反了） |
+| `dependency_cycle` | 1 | 真问题（`depends_on` 成环 T-03↔T-06） |
+
+修法（三处，都在 `planir.py`）：
+1. `_interface_refs()` 取代 `_idents()`：**括号内的标识符一律跳过**（参数位）、**以 `_` 结尾的
+   token 跳过**（通配前缀）；保留裸标识符与成员引用 —— 所以 `Game().start()` 里未声明的 `start`
+   **仍然会被抓**（真问题不能一起放过）。
+2. `_skeleton_symbol()` 保留**缩进**，`skeleton_overreach` **只判缩进 0 的顶层声明**；
+   成员（类的方法）不参与 —— 与 docstring 的原意（"多出的类/模块函数"）对齐。
+3. `_split_ref()` 正确解析 `文件:符号` 写法（有 `:` 先按 `:` 切），修掉假的 `py:Game`。
+
+实测（同一份被卡住的方案）：**18 条 → 5 条**，且 5 条**全是真问题**（lint 3 + 骨架 1 + 依赖环 1）：
+```text
+PLAN_INTERFACE_UNKNOWN | T-02 interface 用到 generate（方案 symbols 缺 Food.generate）
+PLAN_INTERFACE_UNKNOWN | T-03 interface 用到 render  （缺 GameUI.render）
+PLAN_CONTRACT_UNKNOWN  | T-03 contracts.uses 引用 ui_test.py:TestUI.test_render_board
+skeleton_overreach      | ui.py: KeyBinder（骨架多出一个方案未声明的类）
+dependency_cycle        | T-03 → T-06 → T-03
+```
+⇒ 闸门**现在可以靠自纠收敛**了（这 5 条都是架构师改得动的）。
+
+**续跑语义**（真源 `_resume_gate_stage`）：条件闸门停下时会记住"停在哪个闸门"，续跑**先原地
+复核该闸门、不推进任何阶段**；`design_gate_blocked` 存在时 `_design_gate_resume_check()` 会
+**重跑确定性编译链重新判定**（不改方案 ⇒ 原地再停）。所以：
+- 人工改产物 → `--resume`（走复核）；
+- 让架构师重做 → `--from architect_plan --feedback "..."`。
+`_run_architect_plan` 在闸门拦截时**不开轮**（attempt 不增），游标仍推进到 `dev`，
+放行那一刻才 `_begin_round`。
+
+回归测试：`tests/test_plan_lint.py` +7 条（参数名不算符号 / 通配前缀不算符号 / 成员未声明仍判负 /
+`文件:符号` 解析 / 骨架成员不算越权 / 顶层多出的类仍要抓）。全量：**211 单测 + 19 套 smoke 全绿**。
+
+#### 七.1 第二轮真机（同一 run）仍卡死：**成员级判负 + 测试反向依赖**（已修）
+
+打回 `--from architect_plan --feedback "<5 条真问题>"` 后，架构师重做两轮，闸门从 4 → 6 条，
+**仍未放行**。审计第二轮 6 条，又是两类**不可能修的表达**：
+
+| 现象 | 条数 | 为什么无法修 |
+|---|---|---|
+| `PLAN_INTERFACE_UNKNOWN: generate / calculate_score / render` | 3 | 都是 **已声明类的成员**（`Food.generate` 里 `Food` 已在 symbols）。方案 symbols 的惯例是**只列类名**，逐条列方法不是这个模型的输出形态——连续 3 次尝试都没消除 |
+| `PLAN_CONTRACT_UNKNOWN` + `contract_unresolved`：`T-02 uses=game_logic_test.py:TestSnake.test_move` | 3 | 模型**字面**把测试方法写进**生产任务**的 `contracts.uses`。方向不可能成立（测试依赖实现，实现永不依赖测试）；闸门每次都只叫它"改成真实接口"，它就把测试方法改个名字 |
+
+修法（两处，仍在 `planir.py` + 编排层）：
+
+1. **成员级降为 `warn`（新 code `PLAN_INTERFACE_MEMBER_UNKNOWN`）**：`_interface_refs()` 现在返回
+   `{名字: 是不是点号成员}`；**裸顶层名**（`process()`）仍是 `block`。
+   理由：成员是否真实存在，**冻结的接口骨架**才是基准（Plan IR 解析不了时另有
+   `contract_unresolved` 兜底）；对成员判 block = 让方案阶段**永不收敛**。
+   ⇒ `tests/test_replay_fixtures.py` 的 §40 验收项 ③ 与 `fixture_020` 的 expect 同步改口径
+   （并在 fixture description 里写清依据），另加"裸顶层名仍 block"的钉子。
+2. **`strip_test_dependencies(plan)`：机械剔除「生产文件 → 测试文件」的契约引用**。
+   放在 `orchestrator._normalize_and_compile()` **最前** ⇒ Plan IR 与方案 lint 看到同一份
+   清洗后的方案（两处口径不漂）。判定用 `_is_test_path()`（`test_*.py` / `*_test.py` /
+   `tests/`，宁可漏认也不误判生产文件）。被删清单落 `state["plan_contract_pruned"]`，
+   `issues.collect_issues` 新增 kind **`contract_test_dependency`**（warn）——
+   机械能判定的不可能项：**就地归一 + 暴露**，而不是无限返工。
+   实测该 run：剔除 **10 条**，闸门判定全清（unresolved 0 / 越权 0 / 编译错误 0）。
+
+**结果**：原地 `--resume` → `[强控] 设计阻断项已消除 —— 放行进入开发` → **首次真正进入 dev**
+（8 张施工图逐张施工）。全程**没有**再让 14B 重做方案（改判据比改模型便宜且确定）。
+
+#### 七.2 一条被冒烟拦住的配置改动（值得记）
+
+为防 14B prefill 退化再撞超时，我把 `runtime.request_timeout` 从 600 抬到 **1200** ——
+`tools/smoke_recovery.py` 立刻判负：
+
+```
+[FAIL] 单次 HTTP 超时不高于 900s —— 1800s 意味着卡死可静默 30 分钟
+       （调用期间不写产物/追踪/日志，心跳照常 ⇒ 无法区分'在生成'与'已卡死'）
+```
+
+这条不变量有道理（长超时会掩盖僵死），所以**改配置而不是改不变量**：取值收到允许上限 **900**。
+记下来是因为它示范了正确姿势：**冒烟红了先怀疑自己的改动，别先去松断言**。
+
+### 八、仍未做
+
+1. **真机跑一轮**（唯一能见证 Q2/机械场景/P0-12/P0-13 + 本轮 8 项端到端的东西）：
+   需要 ollama（`models\start_ollama.ps1`）+ 目标仓库；命令见 §24.5。
+   ⚠ 前端新面板在**旧 run** 上多数是隐藏态（旧 run 没有契约/PO）——这是设计如此，不是 bug。
+2. 前端仍以 `console.html` 单文件承载全部面板（已 ~4300 行）。建议书禁止引框架，
+   所以它是**有意**的单文件；若继续膨胀，可考虑拆成同一目录下的若干 `.js`（仍是零构建，
+   但 `server.py` 需加静态路由）。
+3. `plan` / `scope` 未进 detail 白名单（有意为之）；若将来有面板需要，取**摘要**而不是整份。

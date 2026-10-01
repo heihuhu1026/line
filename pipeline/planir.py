@@ -36,7 +36,8 @@ import hashlib
 import io
 import json
 import os
-from typing import Any
+from pathlib import PurePosixPath
+from typing import Any, Iterable
 
 from . import ontology
 from . import symbols as symbol_resolver
@@ -754,14 +755,27 @@ def fingerprint(*, prompt_hash: str = "") -> dict:
 
 
 # ---------------------------------------------------------- 骨架越权检测（规格§十三：方案层矛盾）
+def _skeleton_symbol(line: str) -> tuple[str, int]:
+    """骨架一行 → ``(对外符号名, 缩进)``；非定义行返回 ``("", 缩进)``。
+
+    **缩进必须留着**：``class Snake``（缩进 0）是**顶层声明**，``    def move(self)``
+    （缩进 4）是它的**成员**。以前统一 ``strip()`` 把两者混为一谈，于是"类的方法"被当成
+    "骨架私自扩大的方案边界" —— 而方案里写的是类名，方法名**必然**不在其中 ⇒ 只要架构师
+    按类名规划，这条**必然触发**、且重做多少次都消不掉。真机 20260930-132625 的 18 条
+    设计阻断里 4 条正是它，直接把闸门卡死（2 次自纠耗尽 → 停人工）。
+    """
+    raw = str(line)
+    indent = len(raw) - len(raw.lstrip())
+    text = raw.strip()
+    for prefix in ("class ", "def ", "async def "):
+        if text.startswith(prefix):
+            return text[len(prefix):].split("(")[0].strip(), indent
+    return "", indent
+
+
 def _skeleton_member_names(line: str) -> str:
-    """骨架一行（``class X(...)`` / ``def f(...)``）→ 对外符号名；非成员行返回空串。"""
-    text = str(line).strip()
-    if text.startswith("class "):
-        return text[len("class "):].split("(")[0].strip()
-    if text.startswith("def "):
-        return text[len("def "):].split("(")[0].strip()
-    return ""
+    """兼容包装：只要符号名（不再用于越权判定，判据见 :func:`skeleton_overreach`）。"""
+    return _skeleton_symbol(line)[0]
 
 
 def skeleton_overreach(plan: Any, skeleton: Any) -> dict[str, Any]:
@@ -771,8 +785,12 @@ def skeleton_overreach(plan: Any, skeleton: Any) -> dict[str, Any]:
     这边查「骨架多出来」——第二次 LLM 调用不能私自扩大方案边界：
 
       * ``extra_files``：骨架里出现、方案 changes 未规划的文件；
-      * ``extra_symbols``：文件方案已声明非空 symbols 时，骨架多出的类/模块函数
+      * ``extra_symbols``：文件方案已声明非空 symbols 时，骨架多出的**顶层**类/模块函数
         （方案 symbols 为空时骨架是**回填基准**，不算越权，见 _backfill_task_symbols）。
+
+    **只判顶层（缩进 0）**：`class Game` 下面挂的 `def move(...)` 是**类的成员**，属于
+    骨架冻结接口的正当职责，不是"扩大方案边界"。判成员名 ∈ 方案 symbols 必然为假
+    （方案写的是类名），那会让闸门永远不放行 —— 真机踩过，见 `_skeleton_symbol` 的注释。
     """
     plan = plan if isinstance(plan, dict) else {}
     skeleton = skeleton if isinstance(skeleton, dict) else {}
@@ -803,8 +821,11 @@ def skeleton_overreach(plan: Any, skeleton: Any) -> dict[str, Any]:
             continue  # 方案没声明 symbols：骨架是回填源，不判越权
         extras: list[str] = []
         for line in lines or []:
-            name = _skeleton_member_names(line)
-            if name and name not in planned_names:
+            name, indent = _skeleton_symbol(line)
+            # 只判顶层声明：缩进 > 0 的是成员（类的方法），不算越权
+            if not name or indent > 0:
+                continue
+            if name not in planned_names:
                 extras.append(name)
         if extras:
             extra_symbols[path] = extras
@@ -930,6 +951,118 @@ def _idents(text: Any) -> set[str]:
     return out
 
 
+def _interface_refs(text: Any) -> dict[str, bool]:
+    """interface 文本 → ``{标识符: 是不是"点号成员"}``（§8.2 的判据真源）。
+
+    刻意排除两类（真机 20260930-132625 的 10 条 ``PLAN_INTERFACE_UNKNOWN`` 里 8 条是它们）：
+      * **参数位**（括号内）：`Board(width, height)` 的 width/height 是**参数名**，
+        方案 symbols 里本就不该有它们 —— 不排掉就一直判负，且无从修好；
+      * **通配/前缀写法**：`TestUI.test_*` 里的 `test_` 是模式前缀，不是符号名
+        （判据：以 `_` 结尾的 token 一律跳过）。
+
+    **成员与顶层的区别要留住**：调用方据此决定"判负还是只提示" —— 见
+    :func:`validate_architect_plan` 里 §8.2 的一段（成员由**冻结骨架**当基准，
+    方案 symbols 里通常只写类名）。
+    """
+    out: dict[str, bool] = {}
+    depth = 0
+    cur = ""
+    prev_dot = False
+    for ch in str(text or "") + " ":
+        if ch.isalnum() or ch == "_":
+            cur += ch
+            continue
+        if cur:
+            if depth == 0 and not cur.endswith("_") and not cur[0].isdigit() \
+                    and cur not in _STOPWORDS:
+                out[cur] = out.get(cur, False) or prev_dot
+            cur = ""
+        prev_dot = ch == "."
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+    return out
+
+
+def _is_test_path(path: Any) -> bool:
+    """是不是**测试文件**（``test_*.py`` / ``*_test.py`` / ``tests/`` 下）。
+
+    只认最通行的三种命名 —— 宁可漏认也不能把生产文件误判成测试文件
+    （误判会让"生产依赖测试"的清洗反过来吃掉正常契约）。
+    """
+    text = str(path or "").replace("\\", "/")
+    if not text:
+        return False
+    name = text.rsplit("/", 1)[-1]
+    return name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{text}"
+
+
+def strip_test_dependencies(plan: Any) -> list[dict]:
+    """**机械剔除**「生产文件 → 测试文件」的契约引用（§8.3 的不可满足形态）。
+
+    为什么必须由机制做，而不是靠架构师改：真机 20260930-132625 连续 3 次产出
+    ``T-02 的 contracts.uses = ['game_logic_test.py:TestSnake.test_move']`` ——
+    生产模块引用测试方法，方向**不可能**成立（测试依赖实现，实现永不依赖测试）。
+    闸门每次都判 ``PLAN_CONTRACT_UNKNOWN`` / ``contract_unresolved``，模型只会把
+    测试方法改个名字，2 次自纠必然耗尽 ⇒ 整条流水线卡在方案阶段。
+
+    这里把这类引用**删掉**（原地改 ``plan``），并返回被删清单供调用方留痕 ——
+    与既有纪律一致：机械能判定的不可能项，就地归一 + 暴露，而不是无限返工。
+
+    ⚠ 只删「非测试文件 → 测试文件」这一种方向。测试文件引用生产符号、
+    生产文件引用生产符号，一律不动。
+    """
+    dropped: list[dict] = []
+    for task in (plan or {}).get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        owner_files = [str(p) for p in (task.get("target_files") or []) if str(p)]
+        if not owner_files or all(_is_test_path(p) for p in owner_files):
+            continue                      # 测试文件自己的 uses 合法，不动
+        contracts = task.get("contracts")
+        if not isinstance(contracts, dict):
+            continue
+        uses = [str(x) for x in (contracts.get("uses") or []) if str(x or "").strip()]
+        keep: list[str] = []
+        for ref in uses:
+            target = ref.partition(":")[0] or ref.split(".")[0]
+            if _is_test_path(target):
+                dropped.append({
+                    "task": str(task.get("id") or ""),
+                    "files": owner_files,
+                    "ref": ref,
+                    "detail": (f"{task.get('id')}（{'、'.join(owner_files)}）的 contracts.uses "
+                               f"引用了测试文件 {ref} —— 生产代码不得依赖测试，已机械剔除"),
+                })
+                continue
+            keep.append(ref)
+        if len(keep) != len(uses):
+            contracts["uses"] = keep
+    return dropped
+
+
+def _split_ref(ref: Any) -> tuple[str, str]:
+    """把 ``contracts.uses`` 的引用拆成 ``(来源, 符号)``。
+
+    支持架构师实际在用的两种写法：
+      * ``game_logic.py:Game`` —— **文件:符号**（真机最常见）
+      * ``game_logic.SNAKE_BODY_COLOR`` / ``Game.score`` —— 点号路径
+
+    以前只按点号切 ⇒ ``game_logic.py:Game`` 被切成 ``py:Game``，于是报出
+    "方案里没有定义 `py:Game`" 这种**假**阻断（真机 20260930-132625 命中 2 条，
+    而 `Game` 明明就在方案 changes 里）。
+    """
+    text = str(ref or "").strip()
+    if ":" in text:
+        source, _, symbol = text.partition(":")
+        return source.strip(), symbol.strip()
+    parts = [p for p in text.split(".") if p]
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return "", (parts[0] if parts else "")
+
+
 def _declared_symbol_names(plan: Any, skeleton: Any = None) -> tuple[set[str], set[str]]:
     """方案 + 骨架声明过的符号，返回 ``(broad, top_level)`` 两个集合。
 
@@ -980,7 +1113,71 @@ def _declared_symbol_names(plan: Any, skeleton: Any = None) -> tuple[set[str], s
     return broad, top_level
 
 
-def validate_architect_plan(plan: Any, skeleton: Any = None) -> list[dict]:
+def _task_dep_refs(task: dict) -> list[str]:
+    """一张图声明的所有"我用谁"的引用（contracts.uses / deps / 任务级 deps 与 uses）。"""
+    refs: list[str] = []
+    contracts = task.get("contracts") if isinstance(task.get("contracts"), dict) else {}
+    for key in ("uses", "deps"):
+        for raw in contracts.get(key) or []:
+            if str(raw or "").strip():
+                refs.append(str(raw).strip())
+    for key in ("deps", "uses"):
+        value = task.get(key)
+        if isinstance(value, (list, tuple)):
+            refs.extend(str(x).strip() for x in value if str(x or "").strip())
+        elif isinstance(value, str) and value.strip():
+            refs.append(value.strip())
+    return refs
+
+
+def _normalize_forbidden(entries: Any) -> dict[str, list[str]]:
+    """``forbidden_modules`` 归一成 ``{模块: [作用域文件]}``（空列表 = 全项目）。
+
+    接三种形态，向后兼容：
+      * ``"tkinter"`` —— 全项目禁用；
+      * ``{"module": "tkinter", "files": ["game_logic.py"]}`` —— **只在这些文件里**禁用；
+      * ``{"tkinter": ["game_logic.py"]}`` —— 整份映射（``semantics.forbidden_module_scopes``
+        的字典化形态）。**必须显式支持**：传映射时若按"可迭代 = 逐个模块名"处理，
+        拿到的是键（字符串）⇒ 作用域被静默丢掉、退化成全局禁用，正好制造误伤。
+
+    作用域是必需的：真机贪吃蛇需求写的是「`game_logic.py` 中不得出现 import tkinter」，
+    而 `ui.py` **必须**用 tkinter 画 Canvas。全局禁用会把正确方案判成违规 → 架构师
+    无限返工（永远改不对，因为改对的方式就是"ui.py 用 tkinter"）。
+    """
+    if isinstance(entries, dict) and not isinstance(entries, type):
+        entries = [{"module": k, "files": v} for k, v in entries.items()]
+    out: dict[str, list[str]] = {}
+    for entry in entries or ():
+        if isinstance(entry, dict):
+            module = str(entry.get("module") or "").strip()
+            files = [str(f).replace("\\", "/") for f in (entry.get("files") or []) if str(f)]
+        else:
+            module, files = str(entry or "").strip(), []
+        if not module:
+            continue
+        if module not in out:
+            out[module] = files
+        elif not files:
+            out[module] = []           # 任一约束是全项目 ⇒ 取最严
+        elif out[module]:
+            out[module] = sorted(set(out[module]) | set(files))
+    return out
+
+
+def _scope_hit(files: Any, scope: list[str]) -> bool:
+    """任务文件是否落在约束作用域内（空作用域 = 全项目，恒真）。"""
+    if not scope:
+        return True
+    names = {str(f).replace("\\", "/") for f in (files or [])}
+    for item in scope:
+        if item in names or PurePosixPath(item).name in {PurePosixPath(n).name for n in names}:
+            return True
+    return False
+
+
+def validate_architect_plan(
+    plan: Any, skeleton: Any = None, *, forbidden_modules: Iterable[Any] = (),
+) -> list[dict]:
     """方案静态 lint（**纯函数**，零模型）：symbols / interface / contracts 三者互证。
 
     返回 finding 列表，每项 ``{code, task, symbol, severity, detail}``；
@@ -990,16 +1187,50 @@ def validate_architect_plan(plan: Any, skeleton: Any = None) -> list[dict]:
       * ``PLAN_INTERFACE_UNKNOWN``     —— interface 里调用了没声明的符号（§8.2）
       * ``PLAN_CONTRACT_UNKNOWN``      —— contracts.uses 引用了方案里不存在的符号（§8.3）
       * ``PLAN_UNDECLARED_DEPENDENCY`` —— 出现明确禁止的第三方依赖（§8.4）
+      * ``PLAN_FORBIDDEN_DEPENDENCY``  —— 命中**用户硬约束**禁止的模块（§7 禁止约束完整性）
       * ``PLAN_UNRELATED_DEPENDENCY``  —— math/time 这类未必被要求的依赖（§8.5，仅 warn）
+
+    ``forbidden_modules`` 来自 Grounded Requirement Contract 的硬约束
+    （``semantics.forbidden_modules``）。为什么必须由调用方传进来：`tkinter` 是标准库，
+    既不在 `_NON_STDLIB_BLOCK` 也不在 `_WEAK_DEPS` —— 单靠本模块的内置名单**永远抓不到**
+    "game_logic.py 不得 import tkinter" 这类用户约束。
     """
     findings: list[dict] = []
     if not isinstance(plan, dict):
         return findings
+    forbidden = _normalize_forbidden(forbidden_modules)
     declared, top_level = _declared_symbol_names(plan, skeleton)
     for task in plan.get("tasks") or []:
         if not isinstance(task, dict):
             continue
         tid = str(task.get("id") or "")
+        files = [str(p) for p in (task.get("target_files") or []) if str(p)]
+        # ---- §7 禁止约束完整性：命中**用户硬约束**点名的模块 ⇒ 直接阻断。
+        # 与 §8.4 的区别：§8.4 是本模块的内置"非标准库"名单，抓不到 tkinter 这类标准库
+        # 模块；用户说"game_logic.py 不得依赖 tkinter"时，只有这条能抓住。
+        if forbidden:
+            for ref in _task_dep_refs(task):
+                module = ref.split(".")[0].strip()
+                scope = forbidden.get(module)
+                if scope is None:
+                    continue
+                # 作用域：只查约束点名的文件（`game_logic.py` 禁 tkinter 不该连坐 ui.py）。
+                # 任务没有文件信息时不判（宁漏不误伤 —— 真产物还有 verify 那道机械检查兜底）。
+                if not files or not _scope_hit(files, scope):
+                    continue
+                findings.append({
+                    "code": "PLAN_FORBIDDEN_DEPENDENCY",
+                    "task": tid,
+                    "symbol": ref,
+                    "files": files,
+                    "severity": "block",
+                    "detail": (
+                        f"{tid} 依赖 {module}，而用户硬约束明确禁止依赖它"
+                        + (f"（作用域：{'、'.join(scope)}）" if scope else "（全项目禁止）")
+                        + (f"；该任务文件：{'、'.join(files)}" if files else "")
+                        + " —— 请改用允许的实现方式；若确有必要，必须先由人工修改约束"
+                    ),
+                })
         # ---- §8.1 成员写法必须有归属
         for raw in task.get("symbols") or []:
             sym = str(raw or "").strip()
@@ -1015,10 +1246,24 @@ def validate_architect_plan(plan: Any, skeleton: Any = None) -> list[dict]:
         # ---- §8.2 interface 调用了没声明的符号
         interface = str(task.get("interface") or "").strip()
         if interface:
-            for name in sorted(_idents(interface)):
+            for name, is_member in sorted(_interface_refs(interface).items()):
                 # 单字母（`x`/`i`）一律是局部名/参数，不可能是"方案该声明的符号"
-                if len(name) <= 1 or name in _STOPWORDS or name in declared:
+                if len(name) <= 1 or name in declared:
                     continue
+                if is_member:
+                    # **成员**（`Food.generate(board)` 里的 generate）：方案 symbols 里
+                    # 通常只写类名，逐条列方法不是惯例；而"成员是否真实存在"由**冻结的
+                    # 接口骨架**当基准（Plan IR 就按骨架解析，解析不了另有 contract_unresolved
+                    # 兜底）。这里只提示，不阻断 —— 判负会让方案阶段**永不收敛**
+                    # （真机 20260930-132625：这条 3 次尝试都没消除，2 次自纠必然耗尽）。
+                    findings.append({
+                        "code": "PLAN_INTERFACE_MEMBER_UNKNOWN", "task": tid, "symbol": name,
+                        "severity": "warn",
+                        "detail": (f"{tid} 的 interface 用了成员 {name}，但它没在 symbols 里"
+                                   "逐条声明；接口基准以骨架为准（仅提示）"),
+                    })
+                    continue
+                # **裸标识符**（`Game()` / `process()`）才是"方案该声明却没有"的真问题
                 findings.append({
                     "code": "PLAN_INTERFACE_UNKNOWN", "task": tid, "symbol": name,
                     "severity": "block",
@@ -1030,8 +1275,8 @@ def validate_architect_plan(plan: Any, skeleton: Any = None) -> list[dict]:
             ref = str(raw or "").strip()
             if not ref:
                 continue
-            module = ref.split(".")[0].strip()
-            symbol = ref.split(".")[-1].strip()
+            module = ref.split(".")[0].split(":")[0].strip()
+            symbol = _split_ref(ref)[1]
             if module in _NON_STDLIB_BLOCK:
                 findings.append({
                     "code": "PLAN_UNDECLARED_DEPENDENCY", "task": tid, "symbol": ref,

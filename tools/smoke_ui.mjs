@@ -434,6 +434,206 @@ async function run() {
       skip("没有作业，跳过作业页断言");
     }
 
+    // ---- §30/§34/§22.1/§29/§25/§35：本轮新增的前端能力（真实渲染 + 真实交互）
+    // 上面几节可能打开了别的运行（带红线的那个）——先切回来，断言才有确定对象
+    await evalJs(`openRun(${JSON.stringify(runId)})`);
+    await sleep(1500);
+    check(await evalJs("!!$('d-sticky') && !$('d-sticky').hidden"), "§34.1 固定控制条已渲染");
+    check(await evalJs(`$('d-sticky-id').innerText === ${JSON.stringify(runId)}`),
+      "§34.1 固定控制条显示当前运行 ID", await evalJs("$('d-sticky-id').innerText"));
+    check(await evalJs("!!$('d-sticky-gate') && $('d-sticky-gate').innerText.length > 0"),
+      "§34.1 固定控制条显示闸门与机器放行结论",
+      (await evalJs("$('d-sticky-gate').innerText")).slice(0, 60));
+    const navN = await evalJs("document.querySelectorAll('#d-anchor-nav button').length");
+    check(navN >= 7, "§34 固定导航按钮齐备", `${navN} 个`);
+    // 点一个导航按钮：不能抛错，且滚动位置应发生变化（锚点真的有效）
+    const beforeY = await evalJs("window.scrollY");
+    await evalJs("document.querySelector('#d-anchor-nav button[data-goto=\"d-stages-card\"]').click()");
+    await sleep(500);
+    check(true, "§34 点击导航按钮不抛异常");
+    check(await evalJs("window.scrollY") !== beforeY || beforeY === 0,
+      "§34 导航触发滚动（锚点生效）");
+    // §30 阶段图 / 证明链切换
+    await evalJs("setGraphView('proof')");
+    await sleep(300);
+    check(await evalJs("$('d-proof-chain').hidden === false"), "§30 切换到证明链：链条容器可见");
+    check(await evalJs("[...document.querySelectorAll('#d-graph-card .graph-wrap')].every(el=>el.hidden)"),
+      "§30 切换到证明链：阶段图隐藏");
+    const chainText = await evalJs("$('d-proof-chain').innerText");
+    check(/需求/.test(chainText) && /证明义务/.test(chainText) && /裁决/.test(chainText),
+      "§30 证明链含 需求→证明义务→…→裁决", chainText.replace(/\n/g, " ").slice(0, 80));
+    await evalJs("setGraphView('stage')");
+    await sleep(300);
+    check(await evalJs("$('d-proof-chain').hidden === true"), "§30 切回阶段流程");
+    // §22.1 证明矩阵行展开（有 PO 才验）
+    const poN = await evalJs("document.querySelectorAll('#d-proof-body tr.po-row').length");
+    if (poN) {
+      await evalJs("document.querySelector('#d-proof-body tr.po-row').click()");
+      await sleep(200);
+      const det = await evalJs(
+        "(()=>{const r=document.querySelector('#d-proof-body tr.po-row').nextElementSibling;"
+        + "return r && !r.hidden ? r.innerText : ''})()");
+      check(/Claim/.test(det) && /Scenario/.test(det) && /Workspace/.test(det),
+        "§22.1 点 PO 行展开证据明细（Claim/Scenario/Workspace）", det.replace(/\n/g, " ").slice(0, 70));
+      await evalJs("document.querySelector('#d-proof-body tr.po-row').click()");
+      check(await evalJs(
+        "document.querySelector('#d-proof-body tr.po-row').nextElementSibling.hidden === true"),
+        "§22.1 再点收起");
+    } else {
+      skip("该运行没有 required PO 行，跳过证明矩阵展开断言");
+    }
+    // §29 真值卡片：**有契约才显示**（mock 不建契约 ⇒ 正确行为是隐藏，不该判失败）
+    const cpNow = (await fetchJson(`/api/runs/${encodeURIComponent(runId)}`)).control_plane || {};
+    const truthData = cpNow.truth || {};
+    const truthRows = (truthData.asserted || []).length + (truthData.derived || []).length;
+    if (truthRows) {
+      check(await evalJs("!$('d-truth-card').hidden"),
+        "§29 需求真值卡片已渲染（用户原文 / 默认假设分开）",
+        (await evalJs("$('d-truth-note').innerText")).slice(0, 60));
+      const bodies = await evalJs("$('d-truth-body').innerText");
+      if ((truthData.derived || []).length) {
+        check(/默认假设/.test(bodies), "§29 默认假设被显式标为「默认假设」（不是用户要求）");
+      }
+    } else {
+      check(await evalJs("$('d-truth-card').hidden") === true,
+        "§29 没有契约时不渲染空真值卡片（不臆造）");
+    }
+    // §26 方案 → 编译任务：同样只在该运行真有 draft/compiled 时验
+    const diff = cpNow.plan_diff || {};
+    if ((diff.draft || []).length || (diff.compiled || []).length) {
+      check(await evalJs("!$('d-plandiff-card').hidden"), "§26 方案→编译任务 对照卡片已渲染",
+        (await evalJs("$('d-plandiff-note').innerText")).slice(0, 60));
+    } else {
+      check(await evalJs("$('d-plandiff-card').hidden") === true,
+        "§26 没有方案数据时不渲染空对照卡片");
+    }
+    // §35 日志搜索：输入后必须给出命中行数，且命中被高亮
+    await evalJs("$('log-search').value='dev';$('log-search').dispatchEvent(new Event('input'))");
+    await sleep(400);
+    const note = await evalJs("$('log-search-note').innerText");
+    check(/命中 \d+ 行/.test(note), "§35 日志搜索结果计数", note);
+    check(await evalJs("document.querySelectorAll('#d-log mark.hit').length > 0"),
+      "§35 日志命中被高亮");
+    await evalJs("$('log-search').value='';$('log-search').dispatchEvent(new Event('input'))");
+    await sleep(300);
+    check(await evalJs("document.querySelectorAll('#d-log mark.hit').length === 0"),
+      "§35 清空搜索后高亮消失");
+    // §25 Workspace revision 过滤证据链
+    const wsN = await evalJs("document.querySelectorAll('#d-workspace-body .ws-row').length");
+    if (wsN) {
+      await evalJs("document.querySelector('#d-workspace-body .ws-row').click()");
+      await sleep(300);
+      check(await evalJs("/只显示/.test($('d-evidence-filter').innerText)"),
+        "§25 点 revision 后证据链进入过滤态", await evalJs("$('d-evidence-filter').innerText"));
+      await evalJs("$('btn-ev-clear').click()");
+      await sleep(300);
+      check(await evalJs("$('d-evidence-filter').innerText === ''"), "§25 可清除过滤");
+    } else {
+      skip("该运行没有 workspace 链，跳过 revision 过滤断言");
+    }
+
+    // ---- 合成数据渲染路径：现有真机 run 都早于 Phase A–F（没有 requirement_contract /
+    // proof_gate.obligations），所以"有数据时怎么渲染"必须用**后端真实形状**的数据在
+    // 真实浏览器里验一遍 —— 否则要等下一次真机运行才发现面板是空的。
+    const synthetic = {
+      release_gate: {status: "UNPROVEN", can_pass: false, semantic_verdict: "pass",
+                     proof_status: "UNPROVEN", ontology_status: "VALID",
+                     workspace_status: "VERIFIED", verified_revision: "ws-006",
+                     decision_id: "dec-1", blocking_reasons: ["缺 2 个 required PO"]},
+      proof_summary: {required: 3, covered: 1, failed: 1, unproven: 1, weak: 0,
+                      unexecutable: 0},
+      proofs: [{
+        id: "po:FR-04", status: "UNPROVEN", requirement: "req:FR-04",
+        claim: "吃到食物后得分 +10", kind: "behavior", task: "T-02",
+        scenario: "tscn:x", evidence: [], workspace_revision: "",
+        required: true, scenario_detail: {}, command_details: [], evidence_detail: [],
+      }],
+      evidence_summary: {total: 0, stale: 0, by_kind: {}},
+      evidence: [], ontology: {status: "VALID", errors: [], error_count: 0,
+                               revision: "onto-1", requirement_count: 8},
+      workspace: {verified_revision: "ws-006", status: "VERIFIED",
+                  chain: [{revision: "ws-006", task: "T-02", status: "VERIFIED"}]},
+      tasks: [{id: "T-01", semantic_task_id: "stask:1", task_revision: 1,
+               target_files: ["game_logic.py"], symbols: ["Snake"], creates_file: true,
+               implements_requirements: ["req:FR-01"], candidate_requirement_ids: []}],
+      test: {required: 3, covered: 1, weak: 0, missing: 1, unexecutable: 1,
+             unbound_commands: [{command: "python main.py", candidate: "po:ctr",
+                                 reason: "该 PO 由就地机械检查器证明"}],
+             unsafe_commands: [], verification_modes: {mechanical: ["po:ctr"],
+                                                       gui_smoke: ["po:ui"]},
+             external_required: ["po:ui"], coverage_gap: ["po:FR-04"],
+             scenarios: [{id: "tscn:x", target_po: "po:FR-04", kind: "behavior",
+                          title: "得分", status: "unproven", gap_reason: "没有可执行命令",
+                          verification_mode: "unit", mechanical_check: [],
+                          commands: [], assertions: []}]},
+      plan_diff: {
+        draft: [{id: "T-01", side: "draft", files: ["game_logic.py"], symbols: ["Snake"],
+                 creates_file: false, task_revision: null, supersedes: [],
+                 requirements: [], candidates: []},
+                {id: "T-02", side: "draft", files: ["game_logic.py"],
+                 symbols: ["Game.score"], creates_file: false, task_revision: null,
+                 supersedes: [], requirements: [], candidates: []}],
+        compiled: [{id: "T-01", side: "compiled", files: ["game_logic.py"],
+                    symbols: ["Snake", "Game.score"], creates_file: true,
+                    task_revision: 1, supersedes: [], requirements: [], candidates: []}],
+        files: [{file: "game_logic.py", draft_ids: ["T-01", "T-02"],
+                 compiled_ids: ["T-01"], symbols: ["Snake", "Game.score"],
+                 creates_file: true, create_owner: "T-01", modify_tasks: [],
+                 kind: "merged"}],
+        reasons: ["架构师把同文件拆成多张图"],
+      },
+      truth: {
+        asserted: [
+          {bucket: "declared_files", label: "用户声明文件", text: "game_logic.py",
+           truth: "ASSERTED", source_quote: "game_logic.py", mechanical_check: []},
+          {bucket: "hard_constraints", label: "硬约束",
+           text: "游戏逻辑不得依赖 tkinter", truth: "ASSERTED",
+           source_quote: "不得依赖 tkinter", mechanical_check: ["forbidden_import:tkinter"]},
+        ],
+        derived: [{text: "目标用户为终端玩家", source: "intake", truth: "DERIVED"}],
+        human: [{scope: "pm", decision: "采用建议答案", subject: "q1"}],
+        contradicted: [{code: "PLAN_FORBIDDEN_DEPENDENCY", object: "T-01",
+                        message: "T-01 依赖 tkinter"}],
+        grounding_errors: [{code: "ASSERTED_WITHOUT_QUOTE", detail: "x"}],
+        constraint_checks: [], version: 1,
+      },
+      decision: {verdict: "rework_dev", can_pass: false, decision_id: "dec-1",
+                 evidence_ids: ["ev:17"], defect_ids: ["def:1"],
+                 semantic_review_is_candidate_only: true},
+      issues: {}, next_action: {text: "缺 2 个 required PO → 去 Test 阶段补测试",
+                                route: "test"},
+    };
+    await evalJs(`(()=>{const d={run_id:'synthetic-ui-check',state:{status:'done'},
+      control_plane:${JSON.stringify(synthetic)}};S.detail=d;renderControlPlane(d);return true})()`);
+    await sleep(400);
+    check(await evalJs("!$('d-truth-card').hidden"), "§29 有契约时真值卡片渲染出来");
+    const tBody = await evalJs("$('d-truth-body').innerText");
+    check(/默认假设/.test(tBody) && /用户原文/.test(tBody) && /人工确认/.test(tBody)
+          && /forbidden_import:tkinter/.test(tBody),
+      "§29 四态 + 机械检查绑定都渲染（默认假设 ≠ 用户原文）",
+      tBody.replace(/\s+/g, " ").slice(0, 90));
+    check(await evalJs("!$('d-plandiff-card').hidden") && /合并/.test(
+      await evalJs("$('d-plandiff-body').innerText")),
+      "§26 多张 draft 合成一张 ⇒ 显示「合并」");
+    check(/架构师 2 张 → 编译器 1 张/.test(await evalJs("$('d-plandiff-note').innerText")),
+      "§26 对照卡片给出前后张数",
+      await evalJs("$('d-plandiff-note').innerText"));
+    check(/GUI 冒烟/.test(await evalJs("$('d-test-body').innerText"))
+          && /LLM 候选命令（编译器不认，未执行）/.test(await evalJs("$('d-test-body').innerText")),
+      "§27 验证方式分类 + 候选命令分离都渲染");
+    check(/最终机器裁决/.test(await evalJs("$('d-ctl-next').innerText"))
+          && /依据/.test(await evalJs("$('d-ctl-next').innerText")),
+      "§28 最终机器裁决 + 依据渲染",
+      (await evalJs("$('d-ctl-next').innerText")).replace(/\s+/g, " ").slice(0, 80));
+    await evalJs("setGraphView('proof')");
+    await sleep(250);
+    check(/需求 8/.test(await evalJs("$('d-proof-chain').innerText")),
+      "§30 证明链取到需求条数（Requirement → PO …）",
+      (await evalJs("$('d-proof-chain').innerText")).replace(/\s+/g, " ").slice(0, 90));
+    await evalJs("setGraphView('stage')");
+    await evalJs(`openRun(${JSON.stringify(runId)})`);
+    await sleep(1200);
+
     check(problems.length === 0, "页面无 console.error / 未捕获异常", problems.slice(0, 3).join(" | "));
 
     if (process.env.SHOT) {

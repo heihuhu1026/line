@@ -71,6 +71,9 @@ CALL_FIELDS: tuple[str, ...] = (
     # 回答「review 为什么慢、是哪一轮、哪套 ontology/compiler、输入了哪个 artifact」。
     # 旧记录与不适用行一律为 null（normalize 补列，读旧 jsonl 安全）。
     "artifact_id", "ontology_revision", "task_semantic_id",
+    # §37 语义上下文：这一轮模型面对的语义图规模（义务数 / 证据数）。有它，
+    # "这轮 review 为什么 context 这么大"不必再翻 state.json 反推。
+    "proof_obligation_count", "evidence_count",
     # 模型与本次调度
     "tag", "role", "attempt", "num_ctx", "think", "prompt_version",
     "switched", "resident_before",
@@ -650,6 +653,79 @@ def list_runs(runs_dir: Path) -> list[dict]:
     return rows
 
 
+#: ``run_detail`` 视图的**白名单真源**。两份用途共用这一份清单：
+#:   ① 摊平：``_snapshot()`` 把整份 state 嵌在 ``"artifacts"`` 下，凡白名单里的键若只在
+#:      artifacts 层，就从那里搬到顶层（否则"页面一片干净"—— 真机踩过两次）；
+#:   ② 视图：只回这些键，避免把任意 state 泄漏到页面。
+#: 刻意做成模块级常量：以前摊平写一小撮固定键、视图另写一份大清单，
+#: 结果新键登记进视图却漏了摊平 ⇒ 白名单里那些键**永远读不到**（2026-09-30 UI 实测抓到）。
+_STATE_VIEW_KEYS: tuple[str, ...] = (
+    "status",
+    "verdict",
+    "cursor",
+    "paused_after",
+    "attempt",
+    "review_every",
+    "max_rework",
+    "needs_human",
+    "pause_after",
+    "initial_pause_after",
+    "fixes",
+    "rounds",
+    "human_feedback",
+    "human_actions",
+    "intake_decisions",
+    "pm_decisions",
+    "implementation_audit",
+    "patch_audit",
+    "verify_report",
+    "rule_findings",
+    "refuted_blockers",
+    "duplicate_stage_seqs",
+    "rule_load_notes",
+    "grounding_warnings",
+    "pruned_patches",
+    "defect_verdicts",
+    "elapsed_s",
+    "model_switches",
+    "repo",
+    # 项目类型必须透出：二开与新建项目是两套提示词/两套流程，
+    # 页面与汇总若不区分，跨运行对比时问题增减无法归因。
+    "project_type",
+    "mode",
+    "mock",
+    "requirement",
+    # ---- 交付控制塔（P1 §32）需要的机械结论键
+    "ontology",                      # 语义图（Evidence / PO / Decision 的来源）
+    "ontology_problems_structured",  # 语义完整性 error 明细
+    "ontology_revision",
+    "ontology_design_problems",
+    "proof_gate",                    # Proof Gate 结论（PO 状态与命令归属）
+    "release_gate",                  # 放行裁决（can_pass / next_action）
+    "workspace_chain",
+    # ---- Phase A–F 新增的机械信号
+    "requirement_contract",
+    "plan_file_owners",
+    "symbol_collisions",
+    "plan_lint_warnings",
+    "plan_compiled_tasks",
+    # §26 方案 → 编译任务 对照：架构师原图与编译器口径偏差必须能被页面看到
+    "plan_draft_tasks",
+    "plan_compiled_reasons",
+    "defect_ledger",
+    "defect_task_resolution",
+    # ---- P0-13 / §27：TestCompiler 的编译产物（验证方式分类 + LLM 候选
+    # vs Compiler 最终命令的区分都靠它）
+    "test_scenarios",
+    "test_scenario_audit",
+    # ---- §7/§29：硬约束的机械检查绑定 + 方案完整性警告
+    "constraint_checks",
+    "plan_completeness_warnings",
+    # 方案期机械清洗留痕（被剔除的"生产依赖测试"契约引用）
+    "plan_contract_pruned",
+)
+
+
 def run_detail(run_dir: Path) -> dict:
     """操作页面用：单次运行的完整视图。"""
     run_dir = Path(run_dir)
@@ -661,15 +737,14 @@ def run_detail(run_dir: Path) -> dict:
     # 真机校准 20260926-205505 就是这么抓到的：日志 `[红线] 阻断 0 条 / 提示 5 条`，
     # 页面与账本全是 0。消费侧另有 `artifact_view`（给 gateway/issues 这类直接吃快照的地方）。
     artifacts = state.get("artifacts") or {}
-    for key in (
-        "implementation_audit", "patch_audit",
-        # verify_report 在真实快照里通常是顶层键，但补丁产物形态不一时也可能只在 artifacts
-        # 里（合成/旧数据）—— 摊平一次是无害的幂等操作
-        "verify_report",
-        # 本轮新增的机械信号：红线 / 被证伪项 / 两代混存 / 规则库加载问题
-        "rule_findings", "refuted_blockers", "duplicate_stage_seqs", "rule_load_notes",
-    ):
-        if key not in state and artifacts.get(key):
+    # ⚠ 这里**必须用白名单驱动摊平**：_snapshot() 把整份 state 嵌在 `"artifacts"` 下，
+    # 而下面 return 里的视图是白名单。以前只摊平一小撮固定键 ⇒ 白名单里其余键
+    # （requirement_contract / test_scenarios / plan_draft_tasks / constraint_checks …）
+    # 在真实快照里**永远读不到** —— 症状是"流水线写了、日志也打了、页面却是空的"，
+    # 而且只有真机才暴露（UI 实测 2026-09-30 抓到：控制塔真值卡片一直不显示）。
+    # 用白名单本身驱动，既不会漏，也不会把任意 state 泄漏到页面。
+    for key in _STATE_VIEW_KEYS:
+        if state.get(key) is None and artifacts.get(key) is not None:
             state[key] = artifacts[key]
     snaps = stage_snapshots(run_dir)
     artifacts = {s["stage"]: s["artifact"] for s in snaps if s["artifact"] is not None}
@@ -683,67 +758,8 @@ def run_detail(run_dir: Path) -> dict:
     )
     return {
         "run_id": run_dir.name,
-        "state": {
-            key: state.get(key)
-            for key in (
-                "status",
-                "verdict",
-                "cursor",
-                "paused_after",
-                "attempt",
-                "review_every",
-                "max_rework",
-                "needs_human",
-                "pause_after",
-                "initial_pause_after",
-                "fixes",
-                "rounds",
-                "human_feedback",
-                "human_actions",
-                "intake_decisions",
-                "pm_decisions",
-                "implementation_audit",
-                "patch_audit",
-                "verify_report",
-                # ⚠ 这份视图是**白名单**：上面摊平过的键必须在这里登记，否则等于白摊
-                # （页面会"一片干净"，而日志/账本里明明有 —— 真机校准踩过）。
-                "rule_findings",
-                "refuted_blockers",
-                "duplicate_stage_seqs",
-                "rule_load_notes",
-                "grounding_warnings",
-                # 本轮新增的两项**必须登记**（否则页面/接口读不到，等于白摊）：
-                # 「被移除的定位失败补丁」与「逐项验收」—— 后者是人工最终审核要的主表。
-                "pruned_patches",
-                "defect_verdicts",
-                "elapsed_s",
-                "model_switches",
-                "repo",
-                # 项目类型必须透出：二开与新建项目是两套提示词/两套流程，
-                # 页面与汇总若不区分，跨运行对比时问题增减无法归因。
-                "project_type",
-                "mode",
-                "mock",
-                "requirement",
-                # ---- 交付控制塔（P1 §32）需要的机械结论键：**必须登记**否则页面一片干净
-                # （视图是白名单，上面摊平过的键不登记等于白摊 —— 真机校准踩过）
-                "ontology",                      # 语义图（Evidence / PO / Decision 的来源）
-                "ontology_problems_structured",  # 语义完整性 error 明细
-                "ontology_revision",
-                "ontology_design_problems",
-                "proof_gate",                    # Proof Gate 结论（PO 状态与命令归属）
-                "release_gate",                  # 放行裁决（can_pass / next_action）
-                "workspace_chain",
-                # ---- 本轮（Phase A–F）新增的机械信号
-                "requirement_contract",
-                "plan_file_owners",
-                "symbol_collisions",
-                "plan_lint_warnings",
-                "plan_compiled_tasks",
-                "defect_ledger",
-                "defect_task_resolution",
-            )
-        },
+        # 白名单真源见模块级 _STATE_VIEW_KEYS（摊平与视图共用一份 ⇒ 不会两处漂移）
+        "state": {key: state.get(key) for key in _STATE_VIEW_KEYS},
         "requirement": requirement,
         "summary": summary,
         "artifacts": artifacts,

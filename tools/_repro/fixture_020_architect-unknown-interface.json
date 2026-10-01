@@ -4,7 +4,7 @@
   "derived_from": [
     "04-architect_plan.json"
   ],
-  "description": "真机形态：T-02 的 interface 写了 Game().start()，但方案/骨架里根本没有 start。必须在 DEV 之前被判出（§8.2）。",
+  "description": "真机形态：T-02 的 interface 写了 Game().start()，但方案/骨架里根本没有 start。必须在 DEV 之前被判出（§8.2）。⚠ 口径已按证据修订：`start` 是**已声明类 Game 的成员**，方案 symbols 里通常只写类名、不逐条列方法，成员是否真实存在由**冻结的接口骨架**当基准（Plan IR 解析不了时会报 contract_unresolved）。若仍按 block 判负，方案阶段永不收敛（真机 20260930-132625：这类成员级判负连续 3 次尝试都没消除，2 次自纠必然耗尽）。⇒ 成员级降为 warn，**裸**顶层名（如 process()）仍为 block。",
   "input": {
     "plan": {
       "changes": [
@@ -27,8 +27,8 @@
     }
   },
   "expect": {
-    "code": "PLAN_INTERFACE_UNKNOWN",
+    "code": "PLAN_INTERFACE_MEMBER_UNKNOWN",
     "symbol": "start",
-    "severity": "block"
+    "severity": "warn"
   }
 }

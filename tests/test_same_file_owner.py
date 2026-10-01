@@ -81,3 +81,79 @@ def test_different_files_each_get_own_owner() -> None:
     owners = tc.file_owner_map(tasks)
     assert owners["game_logic.py"]["create_owner"] == "T-01"
     assert owners["ui.py"]["create_owner"] == "T-02"
+
+
+# ---------------------------------------------------------------- DEV 侧租约执法
+def _bare_orchestrator(attempt: int = 3):
+    """不跑 __init__ 的裸实例：这两个方法只用 state/attempt/client 三个东西。"""
+    from pipeline.orchestrator import Orchestrator
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.state = {}
+    orch.attempt = attempt
+    orch.client = object()  # 不是 MockClient ⇒ 走真实执法分支
+    return orch
+
+
+def _whole_file_add(path: str, symbol: str) -> dict:
+    return {"path": path, "change_type": "add", "target_symbol": symbol,
+            "patch": "x = 1\n"}
+
+
+def test_enforce_file_lease_drops_non_owner_add_with_named_code() -> None:
+    """非 owner 的整份 add 被丢弃，且留下**具名**判据（不是一句人话）。"""
+    orch = _bare_orchestrator(attempt=3)
+    data = {"edits": [_whole_file_add("game_logic.py", "game_logic")]}
+    violations = orch._enforce_file_lease({"id": "T-02"}, data, {"game_logic.py": "T-01"})
+    assert len(violations) == 1 and "创建租约属于 T-01" in violations[0]
+    assert data["edits"] == [], "越权的整份 add 没有被机械丢弃"
+    rec = orch.state["file_lease_violations"][0]
+    assert rec["code"] == "SAME_FILE_MULTI_ADD"
+    assert (rec["task"], rec["path"], rec["owner"], rec["round"]) == \
+        ("T-02", "game_logic.py", "T-01", 3)
+
+
+def test_enforce_file_lease_keeps_owner_and_symbol_scoped_add() -> None:
+    """owner 自己的整份 add、以及非 owner 的**定点**符号 add 都必须放行。"""
+    orch = _bare_orchestrator()
+    owner_data = {"edits": [_whole_file_add("game_logic.py", "game_logic")]}
+    assert orch._enforce_file_lease({"id": "T-01"}, owner_data,
+                                    {"game_logic.py": "T-01"}) == []
+    assert len(owner_data["edits"]) == 1
+    scoped = {"edits": [_whole_file_add("game_logic.py", "Food")]}
+    assert orch._enforce_file_lease({"id": "T-02"}, scoped,
+                                    {"game_logic.py": "T-01"}) == []
+    assert len(scoped["edits"]) == 1
+
+
+def test_lease_violation_becomes_named_mechanical_blocker() -> None:
+    """被丢弃的正文不能静默：本轮越权必须成为具名机械阻断（评审 pass 也改判）。"""
+    orch = _bare_orchestrator(attempt=3)
+    orch._enforce_file_lease({"id": "T-02"},
+                             {"edits": [_whole_file_add("game_logic.py", "game_logic")]},
+                             {"game_logic.py": "T-01"})
+    blockers = orch._lease_blockers()
+    assert len(blockers) == 1 and blockers[0].startswith("SAME_FILE_MULTI_ADD")
+
+
+def test_stale_lease_violation_does_not_block_next_round() -> None:
+    """上一轮的越权随轮次结束失效 —— 否则每轮 dev 都被陈旧记录判负、永久空转。"""
+    orch = _bare_orchestrator(attempt=3)
+    orch._enforce_file_lease({"id": "T-02"},
+                             {"edits": [_whole_file_add("game_logic.py", "game_logic")]},
+                             {"game_logic.py": "T-01"})
+    orch.attempt = 4  # 进入下一轮
+    assert orch._lease_blockers() == []
+
+
+def test_lease_blocker_dedupes_repeat_enforcement() -> None:
+    """同一任务首版 + 重问两次执法留下等价记录 ⇒ 只报一条阻断。"""
+    orch = _bare_orchestrator(attempt=3)
+    owner_map = {"game_logic.py": "T-01"}
+    for _ in range(2):
+        orch._enforce_file_lease(
+            {"id": "T-02"},
+            {"edits": [_whole_file_add("game_logic.py", "game_logic")]},
+            owner_map,
+        )
+    assert len(orch._lease_blockers()) == 1

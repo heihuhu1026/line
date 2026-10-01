@@ -487,10 +487,20 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
     # 不能只依赖模型自己在 coverage_gaps 里诚实申报。
     test_audit = artifacts.get("test_audit") or {}
     if test_audit.get("missing_types"):
+        expected = [str(t) for t in (test_audit.get("expected_types") or [])]
         add(
             "test_gap", "test", "warn", "system",
-            f"测试缺少用例类型：{', '.join(str(t) for t in test_audit['missing_types'])}",
-            "编排器机械核对 cases[].type：new / regression / compat 三类缺一不可",
+            f"测试缺少必需用例类型：{', '.join(str(t) for t in test_audit['missing_types'])}",
+            "编排器机械核对 cases[].type：本轮必需类别"
+            + (f"（{' / '.join(expected)}）" if expected else "")
+            + "按任务类型聚焦，缺失即视为测试不完整",
+        )
+    if test_audit.get("suggested_missing"):
+        add(
+            "test_gap", "test", "info", "system",
+            "测试缺少建议补充的用例类别："
+            + ", ".join(str(t) for t in test_audit["suggested_missing"]),
+            "提示级（不判负）：确有兼容面 / 接口契约面时补上更稳，不必为凑类别编造用例",
         )
     if test_audit.get("vague_count"):
         add(
@@ -661,6 +671,15 @@ def collect_issues(state: dict | None, run_id: str = "") -> list[Issue]:
             criterion="加载问题清单为空，才算规则全部生效",
             blind="规则文件是数据，写错不会报错，只会静默少一条检查",
         )
+
+    # 6.5) 方案期的**机械清洗**：被剔除的"生产文件依赖测试文件"契约引用。
+    # 这类引用方向不可能（测试依赖实现，实现永不依赖测试），机制就地剔除并留痕；
+    # 必须是 warn 而不是 blocker —— 它已经被修好了，只是要让人知道模型又写了这种引用。
+    for item in artifacts.get("plan_contract_pruned") or []:
+        add("contract_test_dependency", "architect_plan", "warn", "compiler",
+            f"{item.get('task')} 的契约引用了测试文件 {item.get('ref')}（已机械剔除）",
+            item.get("detail") or "",
+            ref=item.get("ref"), files=item.get("files"))
 
     # 6) 触顶
     if state.get("needs_human"):

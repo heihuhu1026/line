@@ -151,12 +151,23 @@ def test_snake_same_file_has_single_owner() -> None:
 
 
 def test_snake_unknown_interface_caught_before_dev() -> None:
-    """③ Game().start() 若未定义，必须在 DEV 前被识别。"""
+    """③ `Game().start()` 若未定义，必须在 DEV 前被识别。
+
+    口径已按证据修订（见 fixture_020 的 description）：`start` 是**已声明类 Game 的成员**，
+    识别强度是 **warn**（可见、进问题记录），不再 block —— 成员是否真存在由冻结的接口
+    骨架 + Plan IR 的 `contract_unresolved` 兜底；而**裸**顶层名未声明仍是 block。
+    """
     plan = {
         "changes": [{"path": "game_logic.py", "symbols": ["Game", "Snake"]}],
         "tasks": [{"id": "T-02", "symbols": ["Game"], "interface": "Game().start()"}],
     }
-    codes = [f["code"] for f in planir.validate_architect_plan(plan)]
+    findings = planir.validate_architect_plan(plan)
+    hit = next(f for f in findings if f["symbol"] == "start")
+    assert hit["code"] == "PLAN_INTERFACE_MEMBER_UNKNOWN" and hit["severity"] == "warn"
+    # 裸顶层名（无归属）仍然必须在 DEV 前阻断
+    bare = {"changes": [{"path": "game_logic.py", "symbols": ["Game"]}],
+            "tasks": [{"id": "T-09", "symbols": ["Game"], "interface": "build_board()"}]}
+    codes = [f["code"] for f in planir.validate_architect_plan(bare)]
     assert "PLAN_INTERFACE_UNKNOWN" in codes, codes
 
 

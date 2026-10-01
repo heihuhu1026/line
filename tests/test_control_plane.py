@@ -156,6 +156,123 @@ def test_test_view_separates_candidate_from_compiled() -> None:
     assert len(view["test"]["unsafe_commands"]) == 1
 
 
+def test_test_view_exposes_modes_and_scenarios() -> None:
+    """§27 / P0-13：场景明细 + 验证方式分类 + 机械不可验义务（只聚合，不裁决）。"""
+    view = cp.build_control_plane(_detail({
+        "test_scenarios": {
+            "verification_modes": {"mechanical": ["po:ctr"], "gui_smoke": ["po:ui"]},
+            "external_required": ["po:ui"],
+            "coverage_gap": ["po:ui"],
+            "unbound_commands": [{"command": "python main.py", "candidate": "po:ctr",
+                                  "reason": "就地机械检查器"}],
+            "scenarios": [{
+                "id": "tscn:1", "target_po": "po:ctr", "kind": "contract",
+                "status": "mechanical", "verification_mode": "mechanical",
+                "mechanical_check": ["contract_check"], "automated_commands": [],
+                "actions": [{"assertions": ["exit_code==0"]}],
+            }],
+        },
+    }))
+    test = view["test"]
+    assert test["verification_modes"]["gui_smoke"] == ["po:ui"]
+    assert test["external_required"] == ["po:ui"]
+    assert test["coverage_gap"] == ["po:ui"]
+    # 编译产物优先于 Proof Gate 的同名字段（老 run 才走回退）
+    assert len(test["unbound_commands"]) == 1
+    row = test["scenarios"][0]
+    assert row["mechanical_check"] == ["contract_check"]
+    assert row["commands"] == [] and row["assertions"] == ["exit_code==0"]
+    assert row["verification_mode"] == "mechanical"
+
+
+def test_proof_rows_carry_bound_details() -> None:
+    """§22.1：场景/命令/退出码/证据的 join 在**后端**做 —— 前端只渲染，不按 id 猜。"""
+    view = cp.build_control_plane(_detail({
+        "proof_gate": {"obligations": [{
+            "id": "po:1", "status": "FAILED", "claim": "吃到食物得分 +10",
+            "kind": "behavior", "scenario": "tscn:1", "evidence": ["ev:1"],
+            "workspace_revision": "ws-006", "required": True,
+        }]},
+        "test_scenarios": {"scenarios": [{
+            "id": "tscn:1", "target_po": "po:1", "status": "executable",
+            "automated_commands": ["python -c \"assert 1\""],
+            "actions": [{"assertions": ["stdout_contains:ok"]}],
+        }]},
+        "verify_report": {"commands": [{
+            "command": "python -c \"assert 1\"", "status": "fail", "exit_code": 1,
+            "stdout_tail": "boom", "stderr_tail": "AssertionError",
+        }]},
+        "ontology": {"objects": [{"id": "ev:1", "type": "Evidence",
+                                  "payload": {"status": "fail", "target_po": ["po:1"]}}]},
+    }))
+    row = view["proofs"][0]
+    assert row["scenario_detail"]["id"] == "tscn:1"
+    cmd = row["command_details"][0]
+    assert (cmd["status"], cmd["exit_code"], cmd["stdout_tail"]) == ("fail", 1, "boom")
+    assert cmd["stderr_tail"] == "AssertionError"
+    assert row["evidence_detail"][0]["id"] == "ev:1"
+
+
+def test_truth_view_separates_asserted_from_derived() -> None:
+    """§29/§16.3：默认假设**不得**与用户原文混在一起（否则会被读成用户要求）。"""
+    view = cp.build_control_plane(_detail({
+        "requirement_contract": {
+            "version": 1,
+            "declared_files": [{"path": "game_logic.py", "truth": "ASSERTED",
+                                "source_quote": "game_logic.py"}],
+            "hard_constraints": [{"id": "constraint:01", "text": "不得依赖 tkinter",
+                                  "truth": "ASSERTED", "source_quote": "不得依赖 tkinter",
+                                  "mechanical_check": ["forbidden_import:tkinter"]}],
+            "derived_facts": [{"text": "目标用户为终端玩家", "source": "intake"}],
+            "grounding_errors": [{"code": "ASSERTED_WITHOUT_QUOTE", "detail": "x"}],
+        },
+        "intake_decisions": [{"decision": "采用建议答案", "id": "q1"}],
+        "ontology_problems_structured": [{"code": "PLAN_FORBIDDEN_DEPENDENCY",
+                                          "message": "T-01 依赖 tkinter", "object": "T-01"}],
+    }))
+    truth = view["truth"]
+    assert [a["text"] for a in truth["asserted"] if a["bucket"] == "declared_files"] == ["game_logic.py"]
+    assert truth["asserted"][1]["mechanical_check"] == ["forbidden_import:tkinter"]
+    assert truth["derived"][0]["truth"] == "DERIVED"
+    assert truth["human"][0]["scope"] == "intake"
+    assert truth["contradicted"][0]["code"] == "PLAN_FORBIDDEN_DEPENDENCY"
+    assert truth["grounding_errors"]
+
+
+def test_plan_diff_view_reports_merge_and_owner() -> None:
+    """§26：3 张架构师图合成 1 张执行图 ⇒ 必须显示 merged 与文件租约。"""
+    view = cp.build_control_plane(_detail({
+        "plan_draft_tasks": [
+            {"id": "T-01", "target_files": ["game_logic.py"], "symbols": ["Snake"]},
+            {"id": "T-02", "target_files": ["game_logic.py"], "symbols": ["Game.score"]},
+        ],
+        "plan_compiled_tasks": [
+            {"id": "T-01", "target_files": ["game_logic.py"],
+             "symbols": ["Snake", "Game.score"], "creates_file": True},
+        ],
+        "plan_file_owners": {"game_logic.py": {"create_owner": "T-01", "modify_tasks": []}},
+        "plan_compiled_reasons": ["架构师把同文件拆成多张图"],
+    }))
+    diff = view["plan_diff"]
+    assert len(diff["draft"]) == 2 and len(diff["compiled"]) == 1
+    slot = diff["files"][0]
+    assert slot["kind"] == "merged" and slot["create_owner"] == "T-01"
+    assert slot["draft_ids"] == ["T-01", "T-02"] and slot["creates_file"] is True
+    assert diff["reasons"]
+
+
+def test_requirement_count_for_proof_chain() -> None:
+    """§30 证明链首节点：需求条数从语义图直接数（只读结构，不做推理）。"""
+    view = cp.build_control_plane(_detail({
+        "ontology": {"objects": [
+            {"id": "req:1", "type": "Requirement", "payload": {}},
+            {"id": "req:2", "type": "Requirement", "payload": {}},
+            {"id": "po:1", "type": "ProofObligation", "payload": {}},
+        ]},
+    }))
+    assert view["ontology"]["requirement_count"] == 2
+
+
 # ---------------------------------------------------------------- live 轮询
 def test_live_view_is_compact() -> None:
     live = cp.build_live(_detail({

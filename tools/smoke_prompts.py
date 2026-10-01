@@ -7,6 +7,8 @@
   ③ `parts_dev` 的三种视图与**尾部任务段**互斥 —— 这条专治"靠顺序去盖住首轮口径"
      （`_dev_rework_note` 盖 `【任务】按方案实现代码改动`）：顺序一变或被 fit_prompt
      裁掉就会漏回来，而漏回来的后果是"返工轮按首轮纪律整份重吐"（真机四轮零进展的成因）。
+  ④ （P0-12）测试用例类别按 `round_kind` 聚焦：必需类别集合只放宽不收紧，
+     且提示词与 `_audit_test` 共用 `tasktype` 里那一份真源。
 
 为什么这些断言值得单独一套：它们锁的是**结构性风险**（两类任务共用一套契约），
 而结构性风险不会在单测里冒出来，只会在真机上以"白烧一轮"的形式付费。
@@ -18,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import prompts, tasktype  # noqa: E402
+from pipeline import prompts, schemas, tasktype  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -92,6 +94,46 @@ def main() -> int:
     check(prompts.system_prompt("test", "new", tasktype.PLAN_REWORK)
           == prompts.system_prompt("test", "new", tasktype.FEATURE),
           "方案返工轮的 test **刻意**按首轮口径（方案重做后就该按首轮标准验收）")
+
+    print("== 2b. P0-12：测试类别按任务类型聚焦（不再每轮硬凑三类） ==")
+    check(tuple(tasktype.TEST_CASE_TYPES) == tuple(schemas.CASE_TYPE),
+          "tasktype 的类别集合与 schema 的 enum 同源（两处定义不会静默漂移）",
+          str(tasktype.TEST_CASE_TYPES))
+    check(tasktype.expected_test_types(tasktype.FEATURE) == ("new",)
+          and tasktype.expected_test_types(tasktype.FEATURE, has_existing_surface=True)
+          == ("new", "regression"),
+          "首次开发：首轮只要 new；已有交付面才追加 regression")
+    check(tasktype.expected_test_types(tasktype.BUGFIX) == ("regression",),
+          "缺陷修复：只看回归（修前失败、修后通过）")
+    check(tasktype.expected_test_types(tasktype.PLAN_REWORK) == ("new",)
+          and tasktype.suggested_test_types(tasktype.PLAN_REWORK) == ("contract", "interface"),
+          "方案返工：必需 new，接口/契约为建议类别（不判负）")
+    check(all(t in tasktype.TEST_CASE_TYPES
+              for t in tasktype.suggested_test_types(tasktype.PLAN_REWORK)),
+          "建议类别必须在 schema enum 内，否则模型物理上产不出来")
+    # 必需集合恒为旧三类的子集 —— 只放宽不收紧（否则是"隐性加严"，模型无从满足）
+    legacy = {"new", "regression", "compat"}
+    check(all(set(tasktype.expected_test_types(k)) <= legacy
+              for k in tasktype.ROUND_KINDS),
+          "各轮必需类别都是旧三类的子集（P0-12 只放宽，不隐性加严）")
+    # 提示词：聚焦块 + 任务段，且旧口径"三类缺一不可"已从两套 test system 里移除
+    parts = prompts.parts_test(
+        REQ, SCOPE, PLAN, api_digest={}, test_view={"cases": []},
+        test_focus=tasktype.test_focus_guidance(tasktype.BUGFIX),
+    )
+    joined = "\n".join(p for p in parts if p)
+    check("本轮测试聚焦" in joined and "缺陷修复" in joined and "必需类别：regression" in joined,
+          "test 任务段带上本轮聚焦口径（提示词与审计同源）", joined[-200:])
+    check("按上方的**本轮测试聚焦**产出用例" in joined and "三类测试用例" not in joined,
+          "任务段改为按聚焦口径（不再写死三类）")
+    for pt in ("secondary", "new"):
+        sys_test = prompts.system_prompt("test", pt, tasktype.FEATURE)
+        check("缺一不可" not in sys_test and "本轮测试聚焦" in sys_test,
+              f"{pt} 的 test system 已改为按聚焦口径（不再「三类缺一不可」）")
+    # 兼容：不传 test_focus 时回退旧措辞（老复跑脚本不受影响）
+    legacy_parts = "\n".join(p for p in prompts.parts_test(REQ, SCOPE, PLAN) if p)
+    check("产出新功能/回归/兼容三类测试用例" in legacy_parts,
+          "不传 test_focus ⇒ 回退旧的「三类」措辞（向后兼容）")
 
     print("== 3. dev 输入视图互斥（含尾部任务段） ==")
     feat = dev_view(tasktype.FEATURE)
@@ -289,6 +331,38 @@ def main() -> int:
     blk_a = prompts.pm_assumptions_block(applied)
     check("是否记录交易时间：需要" in blk_a,
           "unknowns 裁决折叠成 confirmed_facts 后照样到下游", blk_a[:120])
+
+    print("== 7. Phase H：评审机械摘要第一屏（§36）+ llm-calls 语义上下文（§37） ==")
+    from pipeline import budget, runstore  # noqa: E402
+    summary = {
+        "verify": {"verdict": "fail", "commands": 3, "failed": 1},
+        "proof": {"obligations": 23, "evidence": 26, "status": "UNPROVEN"},
+        "test": {"covered_symbols": 4, "missing_symbols": 2,
+                 "expected_types": ["new"], "missing_types": [], "external_required": ["po:ui"]},
+        "ontology_errors": 0,
+        "workspace": {"revision": "ws-006", "status": "VERIFIED"},
+        "defects": {"green": 2, "red": 1, "unverifiable": 0},
+        "blockers": ["补丁未能套用到 main.py"],
+    }
+    blk = prompts.mechanical_summary_block(summary)
+    check("机械摘要" in blk and "证明义务：23 条 / 证据 26 条" in blk
+          and "机械阻断项：1 条" in blk,
+          "机械摘要逐条渲染已成立的机器事实", blk[:160])
+    check(prompts.mechanical_summary_block(None) == "",
+          "没有机械事实时不渲染空壳标题（不占评审那点紧张预算）")
+    rparts = prompts.parts_review(
+        REQ, SCOPE, PLAN, {"edits": []}, {"cases": []}, summary_block=blk)
+    check(rparts and rparts[0] == blk,
+          "机械摘要排在 parts **最前**（fit_prompt 从末尾截断 ⇒ 必然存活）")
+    fitted, _ = budget.fit_prompt(rparts, budget_tokens=500)
+    check("机械摘要" in fitted, "极小预算下机械摘要仍存活（语义材料先被截）")
+    check(rparts[0] == blk and "机械摘要" not in "\n".join(
+        prompts.parts_review(REQ, SCOPE, PLAN, {}, {})),
+          "不传 summary_block ⇒ 行为不变（老调用点不受影响）")
+    check({"proof_obligation_count", "evidence_count"} <= set(runstore.CALL_FIELDS),
+          "llm-calls 固定列含语义上下文规模（§37）")
+    check(runstore.normalize_call_record({"stage": "dev"})["proof_obligation_count"] is None,
+          "缺列补 None（读旧 jsonl 安全，不臆造 0）")
 
     print(f"\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0
